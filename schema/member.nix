@@ -142,6 +142,12 @@ in {
             description = "Physical NIC name. Required for managed networking on NixOS members.";
             example = "eth0";
           };
+          mac = mkOption {
+            type = types.nullOr (types.strMatching "[0-9a-f]{2}(:[0-9a-f]{2}){5}");
+            default = null;
+            description = "Hardware address (lowercase, colon-separated) — what a DHCP reservation is keyed by. null = not (yet) recorded; the dhcpReservations projection carries it through for reconciliation.";
+            example = "dc:a6:32:aa:bb:cc";
+          };
           roles = mkOption {
             type = types.listOf (types.enum ["dns" "reach" "gateway" "management"]);
             default = [];
