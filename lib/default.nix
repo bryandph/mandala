@@ -3,6 +3,7 @@
   # Schema modules (paths, importable into any module evaluation).
   schemas = {
     operator = ../schema/operator.nix;
+    topology = ../schema/topology.nix;
   };
 
   # Evaluate operator data against the schema; returns the validated
@@ -15,4 +16,13 @@
         {operator = data;}
       ];
     }).config.operator;
+
+  # Same contract for topology data (`{vlans = {...};}`).
+  evalTopology = data:
+    (lib.evalModules {
+      modules = [
+        schemas.topology
+        {topology = data;}
+      ];
+    }).config.topology;
 }

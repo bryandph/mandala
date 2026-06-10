@@ -25,10 +25,14 @@
     checks = eachSystem (pkgs: {
       fake-fleet = let
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
+        topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
         assert op.gpg.openpgp4fpr == "openpgp4fpr:0123456789ABCDEF0123456789ABCDEF01234567";
+        assert topo.vlans.mgmt.prefixLength == 24;
+        assert topo.vlans.storage.subnet == null;
+        assert topo.vlans.storage.prefixLength == null;
           pkgs.runCommand "mandala-fake-fleet" {} "echo ok > $out";
     });
   };
