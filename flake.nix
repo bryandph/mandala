@@ -26,6 +26,7 @@
       fake-fleet = let
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);
+        pki = self.lib.evalPki (import ./examples/fake-fleet/pki.nix);
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
@@ -33,6 +34,8 @@
         assert topo.vlans.mgmt.prefixLength == 24;
         assert topo.vlans.storage.subnet == null;
         assert topo.vlans.storage.prefixLength == null;
+        assert pki.cas.example-intermediate.signedBy == "example-root";
+        assert builtins.length (builtins.attrNames pki.cas) == 2;
           pkgs.runCommand "mandala-fake-fleet" {} "echo ok > $out";
     });
   };

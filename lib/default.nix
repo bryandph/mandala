@@ -4,6 +4,7 @@
   schemas = {
     operator = ../schema/operator.nix;
     topology = ../schema/topology.nix;
+    pki = ../schema/pki.nix;
   };
 
   # Evaluate operator data against the schema; returns the validated
@@ -25,4 +26,13 @@
         {topology = data;}
       ];
     }).config.topology;
+
+  # Same contract for PKI trust anchors (`{cas = {...};}`).
+  evalPki = data:
+    (lib.evalModules {
+      modules = [
+        schemas.pki
+        {pki = data;}
+      ];
+    }).config.pki;
 }
