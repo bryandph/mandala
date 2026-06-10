@@ -68,7 +68,7 @@ in {
     };
 
     platform = mkOption {
-      type = types.enum ["nixos" "darwin" "wsl" "aws" "hetzner" "gcp" "azure" "oci" "windows" "routeros" "opnsense" "firmware"];
+      type = types.enum ["nixos" "darwin" "wsl" "aws" "hetzner" "gcp" "azure" "oci" "windows" "routeros" "opnsense" "firmware" "android"];
       default = "nixos";
       description = "Platform type (OS family or hosting venue)";
     };
@@ -163,6 +163,29 @@ in {
       });
       default = [];
       description = "Network attachments for this member. Each entry references a topology VLAN by name.";
+    };
+
+    zerotier = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          memberId = mkOption {
+            type = types.strMatching "[0-9a-f]{10}";
+            description = "ZeroTier member id (10 hex chars).";
+          };
+          address = mkOption {
+            type = types.str;
+            description = "Assigned overlay IPv4 address.";
+            example = "10.16.42.29";
+          };
+          name = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Display name in ZT Central; projections fall back to the member name when null.";
+          };
+        };
+      });
+      default = null;
+      description = "ZeroTier overlay membership — drives the zerotierMembers projection. null = not on the mesh.";
     };
 
     deployment = {

@@ -40,6 +40,8 @@
         assert member.fqdn == "example-node.example.test";
         assert member.architecture == "armv7l"; # derived from build.system
         
+        assert member.zerotier.memberId == "0123456789";
+        assert member.zerotier.name == null;
         assert member.deployment.ssh.host == "example-node.example.test";
         assert !member.deployment.deployRs.enable; # facts-only by default
         
