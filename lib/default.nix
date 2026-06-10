@@ -78,4 +78,23 @@
       ++ host.tags
       ++ host.deployment.ansible.groups
     );
+
+  # nixos-facter report predicates (pattern: nixpkgs
+  # nixos/modules/hardware/facter/lib.nix). Reports corroborate authored
+  # member data — they never set or override it. Consumers gate on a
+  # non-empty report and cross-check claims at eval time.
+  facter = {
+    # The system the report was captured on ("x86_64-linux"), or null when
+    # the report (or field) is absent.
+    systemOf = report: report.system or null;
+
+    # Every interface name the report observed — flattened
+    # hardware.network_interface[].unix_device_names. Includes virtual
+    # netdevs (VLANs, bridges) that existed at capture time.
+    interfaceNamesOf = report:
+      lib.unique (
+        lib.concatMap (i: i.unix_device_names or [])
+        (report.hardware.network_interface or [])
+      );
+  };
 }
