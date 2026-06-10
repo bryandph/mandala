@@ -27,6 +27,7 @@
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);
         pki = self.lib.evalPki (import ./examples/fake-fleet/pki.nix);
+        member = self.lib.evalMember (import ./examples/fake-fleet/member.nix);
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
@@ -36,6 +37,14 @@
         assert topo.vlans.storage.prefixLength == null;
         assert pki.cas.example-intermediate.signedBy == "example-root";
         assert builtins.length (builtins.attrNames pki.cas) == 2;
+        assert member.fqdn == "example-node.example.test";
+        assert member.architecture == "armv7l"; # derived from build.system
+        
+        assert member.deployment.ssh.host == "example-node.example.test";
+        assert !member.deployment.deployRs.enable; # facts-only by default
+        
+        assert self.lib.groupsFor member
+        == ["nixos" "armv7l" "server" "cache" "edge" "fake" "fake_extra_group"];
           pkgs.runCommand "mandala-fake-fleet" {} "echo ok > $out";
     });
   };
