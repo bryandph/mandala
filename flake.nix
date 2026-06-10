@@ -28,6 +28,7 @@
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);
         pki = self.lib.evalPki (import ./examples/fake-fleet/pki.nix);
         member = self.lib.evalMember (import ./examples/fake-fleet/member.nix);
+        mesh = self.lib.evalMesh (import ./examples/fake-fleet/mesh.nix);
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
@@ -40,8 +41,9 @@
         assert member.fqdn == "example-node.example.test";
         assert member.architecture == "armv7l"; # derived from build.system
         
-        assert member.zerotier.memberId == "0123456789";
-        assert member.zerotier.name == null;
+        assert mesh.members.example-node-mesh.dnsName == "example-node.mesh";
+        assert mesh.members.example-phone.name == null;
+        assert mesh.members.example-phone.dnsName == null;
         assert member.deployment.ssh.host == "example-node.example.test";
         assert !member.deployment.deployRs.enable; # facts-only by default
         

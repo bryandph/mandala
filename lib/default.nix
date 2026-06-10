@@ -6,6 +6,7 @@
     topology = ../schema/topology.nix;
     pki = ../schema/pki.nix;
     member = ../schema/member.nix;
+    mesh = ../schema/mesh.nix;
   };
 
   # Evaluate operator data against the schema; returns the validated
@@ -36,6 +37,15 @@
         {pki = data;}
       ];
     }).config.pki;
+
+  # Same contract for the overlay-mesh table (`{members = {...};}`).
+  evalMesh = data:
+    (lib.evalModules {
+      modules = [
+        schemas.mesh
+        {mesh = data;}
+      ];
+    }).config.mesh;
 
   # Evaluate one member's data against the member schema, plus the
   # cross-field invariants the module system can't express per-option

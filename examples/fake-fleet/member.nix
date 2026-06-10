@@ -26,9 +26,5 @@
       roles = ["dns" "reach"];
     }
   ];
-  zerotier = {
-    memberId = "0123456789";
-    address = "10.99.42.5";
-  };
   deployment.ansible.groups = ["fake_extra_group"];
 }
