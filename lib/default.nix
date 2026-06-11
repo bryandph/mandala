@@ -79,6 +79,23 @@
       ++ host.deployment.ansible.groups
     );
 
+  # ansible group names may only contain [A-Za-z0-9_]; map every other
+  # character to `_` (edge-compute -> edge_compute). Tags stay kebab-case as
+  # the human-facing source of truth — only fan-out surface keys (ansible
+  # inventory groups, deploy batch keys) are sanitized. Canonical here for
+  # the same reason groupsFor is: a per-consumer copy is a drift vector.
+  sanitizeGroupName = name:
+    lib.stringAsChars (c:
+      if lib.match "[A-Za-z0-9_]" c == null
+      then "_"
+      else c)
+    name;
+
+  # groupsFor in the ansible-safe spelling — the one spelling shared by
+  # every fan-out surface (`ansible -l <group>`, `deployBatch.<group>`).
+  # unique again: sanitization can merge two raw names into one key.
+  ansibleGroupsFor = host: lib.unique (map sanitizeGroupName (groupsFor host));
+
   # nixos-facter report predicates (pattern: nixpkgs
   # nixos/modules/hardware/facter/lib.nix). Reports corroborate authored
   # member data — they never set or override it. Consumers gate on a
