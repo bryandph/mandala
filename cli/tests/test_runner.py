@@ -63,6 +63,20 @@ def test_multi_host_demux_with_rollback(tmp_path: Path) -> None:
     assert tailer.hosts["beta"].state == HostState.ROLLED_BACK
 
 
+def test_nixlog_routes_to_sink_and_nowhere_else(tmp_path: Path) -> None:
+    _write(tmp_path / "alpha.jsonl", [
+        {"v": 2, "host": "alpha", "plugin": "build", "event": "nixlog",
+         "line": '@nix {"action":"start","type":105}'},
+    ])
+    tailer = EventTailer(tmp_path)
+    seen: list[str] = []
+    tailer.nixlog_sink = seen.append
+    tailer.poll()
+    assert seen == ['@nix {"action":"start","type":105}']
+    assert not tailer.build.lines  # nixlog never pollutes the line views
+    assert "alpha" not in tailer.hosts
+
+
 def test_failed_without_rollback_and_version_gate(tmp_path: Path) -> None:
     _write(tmp_path / "delta.jsonl", _milestones("delta", "eval", "copy"))
     _write(tmp_path / "delta.jsonl", [

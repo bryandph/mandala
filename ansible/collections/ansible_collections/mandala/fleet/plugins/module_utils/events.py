@@ -23,6 +23,12 @@ Event types:
                "fetched_done", "errors", "current"} (rate-limited)
     milestone  {"milestone": "eval|build|copy|activate|wait|confirm|rollback"}
                parsed from deploy-rs status lines
+    nixlog     {"line": "<raw '@nix {...}' internal-json line>"} — the
+               verbatim nix log stream (v2). Porcelain can feed these
+               straight into `nom --json` for a real build tree.
+
+Protocol history: v2 adds the `nixlog` event type (additive — consumers
+that ignore unknown event types read v2 streams as v1).
 
 Emission is best-effort: I/O errors disable the emitter silently — the
 event channel must never fail a deploy.
@@ -37,7 +43,7 @@ import os
 import re
 import time
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 ENV_VAR = "MANDALA_FLEET_EVENTS"
 
 _PROGRESS_INTERVAL_S = 0.5
@@ -119,6 +125,10 @@ class Emitter:
             return
         self._last_milestone = name
         self._emit("milestone", {"milestone": name})
+
+    def nixlog(self, line):
+        """Verbatim '@nix {...}' internal-json line (v2) — nom food."""
+        self._emit("nixlog", {"line": line})
 
     def feed_deploy_line(self, line):
         """line event + milestone detection for one deploy-rs output line."""

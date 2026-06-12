@@ -79,17 +79,20 @@ ansible-playbook mandala.fleet.deploy -l k3s
 ansible-playbook mandala.fleet.deploy -l host-a,host-b -e deploy_dry_activate=true
 ```
 
-## Event channel (protocol v1)
+## Event channel (protocol v2)
 
 When `MANDALA_FLEET_EVENTS` names a writable directory, both plugins
 append JSONL events to `<dir>/<inventory_hostname>.jsonl`: `status`
-(start/done + rc), `line` (raw output), `progress` (build counters), and
+(start/done + rc), `line` (raw output), `progress` (build counters),
 `milestone` (parsed deploy-rs transitions:
-`eval|build|copy|activate|wait|confirm|rollback`). Every record carries
-`v` (protocol version), `ts`, `host`, and `plugin`. Porcelain (a TUI, a
-log collector) tails the files to render per-host state — including
-flagging a rolled-back host while the rest of the fan-out proceeds —
-without parsing display output.
+`eval|build|copy|activate|wait|confirm|rollback`), and `nixlog` (v2 —
+the verbatim `@nix {...}` internal-json stream; feed it to `nom --json`
+for a real build tree). Every record carries `v` (protocol version),
+`ts`, `host`, and `plugin`. Porcelain (a TUI, a log collector) tails the
+files to render per-host state — including flagging a rolled-back host
+while the rest of the fan-out proceeds — without parsing display output.
+With the channel set, both plugins force flat output (a frontend owns
+the terminal; plugin-side nom would fight it for /dev/tty).
 
 **The protocol is the plugin↔porcelain contract: any shape change bumps
 `PROTOCOL_VERSION`** (`plugins/module_utils/events.py`). With the variable

@@ -19,6 +19,7 @@ from textual.binding import Binding
 from textual.widgets import Footer, Header, RichLog, Static, TabbedContent, TabPane
 
 from ..runner import DeployRun, HostState
+from .nom import NomPane
 
 # deploy-rs / nix progress output carries cursor-control CSI sequences
 # (erase-line ESC[K, cursor moves) besides SGR colors. Keep the colors
@@ -62,11 +63,12 @@ _STATE_GLYPH = {
 class DeployApp(App):
     TITLE = "mandala — deploy runner"
     CSS = """
-    #build { height: 9; border: solid $surface; padding: 0 1; }
+    #build { height: 3; border: solid $surface; padding: 0 1; }
     #recap { dock: bottom; height: 1; padding: 0 1; }
     """
     BINDINGS = [
         Binding("q", "quit_run", "quit (terminates a running deploy)"),
+        Binding("b", "build_tab", "nom build tab"),
         Binding("p", "playbook_log", "playbook output tab"),
     ]
 
@@ -75,11 +77,14 @@ class DeployApp(App):
         self.run_model = run
         self._rendered: dict[str, int] = {}
         self._build_rendered = 0
+        self._nom_finished = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static(id="build")
-        with TabbedContent(id="hosts"):
+        with TabbedContent(id="hosts", initial="tab-nom"):
+            with TabPane("⚙ build", id="tab-nom"):
+                yield NomPane(id="nom")
             with TabPane("ansible", id="tab-playbook"):
                 yield RichLog(id="log-playbook", wrap=True, max_lines=4000)
         yield Static(id="recap")
@@ -87,6 +92,10 @@ class DeployApp(App):
 
     def on_mount(self) -> None:
         self.run_model.start()
+        # Live-wire the internal-json stream into the nom tab — attached
+        # before the first poll, so nom sees the build from line one.
+        if self.run_model.tailer is not None:
+            self.run_model.tailer.nixlog_sink = self.query_one("#nom", NomPane).feed
         self.sub_title = f"-l {self.run_model.limit}" + (
             " (dry-activate)" if self.run_model.dry_activate else ""
         )
@@ -95,6 +104,9 @@ class DeployApp(App):
     def _tick(self) -> None:
         run = self.run_model
         run.poll()
+        if run.tailer.build.done and not self._nom_finished:
+            self._nom_finished = True
+            self.query_one("#nom", NomPane).finish()  # EOF -> nom's final summary
         self._render_build()
         self._render_playbook_output()
         for name in sorted(run.tailer.hosts):
@@ -109,15 +121,12 @@ class DeployApp(App):
             f"batch build  built {b.finished}/{b.built}  "
             f"fetched {b.fetched_done}/{b.fetched}  errors {b.errors}"
         )
-        if b.current:
-            head += f"\ncurrent: {b.current}"
         if b.done:
-            head += f"\ndone rc={b.rc}"
-        text = Text(head)  # Text: no Rich-markup interpretation of [bracketed] output
-        for line in list(b.lines)[-5:]:
-            text.append("\n")
-            text.append(_to_text(line))
-        self.query_one("#build", Static).update(text)
+            head += f"  —  done rc={b.rc}"
+        elif b.current:
+            head += f"  —  {b.current}"
+        # One-line summary; the nom tab carries the full tree.
+        self.query_one("#build", Static).update(Text(head))
 
     def _render_playbook_output(self) -> None:
         log = self.query_one("#log-playbook", RichLog)
@@ -159,6 +168,9 @@ class DeployApp(App):
 
     def action_playbook_log(self) -> None:
         self.query_one("#hosts", TabbedContent).active = "tab-playbook"
+
+    def action_build_tab(self) -> None:
+        self.query_one("#hosts", TabbedContent).active = "tab-nom"
 
     def action_quit_run(self) -> None:
         self.run_model.terminate()

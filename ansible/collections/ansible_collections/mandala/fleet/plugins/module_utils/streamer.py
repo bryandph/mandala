@@ -201,8 +201,12 @@ def run_build(
     """Run a `nix build` invocation with dual-mode output.
 
     Returns: {rc, summary, build_log, out_paths, mode}.
+
+    With `events` set the flat path is forced: a porcelain frontend owns
+    the terminal (plugin-side nom would fight it for /dev/tty), and only
+    the flat parser forwards the internal-json stream into the channel.
     """
-    mode = resolve_output_mode(output_mode)
+    mode = resolve_output_mode(output_mode) if events is None else "flat"
     full_env = {**os.environ, **(env or {})}
     tracker = _Tracker()
     out_paths = []
@@ -343,7 +347,11 @@ def _run_flat(argv, cwd, env, tracker, out_paths, display, label, events=None):
         for raw in iter(builder.stderr.readline, b""):
             line = raw.decode("utf-8", errors="replace").rstrip("\n")
             changed = tracker.feed_line(line)
-            if line and not line.startswith(_NIX_JSON_PREFIX):
+            if line.startswith(_NIX_JSON_PREFIX):
+                if events is not None:
+                    # Verbatim internal-json for porcelain-side nom.
+                    events.nixlog(line)
+            elif line:
                 if display is not None:
                     display.display("[%s] %s" % (label, line))
                 if events is not None:

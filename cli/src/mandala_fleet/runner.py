@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-SUPPORTED_EVENT_VERSION = 1
+# v2 = v1 + the `nixlog` event type (verbatim internal-json for nom).
+SUPPORTED_EVENT_VERSIONS = frozenset({1, 2})
 
 # Raw lines kept per host for the inspector view.
 _MAX_LINES = 2000
@@ -122,6 +123,9 @@ class EventTailer:
         self._offsets: dict[Path, int] = {}
         self.hosts: dict[str, HostRun] = {}
         self.build = BuildModel()
+        # Attach a callable BEFORE polling starts to receive every raw
+        # internal-json line live (nom food); None drops them.
+        self.nixlog_sink = None
 
     def host(self, name: str) -> HostRun:
         if name not in self.hosts:
@@ -154,7 +158,11 @@ class EventTailer:
             event = json.loads(line)
         except ValueError:
             return
-        if event.get("v") != SUPPORTED_EVENT_VERSION:
+        if event.get("v") not in SUPPORTED_EVENT_VERSIONS:
+            return
+        if event.get("event") == "nixlog":
+            if self.nixlog_sink is not None:
+                self.nixlog_sink(event.get("line", ""))
             return
         if event.get("plugin") == "build":
             self.build.feed(event)
