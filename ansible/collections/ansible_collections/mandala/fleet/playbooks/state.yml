@@ -13,14 +13,19 @@
 #
 # Variables:
 #   fleet_state_dir   controller dir for snapshots (default
-#                     $MANDALA_FLEET_STATE or /tmp/mandala-fleet-state)
+#                     $MANDALA_FLEET_STATE, else $XDG_STATE_HOME/mandala/
+#                     fleet — per-user and persistent, deliberately not a
+#                     predictable /tmp path)
 - name: Capture fleet deployment state (read-only)
   hosts: deploy_rs
   gather_facts: false
   ignore_unreachable: true
   vars:
     fleet_state_dir: >-
-      {{ lookup('env', 'MANDALA_FLEET_STATE') | default('/tmp/mandala-fleet-state', true) }}
+      {{ lookup('env', 'MANDALA_FLEET_STATE')
+         | default(lookup('env', 'XDG_STATE_HOME')
+                   | default(lookup('env', 'HOME') ~ '/.local/state', true)
+                   ~ '/mandala/fleet', true) }}
   tasks:
     - name: Ensure the controller snapshot dir exists
       ansible.builtin.file:

@@ -11,31 +11,58 @@ successful deploy).
 Everything here is read-only: snapshots are files, expectations are a
 nix eval, refresh is a fact-gather playbook. Nothing mutates a host.
 
-Drift is EXACT out-path equality — deliberately strict: a commit that
-only moves configurationRevision reads as drift, because the contract
-the host should converge to has in fact moved. "In sync modulo
-revision" would hide real drift behind label equality.
+Drift is EXACT out-path equality — deliberately strict: a moved
+contract IS drift. Time gets the same strictness: snapshots older than
+the staleness threshold judge as STALE rather than pretending an old
+observation is current.
+
+State lives under $MANDALA_FLEET_STATE, else $XDG_STATE_HOME/mandala/
+fleet (resolved at CALL time, not import time): per-user, persistent
+across reboots, and not a predictable world-writable-parent /tmp path
+another local user could pre-seed. Snapshots are keyed by FILENAME —
+the survey writes <inventory_hostname>.json — never by a host field
+inside the file, so one file cannot impersonate another host.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
-DEFAULT_STATE_DIR = Path(
-    os.environ.get("MANDALA_FLEET_STATE", "/tmp/mandala-fleet-state")
-)
+# Evaluated expectations, cached keyed by the contract's git rev: equal
+# CLEAN revs guarantee an identical contract, so the slow toplevel eval
+# is reusable until the repo actually moves — and a key mismatch IS the
+# "contract moved since last eval" signal.
+_EXPECTED_CACHE = ".expected.json"
+
+# Past this age a snapshot no longer supports any in-sync/drift claim.
+DEFAULT_MAX_AGE = timedelta(hours=24)
+
+_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def state_dir() -> Path:
+    """The snapshot/cache directory, resolved at call time."""
+    env = os.environ.get("MANDALA_FLEET_STATE")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state")
+    return Path(xdg) / "mandala" / "fleet"
 
 
 class DriftStatus(str, Enum):
     IN_SYNC = "in-sync"
     DRIFT = "drift"
     REBOOT_PENDING = "reboot-pending"
-    NO_SNAPSHOT = "no-snapshot"
+    STALE = "stale"  # snapshot too old to support a judgement
+    INCOMPLETE = "incomplete"  # snapshot exists but lacks the system links
+    NO_SNAPSHOT = "no-snapshot"  # never surveyed
     UNREACHABLE = "unreachable"
 
 
@@ -49,18 +76,18 @@ class DriftEntry:
     captured_at: str | None = None
 
 
-def read_snapshots(state_dir: Path = DEFAULT_STATE_DIR) -> dict[str, dict]:
-    """Per-host state JSON written by the state playbook."""
+def read_snapshots(directory: Path | None = None) -> dict[str, dict]:
+    """Per-host state JSON written by the state playbook, keyed by file
+    stem (the inventory hostname the survey wrote it under)."""
+    directory = state_dir() if directory is None else Path(directory)
     snapshots: dict[str, dict] = {}
-    if not Path(state_dir).is_dir():
+    if not directory.is_dir():
         return snapshots
-    for path in sorted(Path(state_dir).glob("*.json")):
+    for path in sorted(directory.glob("*.json")):
         try:
-            data = json.loads(path.read_text())
+            snapshots[path.stem] = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        host = data.get("host") or path.stem
-        snapshots[host] = data
     return snapshots
 
 
@@ -68,8 +95,14 @@ def eval_expected(flake: str, hosts: list[str]) -> dict[str, str]:
     """Locally evaluated toplevel out-paths for the given members.
 
     One nix eval for the whole set — heavy (it instantiates every
-    requested system), so callers trigger it explicitly and cache.
+    requested system), so callers trigger it explicitly and cache via
+    save_expected. Host names are validated before they enter the Nix
+    expression: the aggregate is a versioned trust boundary, and a name
+    containing `''` would otherwise escape the indented string.
     """
+    for name in hosts:
+        if not _NAME_RE.fullmatch(name):
+            raise ValueError(f"refusing to eval: invalid member name {name!r}")
     names = json.dumps(hosts)
     expr = (
         "cfgs: builtins.listToAttrs (map (n: { name = n; "
@@ -88,63 +121,118 @@ def eval_expected(flake: str, hosts: list[str]) -> dict[str, str]:
     return json.loads(out)
 
 
+def repo_rev(flake: str) -> str | None:
+    """The contract's git rev, '-dirty'-suffixed when the tree is. Cheap."""
+    try:
+        rev = subprocess.run(
+            ["git", "-C", flake, "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", flake, "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return f"{rev}-dirty" if dirty else rev
+
+
+def cache_fresh(cached_rev: str | None, current_rev: str | None) -> bool:
+    """A cached expectation is reusable only for the SAME CLEAN rev —
+    dirty trees have unknowable content and never match."""
+    return (
+        cached_rev is not None
+        and current_rev is not None
+        and cached_rev == current_rev
+        and not current_rev.endswith("-dirty")
+    )
+
+
+def load_expected(directory: Path | None = None) -> tuple[str | None, dict[str, str]]:
+    """(rev the cache was evaluated at, host -> toplevel out-path)."""
+    directory = state_dir() if directory is None else Path(directory)
+    try:
+        data = json.loads((directory / _EXPECTED_CACHE).read_text())
+    except (OSError, ValueError):
+        return None, {}
+    return data.get("rev"), data.get("toplevels", {})
+
+
+def save_expected(
+    rev: str | None,
+    toplevels: dict[str, str],
+    directory: Path | None = None,
+) -> None:
+    directory = state_dir() if directory is None else Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / _EXPECTED_CACHE).write_text(
+        json.dumps({"rev": rev, "toplevels": toplevels}, indent=1, sort_keys=True)
+    )
+
+
+def _too_old(captured_at: str | None, max_age: timedelta | None, now: datetime) -> bool:
+    if max_age is None or not captured_at:
+        return False
+    try:
+        when = datetime.fromisoformat(captured_at)
+    except ValueError:
+        return True  # unparseable timestamp can't support a judgement
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)  # the playbook writes UTC
+    return (now - when) > max_age
+
+
 def compare(
     deploy_nodes: list[str],
     snapshots: dict[str, dict],
     expected: dict[str, str] | None,
+    max_age: timedelta | None = DEFAULT_MAX_AGE,
+    now: datetime | None = None,
 ) -> list[DriftEntry]:
     """Drift table over the deploy-rs members."""
+    now = now or datetime.now(timezone.utc)
     entries = []
     for host in sorted(deploy_nodes):
         snap = snapshots.get(host)
         if snap is None:
             entries.append(DriftEntry(host=host, status=DriftStatus.NO_SNAPSHOT))
             continue
-        if snap.get("unreachable"):
-            entries.append(
-                DriftEntry(host=host, status=DriftStatus.UNREACHABLE,
-                           captured_at=snap.get("captured_at"))
-            )
-            continue
         current, booted = snap.get("current"), snap.get("booted")
-        want = (expected or {}).get(host)
-        if want is None or current is None:
-            # No expectation evaluated (or snapshot incomplete): the only
-            # judgement possible is current-vs-booted.
-            status = (
-                DriftStatus.REBOOT_PENDING
-                if current and booted and current != booted
-                else DriftStatus.NO_SNAPSHOT
-                if current is None
-                else DriftStatus.IN_SYNC
-            )
-        elif current != want:
-            status = DriftStatus.DRIFT
-        elif booted and booted != current:
-            status = DriftStatus.REBOOT_PENDING
-        else:
-            status = DriftStatus.IN_SYNC
-        entries.append(
-            DriftEntry(
-                host=host,
-                status=status,
-                expected=want,
-                current=current,
-                booted=booted,
-                captured_at=snap.get("captured_at"),
-            )
+        captured_at = snap.get("captured_at")
+        entry = DriftEntry(
+            host=host,
+            status=DriftStatus.IN_SYNC,
+            expected=(expected or {}).get(host),
+            current=current,
+            booted=booted,
+            captured_at=captured_at,
         )
+        if snap.get("unreachable"):
+            entry.status = DriftStatus.UNREACHABLE
+        elif current is None:
+            # The survey reached the host but got no system links —
+            # distinct from "never surveyed" (a broken fact-gather).
+            entry.status = DriftStatus.INCOMPLETE
+        elif _too_old(captured_at, max_age, now):
+            entry.status = DriftStatus.STALE
+        elif entry.expected is not None and current != entry.expected:
+            entry.status = DriftStatus.DRIFT
+        elif booted and booted != current:
+            entry.status = DriftStatus.REBOOT_PENDING
+        else:
+            entry.status = DriftStatus.IN_SYNC
+        entries.append(entry)
     return entries
 
 
 def refresh_snapshots(
     ansible_dir: Path,
-    state_dir: Path = DEFAULT_STATE_DIR,
+    directory: Path | None = None,
     limit: str | None = None,
 ) -> int:
     """Run the read-only state playbook (fact-gather; mutates nothing)."""
     env = dict(os.environ)
-    env["MANDALA_FLEET_STATE"] = str(state_dir)
+    env["MANDALA_FLEET_STATE"] = str(state_dir() if directory is None else directory)
     argv = ["ansible-playbook", "mandala.fleet.state"]
     if limit:
         argv += ["-l", limit]

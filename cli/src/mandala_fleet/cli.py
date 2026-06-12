@@ -113,13 +113,41 @@ def drift(
         rc = drift_mod.refresh_snapshots(ansible_dir)
         if rc != 0:
             typer.echo(f"state survey exited {rc} (continuing with whatever was captured)", err=True)
-    expected = drift_mod.eval_expected(inv.flake, nodes) if do_eval else None
+
+    # Expected toplevels: re-evaluated on --eval, else reused from the
+    # rev-keyed cache when the contract hasn't moved since the last eval.
+    rev = drift_mod.repo_rev(inv.flake)
+    cached_rev, cached = drift_mod.load_expected()
+    expected = None
+    if do_eval:
+        import subprocess
+
+        try:
+            expected = drift_mod.eval_expected(inv.flake, nodes)
+        except subprocess.CalledProcessError as e:
+            tail = (e.stderr or "").strip().splitlines()[-8:]
+            typer.echo("expected-toplevel eval failed:", err=True)
+            for line in tail:
+                typer.echo(f"  {line}", err=True)
+            raise typer.Exit(1) from e
+        drift_mod.save_expected(rev, expected)
+    elif drift_mod.cache_fresh(cached_rev, rev):
+        expected = cached
+        typer.echo(f"(expected from cache @ {rev[:11]})", err=True)
+
     entries = drift_mod.compare(nodes, drift_mod.read_snapshots(), expected)
     short = lambda p: (p or "-").removeprefix("/nix/store/")[:20]
     for e in entries:
         typer.echo(f"{e.host}\t{e.status.value}\t{short(e.current)}\t{short(e.expected)}")
-    if not do_eval:
-        typer.echo("(expected not evaluated — pass --eval for real drift judgement)", err=True)
+    if expected is None:
+        if cached_rev is not None:
+            typer.echo(
+                f"(expected cache stale: evaluated @ {cached_rev[:11]}, repo now @ "
+                f"{(rev or '?')[:11]} — the contract moved; pass --eval)",
+                err=True,
+            )
+        else:
+            typer.echo("(expected not evaluated — pass --eval for real drift judgement)", err=True)
 
 
 @app.command()

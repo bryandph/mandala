@@ -68,6 +68,8 @@ class ExplorerApp(App):
         super().__init__()
         self.inventory = inventory
         self.expected: dict[str, str] | None = None
+        self._rev: str | None = None
+        self._cached_rev: str | None = None
         self._busy = False
 
     # -- layout --------------------------------------------------------
@@ -110,6 +112,12 @@ class ExplorerApp(App):
             except Exception as e:  # noqa: BLE001 — surfaced in the UI
                 self.call_from_thread(self._load_failed, str(e))
                 return
+            # Reuse the rev-keyed expected cache when the contract hasn't
+            # moved since the last eval (a mismatch is itself the signal).
+            self._rev = drift_mod.repo_rev(inv.flake)
+            self._cached_rev, cached = drift_mod.load_expected()
+            if drift_mod.cache_fresh(self._cached_rev, self._rev):
+                self.expected = cached
             self.call_from_thread(self._fill)
 
         self.run_worker(work, thread=True, exclusive=True)
@@ -168,8 +176,15 @@ class ExplorerApp(App):
                 (e.captured_at or "")[:19],
             )
         hint = "S re-survey · e eval expected · R reboot a reboot-pending row"
-        if self.expected is None:
-            hint += "   (expected NOT evaluated yet)"
+        if self.expected is not None:
+            hint += f"   expected @ {(self._rev or '?')[:11]}"
+        elif self._cached_rev is not None:
+            hint += (
+                f"   contract MOVED since last eval"
+                f" (cache @ {self._cached_rev[:11]}, repo @ {(self._rev or '?')[:11]}) — press e"
+            )
+        else:
+            hint += "   (expected NOT evaluated yet — press e)"
         self.query_one("#drift-hint", Static).update(hint)
 
     # -- selection -----------------------------------------------------
@@ -268,6 +283,9 @@ class ExplorerApp(App):
             except Exception as e:  # noqa: BLE001 — surfaced, not raised
                 self.call_from_thread(self._drift_done, None, f"eval failed: {e}")
                 return
+            self._rev = drift_mod.repo_rev(flake)
+            self._cached_rev = self._rev
+            drift_mod.save_expected(self._rev, expected)
             self.call_from_thread(self._drift_done, expected, None)
 
         self.run_worker(work, thread=True, exclusive=True)
@@ -285,7 +303,7 @@ class ExplorerApp(App):
                 "state survey (read-only fact gather)",
                 ["ansible-playbook", "mandala.fleet.state"],
                 _ansible_dir(),
-                env={"MANDALA_FLEET_STATE": str(drift_mod.DEFAULT_STATE_DIR)},
+                env={"MANDALA_FLEET_STATE": str(drift_mod.state_dir())},
             ),
             done,
         )
