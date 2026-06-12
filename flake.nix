@@ -29,6 +29,68 @@
         pki = self.lib.evalPki (import ./examples/fake-fleet/pki.nix);
         member = self.lib.evalMember (import ./examples/fake-fleet/member.nix);
         mesh = self.lib.evalMesh (import ./examples/fake-fleet/mesh.nix);
+
+        # Projection fixtures: the fake member with its management surfaces
+        # flipped on (the factory's job in a real fleet), plus a facts-only
+        # member that must NOT appear in the inventory.
+        managedMember = self.lib.evalMember (lib.recursiveUpdate (import ./examples/fake-fleet/member.nix) {
+          deployment.ansible.enable = true;
+          deployment.deployRs.enable = true;
+        });
+        factsOnly = self.lib.evalMember {name = "facts-only";};
+
+        # NixOS member on a cloud venue: platform names the VENUE, the
+        # consumer-built closure (build != null) marks it NixOS.
+        cloudMember = self.lib.evalMember {
+          name = "cloud-node";
+          platform = "hetzner";
+          build.system = "x86_64-linux";
+          deployment.ansible.enable = true;
+        };
+
+        inventory = self.lib.projections.ansibleInventory {
+          hosts = {
+            example-node = managedMember;
+            facts-only = factsOnly;
+            cloud-node = cloudMember;
+          };
+          extraHostvars = name: {
+            example_dir = "fleet/${name}";
+            # Hooks merge after engine defaults, so they can override them.
+            ansible_user = "operator";
+          };
+        };
+        hv = inventory.all.hosts.example-node;
+
+        # Conventions are overridable: no interpreter pin, no guard group.
+        bareInventory = self.lib.projections.ansibleInventory {
+          hosts = {example-node = managedMember;};
+          pythonInterpreter = null;
+          guardGroup = null;
+        };
+
+        sopsCfg = self.lib.projections.sopsConfig {
+          operatorAnchor = op.gpg.fingerprint;
+          recipients = {
+            example-node = "age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node";
+            other-node = "age1aaafakefakefakefakefakefakefakefakefakefakefakefakefakeother";
+          };
+          rules = [
+            {
+              path = "secrets/admin.yaml";
+              adminOnly = true;
+            }
+            {
+              path = "secrets/all.yaml";
+              readers = ["other-node" "example-node"];
+            }
+            {
+              path = "secrets/one.yaml";
+              readers = ["example-node" "example-node"];
+            }
+          ];
+        };
+        ruleAt = n: lib.head (lib.elemAt sopsCfg.creation_rules n).key_groups;
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
@@ -49,6 +111,36 @@
         
         assert self.lib.groupsFor member
         == ["nixos" "armv7l" "server" "cache" "edge" "fake" "fake_extra_group"];
+        # ansibleInventory: membership, hostvars, groups, guard.
+        assert builtins.attrNames inventory.all.hosts == ["cloud-node" "example-node"]; # facts-only filtered out
+        
+        assert inventory.all.hosts.cloud-node.ansible_python_interpreter
+        == "/run/current-system/sw/bin/python3"; # cloud venue platform, still NixOS
+        
+        assert hv.ansible_host == "example-node.example.test";
+        assert hv.ansible_user == "operator"; # extraHostvars overrides the convention default
+        
+        assert hv.ansible_python_interpreter == "/run/current-system/sw/bin/python3";
+        assert hv.example_dir == "fleet/example-node";
+        assert !(hv ? ansible_port); # default port 22 emits no var
+        
+        assert inventory.all.children.fake.hosts == {example-node = null;};
+        assert inventory.all.children.fake_extra_group.hosts == {example-node = null;};
+        assert inventory.all.children.deploy_rs.hosts == {example-node = null;};
+        assert !(bareInventory.all.hosts.example-node ? ansible_python_interpreter);
+        assert !(bareInventory.all.children ? deploy_rs);
+        # sopsConfig: keys ordering, admin-only rule shape, recipient sets.
+        assert lib.head sopsCfg.keys == op.gpg.fingerprint;
+        assert lib.length sopsCfg.keys == 3; # anchor + one age key per member, sorted by name
+        
+        assert (lib.elemAt sopsCfg.creation_rules 0).path_regex == "secrets/admin\\.yaml$";
+        assert (ruleAt 0).pgp == [op.gpg.fingerprint];
+        assert !(ruleAt 0 ? age); # adminOnly: NO age key, not age = []
+        
+        assert lib.length (ruleAt 1).age == 2; # sorted by member name
+        
+        assert (ruleAt 2).age == ["age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node"]; # readers unique'd
+        
           pkgs.runCommand "mandala-fake-fleet" {} "echo ok > $out";
     });
   };

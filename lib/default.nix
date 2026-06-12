@@ -96,6 +96,14 @@
   # unique again: sanitization can merge two raw names into one key.
   ansibleGroupsFor = host: lib.unique (map sanitizeGroupName (groupsFor host));
 
+  # Projections: pure functions from validated fleet data to tool-shaped
+  # output. Toolchains (pkgs, deploy-rs, …) are injected as ARGUMENTS by
+  # the caller — the engine pins none of them.
+  projections = {
+    ansibleInventory = import ./projections/ansible-inventory.nix {inherit lib ansibleGroupsFor;};
+    sopsConfig = import ./projections/sops-config.nix {inherit lib;};
+  };
+
   # nixos-facter report predicates (pattern: nixpkgs
   # nixos/modules/hardware/facter/lib.nix). Reports corroborate authored
   # member data — they never set or override it. Consumers gate on a
