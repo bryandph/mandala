@@ -504,13 +504,17 @@ def _run_command_pty(argv, cwd, env, display, label, events=None):
                 break
             if not chunk:
                 break
-            buf += chunk
+            # Progress bars (deploy-rs's inner nix, copy meters) redraw
+            # with bare \r — treat every \r as a line break so each frame
+            # becomes its own line instead of gluing into one mega-line.
+            buf += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
             while b"\n" in buf:
                 line, _, buf = buf.partition(b"\n")
-                text = line.decode("utf-8", errors="replace").rstrip("\r")
-                handle(text)
+                text = line.decode("utf-8", errors="replace")
+                if text:
+                    handle(text)
         if buf:
-            text = buf.decode("utf-8", errors="replace").rstrip("\r")
+            text = buf.decode("utf-8", errors="replace")
             if text:
                 handle(text)
         return proc.wait()

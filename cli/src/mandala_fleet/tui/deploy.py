@@ -11,12 +11,28 @@ proceeds untouched.
 
 from __future__ import annotations
 
+import re
+
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header, RichLog, Static, TabbedContent, TabPane
 
 from ..runner import DeployRun, HostState
+
+# deploy-rs / nix progress output carries cursor-control CSI sequences
+# (erase-line ESC[K, cursor moves) besides SGR colors. Keep the colors
+# (Text.from_ansi understands SGR), drop everything else — rendered raw
+# they shred the panes.
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# C0 controls except ESC (SGR survives for from_ansi) and tab.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]")
+
+
+def _to_text(line: str) -> Text:
+    cleaned = _CSI_RE.sub(lambda m: m.group(0) if m.group(0).endswith("m") else "", line)
+    cleaned = _CTRL_RE.sub("", cleaned)
+    return Text.from_ansi(cleaned)
 
 _STATE_STYLE = {
     HostState.PENDING: "dim",
@@ -97,15 +113,18 @@ class DeployApp(App):
             head += f"\ncurrent: {b.current}"
         if b.done:
             head += f"\ndone rc={b.rc}"
-        tail = "\n".join(list(b.lines)[-5:])
-        self.query_one("#build", Static).update(head + ("\n" + tail if tail else ""))
+        text = Text(head)  # Text: no Rich-markup interpretation of [bracketed] output
+        for line in list(b.lines)[-5:]:
+            text.append("\n")
+            text.append(_to_text(line))
+        self.query_one("#build", Static).update(text)
 
     def _render_playbook_output(self) -> None:
         log = self.query_one("#log-playbook", RichLog)
         lines = list(self.run_model.output)
         done = self._build_rendered
         for line in lines[done:]:
-            log.write(line)
+            log.write(_to_text(line))
         self._build_rendered = len(lines)
 
     def _render_host(self, name: str) -> None:
@@ -119,7 +138,7 @@ class DeployApp(App):
         log = self.query_one(f"#log-{name}", RichLog)
         lines = list(host.lines)
         for line in lines[self._rendered[name]:]:
-            log.write(line)
+            log.write(_to_text(line))
         self._rendered[name] = len(lines)
         tab = tabs.get_tab(pane_id)
         tab.label = Text(
