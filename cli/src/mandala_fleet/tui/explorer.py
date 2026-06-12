@@ -203,10 +203,12 @@ class ExplorerApp(App):
             f"ping {target}",
             ["ansible", target, "-m", "ping"],
             _ansible_dir(),
-            # One line per host via the callback (the --one-line CLI flag
-            # is deprecated); ansible.cfg's bin_ansible_callbacks = True
-            # makes ad-hoc honor it.
-            env={"ANSIBLE_STDOUT_CALLBACK": "ansible.builtin.oneline"},
+            # Deliberately the DEFAULT stdout callback: --one-line AND the
+            # oneline/minimal callbacks are deprecated in core 2.19
+            # (removed 2.23) with no core replacement (ansible/ansible
+            # #85333, closed not-planned), and community presentation
+            # plugins would be a new dependency. The default callback is
+            # the only stable surface; the pane wraps and scrolls.
         ))
 
     def action_reboot(self) -> None:
