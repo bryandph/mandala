@@ -12,10 +12,13 @@ proceeds untouched.
 from __future__ import annotations
 
 import re
+import time
 
+from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, RichLog, Static, TabbedContent, TabPane
 
 from ..runner import DeployRun, HostState
@@ -70,6 +73,7 @@ class DeployApp(App):
         Binding("q", "quit_run", "quit (terminates a running deploy)"),
         Binding("b", "build_tab", "nom build tab"),
         Binding("p", "playbook_log", "playbook output tab"),
+        Binding("s", "summary_tab", "summary tab"),
     ]
 
     def __init__(self, run: DeployRun) -> None:
@@ -78,6 +82,7 @@ class DeployApp(App):
         self._rendered: dict[str, int] = {}
         self._build_rendered = 0
         self._nom_finished = False
+        self._summary_shown = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -112,8 +117,10 @@ class DeployApp(App):
         for name in sorted(run.tailer.hosts):
             self._render_host(name)
         self._render_recap()
-        if run.finished and self.sub_title and "exit" not in self.sub_title:
+        if run.finished and not self._summary_shown:
+            self._summary_shown = True
             self.sub_title += f" — exit {run.returncode}"
+            self._show_summary()
 
     def _render_build(self) -> None:
         b = self.run_model.tailer.build
@@ -165,6 +172,69 @@ class DeployApp(App):
                 style=_STATE_STYLE[host.state],
             )
         self.query_one("#recap", Static).update(recap)
+
+    def _show_summary(self) -> None:
+        """Materialize + focus the summary tab once the playbook exits."""
+        run = self.run_model
+        rc = run.returncode
+        elapsed = time.monotonic() - run.started_at if run.started_at else 0
+
+        head = Text()
+        head.append(
+            f"deploy {'succeeded' if rc == 0 else f'FAILED (exit {rc})'}",
+            style="bold green" if rc == 0 else "bold red",
+        )
+        head.append(
+            f"   -l {run.limit}   {elapsed / 60:.0f}m{elapsed % 60:02.0f}s"
+            + ("   dry-activate" if run.dry_activate else ""),
+            style="dim",
+        )
+
+        b = run.tailer.build
+        build_line = Text(
+            f"batch build: built {b.finished}/{b.built}, fetched "
+            f"{b.fetched_done}/{b.fetched}, errors {b.errors}, rc {b.rc}",
+            style="red" if b.rc not in (0, None) else "dim",
+        )
+
+        table = Table(box=None, pad_edge=False, show_header=True, header_style="bold")
+        table.add_column("host")
+        table.add_column("state")
+        table.add_column("rc", justify="right")
+        for host in sorted(run.tailer.hosts.values(), key=lambda h: h.name):
+            style = _STATE_STYLE[host.state]
+            table.add_row(
+                Text(f"{_STATE_GLYPH[host.state]} {host.name}", style=style),
+                Text(host.state.value, style=style),
+                Text("-" if host.rc is None else str(host.rc), style=style),
+            )
+
+        # ansible's own per-host accounting, verbatim.
+        out = list(run.output)
+        recap_at = next((i for i, l in enumerate(out) if "PLAY RECAP" in l), None)
+        recap = Text()
+        if recap_at is not None:
+            for line in out[recap_at:]:
+                recap.append_text(_to_text(line))
+                recap.append("\n")
+
+        body = Text("\n").join([head, build_line])
+
+        tabs = self.query_one("#hosts", TabbedContent)
+        tabs.add_pane(
+            TabPane(
+                Text("summary", style="bold"),
+                VerticalScroll(
+                    Static(body), Static(table), Static(recap), id="summary-scroll"
+                ),
+                id="tab-summary",
+            )
+        )
+        tabs.active = "tab-summary"
+
+    def action_summary_tab(self) -> None:
+        if self.query("#tab-summary"):
+            self.query_one("#hosts", TabbedContent).active = "tab-summary"
 
     def action_playbook_log(self) -> None:
         self.query_one("#hosts", TabbedContent).active = "tab-playbook"
