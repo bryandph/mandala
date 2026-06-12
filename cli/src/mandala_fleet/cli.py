@@ -38,10 +38,32 @@ def members(ctx: typer.Context, as_json: bool = typer.Option(False, "--json")) -
     if as_json:
         typer.echo(json.dumps(inv.members, indent=2, sort_keys=True))
         return
-    for name, member in sorted(inv.members.items()):
-        platform = member.get("platform", "?")
-        role = member.get("role") or "-"
-        typer.echo(f"{name}\t{platform}\t{role}")
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    from .inventory import surfaces
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold", pad_edge=False)
+    table.add_column("member", style="bold")
+    table.add_column("platform")
+    table.add_column("arch", style="dim")
+    table.add_column("category", style="dim")
+    table.add_column("role")
+    table.add_column("tags", style="dim", overflow="fold")
+    table.add_column("ads", style="cyan")
+    for name, m in sorted(inv.members.items()):
+        table.add_row(
+            name,
+            m.get("platform", "?"),
+            m.get("architecture", "?"),
+            m.get("category", "?"),
+            m.get("role") or "-",
+            " ".join(m.get("tags", [])),
+            surfaces(m),
+        )
+    table.caption = f"{len(inv.members)} members — ads = ansible/deploy-rs/sops"
+    Console().print(table)
 
 
 @app.command()
@@ -51,8 +73,18 @@ def groups(ctx: typer.Context, as_json: bool = typer.Option(False, "--json")) ->
     if as_json:
         typer.echo(json.dumps(inv.groups, indent=2, sort_keys=True))
         return
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold", pad_edge=False)
+    table.add_column("group", style="bold")
+    table.add_column("n", justify="right", style="cyan")
+    table.add_column("members", overflow="fold", style="dim")
     for group, names in sorted(inv.groups.items()):
-        typer.echo(f"{group}\t{len(names)}\t{' '.join(sorted(names))}")
+        table.add_row(group, str(len(names)), " ".join(sorted(names)))
+    table.caption = f"{len(inv.groups)} groups — one spelling: @group, ansible -l, deployBatch"
+    Console().print(table)
 
 
 @app.command()

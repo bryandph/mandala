@@ -21,6 +21,16 @@ class InventoryError(RuntimeError):
     pass
 
 
+def surfaces(member: dict) -> str:
+    """Compact management-surface flags: a(nsible) d(eploy-rs) s(ops)."""
+    d = member.get("deployment", {})
+    return "".join([
+        "a" if d.get("ansible", {}).get("enable") else "-",
+        "d" if d.get("deployRs", {}).get("enable") else "-",
+        "s" if d.get("sops", {}).get("recipient") else "-",
+    ])
+
+
 @dataclass
 class Inventory:
     """Lazy view over one flake's aggregate output."""

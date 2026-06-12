@@ -18,7 +18,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Tree
 
 from .. import drift as drift_mod
-from ..inventory import Inventory
+from ..inventory import Inventory, surfaces
 
 _DRIFT_STYLE = {
     drift_mod.DriftStatus.IN_SYNC: "green",
@@ -27,16 +27,6 @@ _DRIFT_STYLE = {
     drift_mod.DriftStatus.NO_SNAPSHOT: "dim",
     drift_mod.DriftStatus.UNREACHABLE: "magenta",
 }
-
-
-def _surfaces(member: dict) -> str:
-    d = member.get("deployment", {})
-    flags = [
-        "a" if d.get("ansible", {}).get("enable") else "-",
-        "d" if d.get("deployRs", {}).get("enable") else "-",
-        "s" if d.get("sops", {}).get("recipient") else "-",
-    ]
-    return "".join(flags)
 
 
 class DriftScreen(Screen):
@@ -205,7 +195,7 @@ class ExplorerApp(App):
                 m.get("category", "?"),
                 m.get("role") or "-",
                 " ".join(m.get("tags", [])),
-                _surfaces(m),
+                surfaces(m),
             )
         scope = self._group or "all"
         self.sub_title = f"{table.row_count} members — {scope} (ads = ansible/deploy/sops)"
