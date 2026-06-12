@@ -14,10 +14,17 @@ def test_no_textual_internal_overrides() -> None:
     helper `_render`) blanks the whole app at paint time — pin that our
     screens leave textual's internals alone."""
     from textual.screen import ModalScreen, Screen
+    from textual.widgets import DataTable
 
     from mandala_fleet.tui.deploy import DeployScreen
+    from mandala_fleet.tui.select_table import SelectTable
     from mandala_fleet.tui.tasks import ConfirmScreen, TaskScreen
 
-    for cls, base in ((TaskScreen, Screen), (DeployScreen, Screen), (ConfirmScreen, ModalScreen)):
+    for cls, base in (
+        (TaskScreen, Screen),
+        (DeployScreen, Screen),
+        (ConfirmScreen, ModalScreen),
+        (SelectTable, DataTable),
+    ):
         for name in ("_render", "render", "_render_content", "render_line", "render_lines"):
             assert getattr(cls, name) is getattr(base, name), f"{cls.__name__}.{name} shadows textual"

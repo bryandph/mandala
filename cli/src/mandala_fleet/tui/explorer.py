@@ -20,12 +20,13 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
+from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
 
 from .. import drift as drift_mod
 from ..inventory import Inventory, surfaces
 from ..runner import DeployRun
 from .deploy import DeployScreen
+from .select_table import SelectTable
 from .tasks import ConfirmScreen, TaskScreen
 
 _DRIFT_STYLE = {
@@ -75,23 +76,23 @@ class ExplorerApp(App):
         yield Header(show_clock=True)
         with TabbedContent(initial="tab-members", id="views"):
             with TabPane("members", id="tab-members"):
-                yield DataTable(id="members-table", zebra_stripes=True, cursor_type="row")
+                yield SelectTable(id="members-table", zebra_stripes=True, cursor_type="row")
             with TabPane("groups", id="tab-groups"):
-                yield DataTable(id="groups-table", zebra_stripes=True, cursor_type="row")
+                yield SelectTable(id="groups-table", zebra_stripes=True, cursor_type="row")
             with TabPane("drift", id="tab-drift"):
                 yield Vertical(
-                    DataTable(id="drift-table", zebra_stripes=True, cursor_type="row"),
+                    SelectTable(id="drift-table", zebra_stripes=True, cursor_type="row"),
                     Static(id="drift-hint"),
                 )
         yield Footer()
 
     def on_mount(self) -> None:
-        members = self.query_one("#members-table", DataTable)
-        members.add_columns("member", "platform", "arch", "category", "role", "tags", "ads")
-        groups = self.query_one("#groups-table", DataTable)
-        groups.add_columns("group", "n", "members")
-        drift = self.query_one("#drift-table", DataTable)
-        drift.add_columns("member", "status", "current", "expected", "booted", "captured")
+        members = self.query_one("#members-table", SelectTable)
+        members.add_columns("", "member", "platform", "arch", "category", "role", "tags", "ads")
+        groups = self.query_one("#groups-table", SelectTable)
+        groups.add_columns("", "group", "n", "members")
+        drift = self.query_one("#drift-table", SelectTable)
+        drift.add_columns("", "member", "status", "current", "expected", "booted", "captured")
         self._load()
 
     # -- data ----------------------------------------------------------
@@ -119,11 +120,12 @@ class ExplorerApp(App):
     def _fill(self) -> None:
         inv = self.inventory
 
-        members = self.query_one("#members-table", DataTable)
-        members.clear()
+        members = self.query_one("#members-table", SelectTable)
+        members.reset_rows()
         for name in sorted(inv.members):
             m = inv.members[name]
-            members.add_row(
+            members.add_named_row(
+                name,
                 name,
                 m.get("platform", "?"),
                 m.get("architecture", "?"),
@@ -133,15 +135,15 @@ class ExplorerApp(App):
                 surfaces(m),
             )
 
-        groups = self.query_one("#groups-table", DataTable)
-        groups.clear()
+        groups = self.query_one("#groups-table", SelectTable)
+        groups.reset_rows()
         for group, names in sorted(inv.groups.items()):
-            groups.add_row(group, str(len(names)), " ".join(sorted(names)))
+            groups.add_named_row(group, group, str(len(names)), " ".join(sorted(names)))
 
         self._fill_drift()
         self.sub_title = (
             f"{len(inv.members)} members, {len(inv.groups)} groups"
-            " — p ping · R reboot · D deploy on the selected row"
+            " — space/shift+↑↓ select · p ping · R reboot · D deploy"
         )
 
     @property
@@ -152,11 +154,12 @@ class ExplorerApp(App):
     def _fill_drift(self) -> None:
         snapshots = drift_mod.read_snapshots()
         entries = drift_mod.compare(self._deploy_nodes, snapshots, self.expected)
-        table = self.query_one("#drift-table", DataTable)
-        table.clear()
+        table = self.query_one("#drift-table", SelectTable)
+        table.reset_rows()
         short = lambda p: (p or "").removeprefix("/nix/store/")[:18]
         for e in entries:
-            table.add_row(
+            table.add_named_row(
+                e.host,
                 e.host,
                 Text(e.status.value, style=_DRIFT_STYLE[e.status]),
                 short(e.current),
@@ -172,8 +175,10 @@ class ExplorerApp(App):
     # -- selection -----------------------------------------------------
 
     def _target(self) -> str | None:
-        """The cursor's selection on the active tab: a member name, or a
-        group name (== the ansible group, one taxonomy one spelling)."""
+        """The action target on the active tab: the multi-selection when
+        one exists, else the cursor row. Names are members or groups (==
+        ansible groups, one taxonomy one spelling), comma-joined into an
+        ansible --limit."""
         active = self.query_one("#views", TabbedContent).active
         table_id = {
             "tab-members": "#members-table",
@@ -182,11 +187,11 @@ class ExplorerApp(App):
         }.get(active)
         if table_id is None:
             return None
-        table = self.query_one(table_id, DataTable)
-        if table.row_count == 0:
-            return None
-        value = table.get_cell_at((table.cursor_row, 0))
-        return str(value.plain if isinstance(value, Text) else value)
+        table = self.query_one(table_id, SelectTable)
+        selected = table.selected_names
+        if selected:
+            return ",".join(selected)
+        return table.cursor_name
 
     # -- actions (pushed screens; views stay read-only) -----------------
 
