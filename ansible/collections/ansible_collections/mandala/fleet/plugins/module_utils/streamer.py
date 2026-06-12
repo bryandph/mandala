@@ -125,7 +125,9 @@ class _Tracker:
         elif action == "msg":
             level = ev.get("level", 99)
             text = ev.get("msg") or ev.get("text") or ""
-            if level <= 1 and text:
+            # level 0 = error ONLY. Level 1 is warnings (e.g. "Git tree is
+            # dirty"), which used to inflate the errors= summary counter.
+            if level == 0 and text:
                 with self._lock:
                     self.errors += 1
                     self.error_msgs.append(text)

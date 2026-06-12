@@ -64,7 +64,14 @@ class Inventory:
         return self.aggregate["groups"]
 
     def resolve(self, selector: str) -> list[str]:
-        """`@group` or member name -> sorted member names."""
+        """`@group` or member name -> sorted member names. Comma-separated
+        selectors union (`@k3s,vishnu`)."""
+        if "," in selector:
+            names: set[str] = set()
+            for part in selector.split(","):
+                if part:
+                    names.update(self.resolve(part))
+            return sorted(names)
         if selector.startswith("@"):
             group = selector[1:]
             try:
@@ -74,3 +81,11 @@ class Inventory:
         if selector not in self.members:
             raise InventoryError(f"no such member: {selector}")
         return [selector]
+
+    def to_limit(self, selector: str) -> str:
+        """Selector -> explicit ansible --limit list. `@group` expands to
+        the exact projected members, so the fan-out target set is pinned
+        by the CLI's resolution, not re-derived ansible-side."""
+        if "@" not in selector:
+            return selector
+        return ",".join(self.resolve(selector))

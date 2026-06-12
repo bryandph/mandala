@@ -21,18 +21,19 @@ app = typer.Typer(no_args_is_help=True, help="Fan-out deploys via deploy-rs + ma
 @app.command()
 def run(
     ctx: typer.Context,
-    limit: str = typer.Option(..., "--limit", "-l", help="Hosts/groups for ansible --limit (required by the playbook's guard)"),
+    limit: str = typer.Option(..., "--limit", "-l", help="Selector: @group (expanded to the projected members), member, or comma-list"),
     dry_activate: bool = typer.Option(False, help="Build + copy but do not activate"),
     throttle: int = typer.Option(4, help="Per-host deploy parallelism"),
     events_dir: str = typer.Option(None, "--events-dir", help="Opt into the JSONL event channel (MANDALA_FLEET_EVENTS)"),
 ) -> None:
     """Run the eval-once + fan-out deploy (mandala.fleet.deploy)."""
+    inv: Inventory = ctx.obj
     env = dict(os.environ)
     if events_dir:
         env["MANDALA_FLEET_EVENTS"] = events_dir
     argv = [
         "ansible-playbook", "mandala.fleet.deploy",
-        "-l", limit,
+        "-l", inv.to_limit(limit),
         "-e", f"deploy_throttle={throttle}",
     ]
     if dry_activate:

@@ -26,3 +26,5 @@ jobs:
       # a package, not a check).
       - run: nix flake check ./examples/showcase --override-input mandala . --no-write-lock-file
       - run: nix build ./examples/showcase#network-tf --override-input mandala . --no-write-lock-file
+      # The CLI build runs the runner-demux + selector tests (checkPhase).
+      - run: nix build .#mandala-cli

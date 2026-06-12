@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Bryan Prather-Huff", email = "bryan@pratherhuff.com" }]
 requires-python = ">=3.11"
-dependencies = ["typer"]
+dependencies = ["typer", "textual"]
 
 [project.scripts]
 mandala = "mandala_fleet.cli:main"

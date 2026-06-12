@@ -56,9 +56,83 @@ def groups(ctx: typer.Context, as_json: bool = typer.Option(False, "--json")) ->
 
 
 @app.command()
+def resolve(ctx: typer.Context, selector: str) -> None:
+    """Expand a selector (`@group`, member, comma-list) to member names."""
+    inv: Inventory = ctx.obj
+    for name in inv.resolve(selector):
+        typer.echo(name)
+
+
+@app.command()
+def drift(
+    ctx: typer.Context,
+    do_eval: bool = typer.Option(False, "--eval", help="Evaluate expected toplevels (one slow nix eval)"),
+    refresh: bool = typer.Option(False, "--refresh", help="Run the read-only state survey (mandala.fleet.state) first"),
+) -> None:
+    """Deployed-generation drift: contract vs reported fleet state."""
+    from pathlib import Path
+
+    from . import drift as drift_mod
+
+    inv: Inventory = ctx.obj
+    nodes = inv.aggregate.get("projections", {}).get("deploy", {}).get("nodes", [])
+    if refresh:
+        ansible_dir = Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
+        rc = drift_mod.refresh_snapshots(ansible_dir)
+        if rc != 0:
+            typer.echo(f"state survey exited {rc} (continuing with whatever was captured)", err=True)
+    expected = drift_mod.eval_expected(inv.flake, nodes) if do_eval else None
+    entries = drift_mod.compare(nodes, drift_mod.read_snapshots(), expected)
+    short = lambda p: (p or "-").removeprefix("/nix/store/")[:20]
+    for e in entries:
+        typer.echo(f"{e.host}\t{e.status.value}\t{short(e.current)}\t{short(e.expected)}")
+    if not do_eval:
+        typer.echo("(expected not evaluated — pass --eval for real drift judgement)", err=True)
+
+
+@app.command()
 def version() -> None:
     """Print the CLI version."""
     typer.echo(__version__)
+
+
+tui_app = typer.Typer(
+    help="Textual TUI tiers: read-only explorer + drift dashboard; deploy runner",
+    invoke_without_command=True,
+)
+
+
+@tui_app.callback(invoke_without_command=True)
+def tui_main(ctx: typer.Context) -> None:
+    """`mandala tui` opens the read-only fleet explorer."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from .tui.explorer import ExplorerApp
+
+    ExplorerApp(ctx.obj).run()
+
+
+@tui_app.command("deploy")
+def tui_deploy(
+    ctx: typer.Context,
+    limit: str = typer.Option(..., "--limit", "-l", help="Selector: @group, member, or comma-list"),
+    dry_activate: bool = typer.Option(False, help="Build + copy but do not activate"),
+    throttle: int = typer.Option(4, help="Per-host deploy parallelism"),
+) -> None:
+    """Deploy-runner view: the fan-out playbook, presented live."""
+    from .runner import DeployRun
+    from .tui.deploy import DeployApp
+
+    inv: Inventory = ctx.obj
+    run = DeployRun(
+        limit=inv.to_limit(limit),
+        dry_activate=dry_activate,
+        throttle=throttle,
+    )
+    raise typer.Exit(DeployApp(run).run() or 0)
+
+
+app.add_typer(tui_app, name="tui")
 
 
 def _load_engines(root: typer.Typer) -> None:

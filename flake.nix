@@ -50,7 +50,10 @@
         pyproject = true;
         src = ./cli;
         build-system = [pkgs.python3Packages.setuptools];
-        dependencies = [pkgs.python3Packages.typer];
+        dependencies = with pkgs.python3Packages; [typer textual];
+        # The runner demux / selector-resolution tests are the headless
+        # half of the TUI verification — they gate the package build.
+        nativeCheckInputs = [pkgs.python3Packages.pytestCheckHook];
         pythonImportsCheck = ["mandala_fleet"];
       };
       mandala-cli = pkgs.python3Packages.toPythonApplication mandala-fleet-python;
