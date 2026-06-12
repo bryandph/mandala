@@ -203,6 +203,10 @@ class ExplorerApp(App):
             f"ping {target}",
             ["ansible", target, "-m", "ping"],
             _ansible_dir(),
+            # One line per host via the callback (the --one-line CLI flag
+            # is deprecated); ansible.cfg's bin_ansible_callbacks = True
+            # makes ad-hoc honor it.
+            env={"ANSIBLE_STDOUT_CALLBACK": "ansible.builtin.oneline"},
         ))
 
     def action_reboot(self) -> None:
