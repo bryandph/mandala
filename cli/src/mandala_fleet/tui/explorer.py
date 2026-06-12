@@ -46,6 +46,11 @@ class ExplorerApp(App):
 
     TITLE = "mandala — fleet"
     CSS = """
+    /* Fill the space between header and footer, and constrain the tables
+       to it — an auto-height DataTable grows past the viewport and never
+       scrolls. */
+    #views { height: 1fr; }
+    #members-table, #groups-table, #drift-table { height: 1fr; }
     #drift-hint { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
     """
     BINDINGS = [
