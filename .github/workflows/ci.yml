@@ -21,3 +21,8 @@ jobs:
       # flake check evaluates the example host + .#mandala/.#ansibleInventory
       # without building anything heavy.
       - run: nix flake check ./templates/fleet --override-input mandala . --no-write-lock-file
+      # The showcase asserts every projection's shape against this
+      # checkout's engine; the terranix render is built explicitly (it's
+      # a package, not a check).
+      - run: nix flake check ./examples/showcase --override-input mandala . --no-write-lock-file
+      - run: nix build ./examples/showcase#network-tf --override-input mandala . --no-write-lock-file
