@@ -201,7 +201,7 @@ class ExplorerApp(App):
             return
         self.push_screen(TaskScreen(
             f"ping {target}",
-            ["ansible", target, "-m", "ping", "--one-line"],
+            ["ansible", target, "-m", "ping"],
             _ansible_dir(),
         ))
 
