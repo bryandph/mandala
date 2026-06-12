@@ -230,18 +230,25 @@ class ExplorerApp(App):
         target = self._target()
         if target is None:
             return
-        playbook = _ansible_dir() / "playbooks/reboot.yaml"
-        if not playbook.is_file():
-            self.sub_title = "no playbooks/reboot.yaml in this repo — reboot task unavailable"
+        # Prefer the operator's wrapper: it carries the controller-side env
+        # raw ansible-playbook lacks — the delegated k8s drain pins
+        # ANSIBLE_LOCAL_PYTHON_INTERPRETER to a python WITH the kubernetes
+        # lib (the global interpreter default does not win for delegated
+        # tasks, so without the wrapper the drain fails "kubernetes
+        # library is missing").
+        import shutil
+
+        if shutil.which("ans-reboot"):
+            argv = ["ans-reboot", "-l", target]
+        elif (_ansible_dir() / "playbooks/reboot.yaml").is_file():
+            argv = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
+        else:
+            self.sub_title = "no ans-reboot wrapper or playbooks/reboot.yaml — reboot task unavailable"
             return
 
         def go(confirmed: bool | None) -> None:
             if confirmed:
-                self.push_screen(TaskScreen(
-                    f"reboot {target}",
-                    ["ansible-playbook", "playbooks/reboot.yaml", "-l", target],
-                    _ansible_dir(),
-                ))
+                self.push_screen(TaskScreen(f"reboot {target}", argv, _ansible_dir()))
 
         self.push_screen(
             ConfirmScreen(f"Reboot '{target}'?\n(rolling, drain-aware — the playbook handles k8s nodes)"),
