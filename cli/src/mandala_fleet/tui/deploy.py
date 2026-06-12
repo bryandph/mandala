@@ -2,16 +2,17 @@
 
 The playbook is the engine (limit guard, throttle, deploy-rs magic
 rollback — never bypassed); this view launches it with the event
-channel set and renders the per-host JSONL streams: a build pane fed by
-the build plugin's progress events (the sanctioned fallback for a nom
-pty), one tab per host color-coded by milestone state, and a recap
-footer. A rolled-back host is flagged loudly; the rest of the fan-out
-proceeds untouched.
+channel set and renders the per-host JSONL streams: nom on a PTY in the
+build tab, one tab per host color-coded by milestone state, ansible's
+own stream, and a summary tab on exit. A rolled-back host is flagged
+loudly; the rest of the fan-out proceeds untouched.
+
+DeployScreen is pushable from the explorer (the action tier); DeployApp
+is the thin standalone wrapper behind `mandala tui deploy`.
 """
 
 from __future__ import annotations
 
-import re
 import time
 
 from rich.table import Table
@@ -19,24 +20,12 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.screen import Screen
 from textual.widgets import Footer, Header, RichLog, Static, TabbedContent, TabPane
 
 from ..runner import DeployRun, HostState
 from .nom import NomPane
-
-# deploy-rs / nix progress output carries cursor-control CSI sequences
-# (erase-line ESC[K, cursor moves) besides SGR colors. Keep the colors
-# (Text.from_ansi understands SGR), drop everything else — rendered raw
-# they shred the panes.
-_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-# C0 controls except ESC (SGR survives for from_ansi) and tab.
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]")
-
-
-def _to_text(line: str) -> Text:
-    cleaned = _CSI_RE.sub(lambda m: m.group(0) if m.group(0).endswith("m") else "", line)
-    cleaned = _CTRL_RE.sub("", cleaned)
-    return Text.from_ansi(cleaned)
+from .render import to_text
 
 _STATE_STYLE = {
     HostState.PENDING: "dim",
@@ -63,22 +52,22 @@ _STATE_GLYPH = {
 }
 
 
-class DeployApp(App):
-    TITLE = "mandala — deploy runner"
+class DeployScreen(Screen):
     CSS = """
     #build { height: 3; border: solid $surface; padding: 0 1; }
     #recap { dock: bottom; height: 1; padding: 0 1; }
     """
     BINDINGS = [
-        Binding("q", "quit_run", "quit (terminates a running deploy)"),
+        Binding("escape,q", "quit_run", "back (terminates a running deploy)"),
         Binding("b", "build_tab", "nom build tab"),
         Binding("p", "playbook_log", "playbook output tab"),
         Binding("s", "summary_tab", "summary tab"),
     ]
 
-    def __init__(self, run: DeployRun) -> None:
+    def __init__(self, run: DeployRun, standalone: bool = False) -> None:
         super().__init__()
         self.run_model = run
+        self.standalone = standalone
         self._rendered: dict[str, int] = {}
         self._build_rendered = 0
         self._nom_finished = False
@@ -101,7 +90,7 @@ class DeployApp(App):
         # before the first poll, so nom sees the build from line one.
         if self.run_model.tailer is not None:
             self.run_model.tailer.nixlog_sink = self.query_one("#nom", NomPane).feed
-        self.sub_title = f"-l {self.run_model.limit}" + (
+        self.app.sub_title = f"-l {self.run_model.limit}" + (
             " (dry-activate)" if self.run_model.dry_activate else ""
         )
         self.set_interval(0.25, self._tick)
@@ -119,7 +108,7 @@ class DeployApp(App):
         self._render_recap()
         if run.finished and not self._summary_shown:
             self._summary_shown = True
-            self.sub_title += f" — exit {run.returncode}"
+            self.app.sub_title += f" — exit {run.returncode}"
             self._show_summary()
 
     def _render_build(self) -> None:
@@ -140,7 +129,7 @@ class DeployApp(App):
         lines = list(self.run_model.output)
         done = self._build_rendered
         for line in lines[done:]:
-            log.write(_to_text(line))
+            log.write(to_text(line))
         self._build_rendered = len(lines)
 
     def _render_host(self, name: str) -> None:
@@ -154,7 +143,7 @@ class DeployApp(App):
         log = self.query_one(f"#log-{name}", RichLog)
         lines = list(host.lines)
         for line in lines[self._rendered[name]:]:
-            log.write(_to_text(line))
+            log.write(to_text(line))
         self._rendered[name] = len(lines)
         tab = tabs.get_tab(pane_id)
         tab.label = Text(
@@ -216,7 +205,7 @@ class DeployApp(App):
         recap = Text()
         if recap_at is not None:
             for line in out[recap_at:]:
-                recap.append_text(_to_text(line))
+                recap.append_text(to_text(line))
                 recap.append("\n")
 
         body = Text("\n").join([head, build_line])
@@ -247,4 +236,20 @@ class DeployApp(App):
 
     def action_quit_run(self) -> None:
         self.run_model.terminate()
-        self.exit(self.run_model.returncode)
+        if self.standalone:
+            self.app.exit(self.run_model.returncode)
+        else:
+            self.app.pop_screen()
+
+
+class DeployApp(App):
+    """Standalone wrapper: `mandala tui deploy -l <sel>`."""
+
+    TITLE = "mandala — deploy runner"
+
+    def __init__(self, run: DeployRun) -> None:
+        super().__init__()
+        self._run = run
+
+    def on_mount(self) -> None:
+        self.push_screen(DeployScreen(self._run, standalone=True))
