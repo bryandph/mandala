@@ -199,6 +199,9 @@ class DeployRun:
         env = dict(os.environ)
         env["MANDALA_FLEET_EVENTS"] = str(self.events_dir)
         env.setdefault("ANSIBLE_FORCE_COLOR", "0")
+        # ansible block-buffers stdout when piped — without this, output
+        # arrives in late multi-KB chunks and the view looks dead.
+        env["PYTHONUNBUFFERED"] = "1"
         argv = [
             "ansible-playbook", str(self.playbook),
             "-l", self.limit,
@@ -207,36 +210,34 @@ class DeployRun:
         if self.dry_activate:
             argv += ["-e", "deploy_dry_activate=true"]
         self.started_at = time.monotonic()
-        self._proc = subprocess.Popen(
-            argv,
-            cwd=self.ansible_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-    def pump_output(self) -> None:
-        """Non-blockingly drain available playbook stdout lines."""
-        if self._proc is None or self._proc.stdout is None:
-            return
-        import selectors
-
-        sel = selectors.DefaultSelector()
+        self.output.append(f"$ {' '.join(argv)}  (cwd={self.ansible_dir}, events={self.events_dir})")
         try:
-            sel.register(self._proc.stdout, selectors.EVENT_READ)
-        except (ValueError, OSError):
+            self._proc = subprocess.Popen(
+                argv,
+                cwd=self.ansible_dir,
+                env=env,
+                # NEVER inherit the TUI's raw-mode stdin: an interactive
+                # prompt (ssh, vault, become) would wedge the run silently.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except OSError as e:
+            self.output.append(f"failed to launch {argv[0]}: {e}")
             return
-        while sel.select(timeout=0):
-            line = self._proc.stdout.readline()
-            if not line:
-                break
-            self.output.append(line.rstrip("\n"))
-        sel.close()
+        # Dedicated reader thread: readline() blocks safely HERE instead
+        # of stalling the UI tick on a partial line.
+        import threading
+
+        def drain() -> None:
+            assert self._proc is not None and self._proc.stdout is not None
+            for line in self._proc.stdout:
+                self.output.append(line.rstrip("\n"))
+
+        threading.Thread(target=drain, daemon=True).start()
 
     def poll(self) -> None:
-        self.pump_output()
         if self.tailer is not None:
             self.tailer.poll()
 

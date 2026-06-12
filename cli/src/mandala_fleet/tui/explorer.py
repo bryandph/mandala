@@ -158,7 +158,27 @@ class ExplorerApp(App):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.add_columns("member", "platform", "arch", "category", "role", "tags", "ads")
-        self._fill()
+        self._load()
+
+    def _load(self) -> None:
+        """Evaluate the aggregate OFF the UI thread — `nix eval .#mandala`
+        takes tens of seconds on a real fleet, and blocking on_mount means
+        a gray void instead of a first paint."""
+        self.sub_title = f"evaluating {self.inventory.flake}#mandala…"
+        inv = self.inventory
+
+        def work() -> None:
+            try:
+                inv.aggregate  # force the cached_property
+            except Exception as e:  # noqa: BLE001 — surfaced in the UI
+                self.call_from_thread(self._load_failed, str(e))
+                return
+            self.call_from_thread(self._fill)
+
+        self.run_worker(work, thread=True, exclusive=True)
+
+    def _load_failed(self, error: str) -> None:
+        self.sub_title = f"aggregate eval failed: {error.splitlines()[-1] if error else 'unknown'}"
 
     def _fill(self) -> None:
         inv = self.inventory
@@ -199,4 +219,4 @@ class ExplorerApp(App):
 
     def action_reload(self) -> None:
         self.inventory = Inventory(flake=self.inventory.flake)
-        self._fill()
+        self._load()
