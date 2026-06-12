@@ -113,9 +113,11 @@ class TaskScreen(Screen):
             self._lines.append(f"— exit {rc}")
 
         threading.Thread(target=drain, daemon=True).start()
-        self.set_interval(0.2, self._render)
+        # NB: must not be called `_render` — that overrides textual's
+        # internal Widget._render (returns a Visual) and blanks the app.
+        self.set_interval(0.2, self._pump)
 
-    def _render(self) -> None:
+    def _pump(self) -> None:
         log = self.query_one(RichLog)
         lines = list(self._lines)
         for line in lines[self._rendered:]:
