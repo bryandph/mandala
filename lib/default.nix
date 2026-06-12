@@ -7,6 +7,7 @@
     pki = ../schema/pki.nix;
     member = ../schema/member.nix;
     mesh = ../schema/mesh.nix;
+    secrets = ../schema/secrets.nix;
   };
 
   # Evaluate operator data against the schema; returns the validated
@@ -66,6 +67,78 @@
     assert lib.assertMsg
     (lib.all (n: n.assignment != "reservation" || n.address != null) m.networks)
     "member ${m.name}: assignment = \"reservation\" requires an address (it IS the reservation)"; m;
+
+  # Evaluate secret declarations against the schema AND the fleet: readers
+  # resolve to member names (explicit members ∪ group members ∪ the
+  # sops-identity set for `all`), and the cross-field invariants fail eval
+  # by name instead of silently mis-sealing a file. Returns the validated
+  # declarations, each augmented with `resolvedReaders` (sorted member
+  # names) for the projection layer.
+  evalSecrets = {
+    # Plain declarations data (`{<name> = {path, readers, custody};}`).
+    declarations,
+    # name -> validated member, the fleet the readers resolve against.
+    hosts,
+  }: let
+    secrets =
+      (lib.evalModules {
+        modules = [
+          schemas.secrets
+          {secrets = declarations;}
+        ];
+      }).config.secrets;
+
+    memberNames = lib.attrNames hosts;
+    sopsMembers =
+      lib.filter (n: hosts.${n}.deployment.sops.recipient != null) memberNames;
+    resolveGroup = g:
+      lib.filter (n: lib.elem g (groupsFor hosts.${n})) memberNames;
+
+    resolvedReadersOf = s:
+      lib.sort (a: b: a < b) (lib.unique (
+        s.readers.members
+        ++ lib.concatMap resolveGroup s.readers.groups
+        ++ lib.optionals s.readers.all sopsMembers
+      ));
+
+    # Offender lists, one per invariant — each assert names every violation.
+    forSecrets = f: lib.concatLists (lib.mapAttrsToList f secrets);
+
+    dupPaths = let
+      paths = lib.mapAttrsToList (_: s: s.path) secrets;
+    in
+      lib.attrNames (lib.filterAttrs (_: c: c > 1) (lib.foldl'
+        (acc: p: acc // {${p} = (acc.${p} or 0) + 1;})
+        {}
+        paths));
+
+    adminOnlyConflicts = forSecrets (name: s:
+      lib.optional
+      (s.readers.adminOnly && (s.readers.members != [] || s.readers.groups != [] || s.readers.all))
+      "secret '${name}' is adminOnly but declares other readers");
+
+    unknownMembers = forSecrets (name: s:
+      map (n: "secret '${name}' names unknown member '${n}'")
+      (lib.filter (n: !(hosts ? ${n})) s.readers.members));
+
+    emptyGroups = forSecrets (name: s:
+      map (g: "secret '${name}' references group '${g}', which resolves to no members")
+      (lib.filter (g: resolveGroup g == []) s.readers.groups));
+
+    missingRecipients = forSecrets (name: s:
+      map (n: "secret '${name}' resolves to reader '${n}', which has no sops recipient")
+      (lib.filter (n: hosts.${n}.deployment.sops.recipient == null)
+        (resolvedReadersOf s)));
+
+    fail = msgs: "mandala evalSecrets:\n  " + lib.concatStringsSep "\n  " msgs;
+  in
+    assert lib.assertMsg (dupPaths == [])
+    (fail (map (p: "path '${p}' is declared by more than one secret") dupPaths));
+    assert lib.assertMsg (adminOnlyConflicts == []) (fail adminOnlyConflicts);
+    assert lib.assertMsg (unknownMembers == []) (fail unknownMembers);
+    assert lib.assertMsg (emptyGroups == []) (fail emptyGroups);
+    assert lib.assertMsg (missingRecipients == []) (fail missingRecipients);
+      lib.mapAttrs (_: s: s // {resolvedReaders = resolvedReadersOf s;}) secrets;
 
   # The one group taxonomy behind every authority — deploy-rs `@group`,
   # ansible `-l group`, and sops recipient groups all call this, so they

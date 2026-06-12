@@ -91,6 +91,53 @@
           ];
         };
         ruleAt = n: lib.head (lib.elemAt sopsCfg.creation_rules n).key_groups;
+
+        # evalSecrets fixtures: a fleet of one keyed member + one keyless
+        # member, and a declaration set exercising every reader form.
+        keyedMember = self.lib.evalMember (lib.recursiveUpdate (import ./examples/fake-fleet/member.nix) {
+          deployment.sops.recipient = "age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node";
+        });
+        keylessMember = self.lib.evalMember {name = "keyless";};
+        secretsFleet = {
+          example-node = keyedMember;
+          keyless = keylessMember;
+        };
+
+        secretsEval = self.lib.evalSecrets {
+          hosts = secretsFleet;
+          declarations = {
+            host-keys = {
+              path = "secrets/host-keys.yaml";
+              readers.adminOnly = true;
+              custody.keySource = "generated";
+            };
+            cache-creds = {
+              path = "secrets/cache.yaml";
+              readers.groups = ["cache"]; # example-node's role group; keyless is not in it
+            };
+            user = {
+              path = "secrets/user.yaml";
+              readers.all = true; # the sops-identity set — keyless is excluded, not an error
+            };
+          };
+        };
+
+        failsEval = decls:
+          !(builtins.tryEval (self.lib.evalSecrets {
+            hosts = secretsFleet;
+            declarations = decls;
+          })).success;
+
+        # The declarations-driven projection: rules derive from evalSecrets
+        # output (adminOnly block first, each block path-sorted).
+        sopsFromDecls = self.lib.projections.sopsConfig {
+          operatorAnchor = op.gpg.fingerprint;
+          recipients = {
+            example-node = "age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node";
+          };
+          secrets = secretsEval;
+        };
+        declRuleAt = n: lib.head (lib.elemAt sopsFromDecls.creation_rules n).key_groups;
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
@@ -141,6 +188,56 @@
         
         assert (ruleAt 2).age == ["age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node"]; # readers unique'd
         
+        # evalSecrets: reader resolution + every cross-field invariant as a
+        # negative test (each must FAIL eval, not silently mis-seal).
+        assert secretsEval.host-keys.resolvedReaders == [];
+        assert secretsEval.cache-creds.resolvedReaders == ["example-node"]; # group-resolved
+        
+        assert secretsEval.user.resolvedReaders == ["example-node"]; # `all` = sops-identity set
+        
+        assert secretsEval.host-keys.custody.keySource == "generated";
+        assert failsEval {
+          a = {path = "secrets/dup.yaml";};
+          b = {path = "secrets/dup.yaml";};
+        }; # unique paths
+        
+        assert failsEval {
+          bad = {
+            path = "secrets/bad.yaml";
+            readers.adminOnly = true;
+            readers.members = ["example-node"];
+          };
+        }; # adminOnly exclusivity
+        
+        assert failsEval {
+          bad = {
+            path = "secrets/bad.yaml";
+            readers.members = ["ghost"];
+          };
+        }; # unknown member
+        
+        assert failsEval {
+          bad = {
+            path = "secrets/bad.yaml";
+            readers.groups = ["nonexistent-group"];
+          };
+        }; # empty group
+        
+        assert failsEval {
+          bad = {
+            path = "secrets/bad.yaml";
+            readers.members = ["keyless"];
+          };
+        }; # reader without a recipient
+        
+        # sopsConfig over declarations: deterministic rule order (adminOnly
+        # first, then member rules by path) and resolved recipient sets.
+        assert map (r: r.path_regex) sopsFromDecls.creation_rules
+        == ["secrets/host-keys\\.yaml$" "secrets/cache\\.yaml$" "secrets/user\\.yaml$"];
+        assert !(declRuleAt 0 ? age); # adminOnly declaration → pgp-only rule
+        
+        assert (declRuleAt 1).age == ["age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node"];
+        assert (declRuleAt 2).age == ["age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node"];
           pkgs.runCommand "mandala-fake-fleet" {} "echo ok > $out";
     });
   };
