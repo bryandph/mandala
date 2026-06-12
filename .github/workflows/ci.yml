@@ -16,3 +16,8 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v22
       - run: nix flake check
       - run: nix fmt -- --check .
+      # The template is a real flake; eval it against THIS checkout's
+      # engine so flakeModule/template drift fails the PR, not an adopter.
+      # flake check evaluates the example host + .#mandala/.#ansibleInventory
+      # without building anything heavy.
+      - run: nix flake check ./templates/fleet --override-input mandala . --no-write-lock-file

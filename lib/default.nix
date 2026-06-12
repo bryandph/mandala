@@ -169,6 +169,35 @@
   # unique again: sanitization can merge two raw names into one key.
   ansibleGroupsFor = host: lib.unique (map sanitizeGroupName (groupsFor host));
 
+  # The versioned aggregate contract output — the one eval surface for
+  # porcelain (CLI/TUI, plugged engines): `nix eval --json .#mandala`
+  # returns this shape, gated by schemaVersion, so no porcelain code
+  # scrapes per-tool outputs. Everything in it must stay PURE DATA
+  # (JSON-serializable, no derivations) — per-tool outputs carry the
+  # build artifacts. Groups are the taxonomy in the fan-out spelling
+  # (ansibleGroupsFor) over ALL members; each fan-out surface applies its
+  # own enable filter on top.
+  aggregate = {
+    # name -> validated member.
+    members,
+    # Validated operator data (evalOperator result); omitted when null.
+    operator ? null,
+    # Serializable projection results, contributed by whoever computed
+    # them (the flakeModules merge theirs in here).
+    projections ? {},
+  }: let
+    names = lib.attrNames members;
+  in
+    {
+      schemaVersion = 1;
+      inherit members projections;
+      groups =
+        lib.genAttrs
+        (lib.unique (lib.concatMap (n: ansibleGroupsFor members.${n}) names))
+        (g: lib.filter (n: lib.elem g (ansibleGroupsFor members.${n})) names);
+    }
+    // lib.optionalAttrs (operator != null) {inherit operator;};
+
   # Projections: pure functions from validated fleet data to tool-shaped
   # output. Toolchains (pkgs, deploy-rs, …) are injected as ARGUMENTS by
   # the caller — the engine pins none of them.

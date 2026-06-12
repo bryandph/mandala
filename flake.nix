@@ -17,6 +17,23 @@
     # this schema; nothing in this repo names a real fleet.
     lib = import ./lib {inherit lib;};
 
+    # flake-parts shim, exported as PATHS so the engine flake gains no
+    # inputs (flake-parts arrives from the CONSUMER's flake). Wiring +
+    # hook options only — every projection these modules emit is callable
+    # directly from lib.projections for non-flake-parts consumers.
+    flakeModules = {
+      fleet = ./flake-modules/fleet.nix;
+      ansible = ./flake-modules/ansible.nix;
+      sops = ./flake-modules/sops.nix;
+      deploy = ./flake-modules/deploy.nix;
+      default = ./flake-modules/fleet.nix;
+    };
+
+    templates.fleet = {
+      path = ./templates/fleet;
+      description = "A mandala fleet: one NixOS member, operator skeleton, fleet + ansible flakeModules wired";
+    };
+
     formatter = eachSystem (pkgs: pkgs.alejandra);
 
     # Evaluate the engine against the bundled fake fleet: proves the schema
@@ -128,6 +145,18 @@
             declarations = decls;
           })).success;
 
+        # Aggregate contract output: the lib function the fleet flakeModule
+        # wires (the module itself needs flake-parts, which the engine
+        # doesn't pin — nixspace + the template are its integration tests).
+        agg = self.lib.aggregate {
+          members = {
+            example-node = managedMember;
+            facts-only = factsOnly;
+          };
+          operator = op;
+          projections = {ansibleInventory = inventory;};
+        };
+
         # The declarations-driven projection: rules derive from evalSecrets
         # output (adminOnly block first, each block path-sorted).
         sopsFromDecls = self.lib.projections.sopsConfig {
@@ -230,6 +259,15 @@
           };
         }; # reader without a recipient
         
+        # aggregate: version gate, taxonomy groups over ALL members
+        # (facts-only included — surfaces apply their own enable filters),
+        # operator + projections carried through as data.
+        assert agg.schemaVersion == 1;
+        assert builtins.attrNames agg.members == ["example-node" "facts-only"];
+        assert agg.groups.cache == ["example-node"];
+        assert agg.groups.server == ["example-node" "facts-only"];
+        assert agg.operator.gpg.keyIdShort == "01234567";
+        assert agg.projections.ansibleInventory.all.hosts ? example-node;
         # sopsConfig over declarations: deterministic rule order (adminOnly
         # first, then member rules by path) and resolved recipient sets.
         assert map (r: r.path_regex) sopsFromDecls.creation_rules
