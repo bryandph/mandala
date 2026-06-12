@@ -175,6 +175,8 @@
   projections = {
     ansibleInventory = import ./projections/ansible-inventory.nix {inherit lib ansibleGroupsFor;};
     sopsConfig = import ./projections/sops-config.nix {inherit lib;};
+    deployNodes = import ./projections/deploy-nodes.nix {inherit lib;};
+    deployBatch = import ./projections/deploy-batch.nix {inherit lib ansibleGroupsFor;};
   };
 
   # nixos-facter report predicates (pattern: nixpkgs
