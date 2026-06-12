@@ -1,0 +1,81 @@
+---
+# mandala.fleet.deploy — eval-once, fan-out fleet deploy.
+#
+# Pipeline, for the hosts selected by --limit:
+#   Play 1 (controller, run_once): build EVERY targeted host's deploy-rs
+#     profile (`deploy.nodes.<h>.profiles.system.path`, the closure that
+#     embeds activate-rs) in ONE `nix build` — one flake eval, one build
+#     schedule, regardless of how --limit shaped the set. When a batch
+#     push already warmed the cache, this substitutes and is near-free.
+#   Play 2 (per host, throttled): `deploy --skip-checks .#<host>` via
+#     mandala.fleet.deploy. deploy-rs stays the per-host activation
+#     primitive — ssh copy, activation, and the magic-rollback handshake
+#     over FRESH ssh connections all belong to the `deploy` binary, so a
+#     bricked host rolls back with no ControlPersist stale-socket
+#     false-confirm. A failed host fails only its own task; the rest of
+#     the fan-out proceeds.
+#
+# Targets `hosts: deploy_rs` — the projected inventory's guard group of
+# members deploy-rs can activate — so a --limit can never reach a
+# facts-only member or an ansible-only host with no deploy.nodes entry.
+#
+# Throttle: each deploy fork pays a deploy-CLI flake eval (deploy-rs has no
+# pre-evaluated input), so an unthrottled 30-fork stampede is all eval memory
+# and no wall-clock win — the builds already happened in play 1. Default 4,
+# override with -e deploy_throttle=N.
+#
+# Variables:
+#   fleet_flake_root      flake exposing deploy.nodes (default: $PWD —
+#                         valid because ansible.cfg loads from the repo
+#                         root, so cwd IS the flake root in the normal
+#                         invocation; consumers elsewhere pass it with -e)
+#   deploy_throttle       per-host deploy parallelism (default 4)
+#   deploy_dry_activate   build + copy but do not activate (default false)
+#
+# Always pass a --limit (-l). Running unlimited would deploy the entire
+# fleet; the safety check below refuses that.
+
+- name: Batch-build deploy-rs profiles (eval once)
+  hosts: deploy_rs
+  gather_facts: false
+  vars:
+    fleet_flake_root: "{{ lookup('env', 'PWD') }}"
+  tasks:
+    - name: Refuse to run without an explicit --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: >-
+          Refusing to deploy the entire fleet. Pass a limit, e.g.
+          `ansible-playbook mandala.fleet.deploy -l k3s`.
+      run_once: true
+      delegate_to: localhost
+
+    - name: Build all targeted profiles in one nix invocation
+      mandala.fleet.build:
+        installables: >-
+          {{ ansible_play_hosts_all
+             | map('regex_replace', '^(.+)$', '.#deploy.nodes.\1.profiles.system.path')
+             | list }}
+        cwd: "{{ fleet_flake_root }}"
+      run_once: true
+      delegate_to: localhost
+
+- name: Fan out activation via deploy-rs (per-host rollback)
+  hosts: deploy_rs
+  gather_facts: false
+  vars:
+    fleet_flake_root: "{{ lookup('env', 'PWD') }}"
+    deploy_throttle: 4
+  tasks:
+    # prebuild: false — play 1 already built the profile; deploy-rs's inner
+    # nix build is a store no-op. skip_checks: the flake check would re-eval
+    # everything per fork (and often needs --impure).
+    - name: Activate via deploy-rs (magic rollback)
+      mandala.fleet.deploy:
+        target: ".#{{ inventory_hostname }}"
+        cwd: "{{ fleet_flake_root }}"
+        prebuild: false
+        skip_checks: true
+        dry_activate: "{{ deploy_dry_activate | default(false) | bool }}"
+      delegate_to: localhost
+      throttle: "{{ deploy_throttle | int }}"
