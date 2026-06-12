@@ -179,13 +179,14 @@ class DeployApp(App):
         rc = run.returncode
         elapsed = time.monotonic() - run.started_at if run.started_at else 0
 
+        minutes, seconds = divmod(int(elapsed), 60)
         head = Text()
         head.append(
             f"deploy {'succeeded' if rc == 0 else f'FAILED (exit {rc})'}",
             style="bold green" if rc == 0 else "bold red",
         )
         head.append(
-            f"   -l {run.limit}   {elapsed / 60:.0f}m{elapsed % 60:02.0f}s"
+            f"   -l {run.limit}   {minutes}m{seconds:02d}s"
             + ("   dry-activate" if run.dry_activate else ""),
             style="dim",
         )
@@ -223,7 +224,9 @@ class DeployApp(App):
         tabs = self.query_one("#hosts", TabbedContent)
         tabs.add_pane(
             TabPane(
-                Text("summary", style="bold"),
+                # Plain str: this textual's TabPane title goes through
+                # Content.from_markup, which rejects rich Text objects.
+                "summary",
                 VerticalScroll(
                     Static(body), Static(table), Static(recap), id="summary-scroll"
                 ),

@@ -58,7 +58,9 @@ _MILESTONES = (
     ("activate", re.compile(r"Activating profile|activate the configuration")),
     ("wait", re.compile(r"Waiting for confirmation")),
     ("confirm", re.compile(r"Success activating|Completed dry-activate|[Dd]eployment confirmed")),
-    ("rollback", re.compile(r"[Rr]olling back|[Mm]agic rollback")),
+    # Match rollback ACTIONS only — informational lines ("magic rollback
+    # is enabled/deactivating") must not flag a healthy host.
+    ("rollback", re.compile(r"[Rr]olling back|[Rr]ollback (?:succeeded|failed)")),
 )
 
 
