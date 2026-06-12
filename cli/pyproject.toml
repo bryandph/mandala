@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mandala-fleet"
+version = "0.1.0"
+description = "mandala fleet porcelain: dispatch + present over the flake.mandala aggregate; engines plug in via mandala.engines entry points"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Bryan Prather-Huff", email = "bryan@pratherhuff.com" }]
+requires-python = ">=3.11"
+dependencies = ["typer"]
+
+[project.scripts]
+mandala = "mandala_fleet.cli:main"
+
+# Built-in engines register through the SAME entry-point group external
+# plugins use — there is no privileged wiring path. An operator package
+# (e.g. mandala-bph's engines) adds its own entries to this group and the
+# CLI discovers them at startup.
+[project.entry-points."mandala.engines"]
+deploy = "mandala_fleet.engines.deploy:app"
+ansible = "mandala_fleet.engines.ansible:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

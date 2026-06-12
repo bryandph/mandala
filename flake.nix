@@ -36,6 +36,27 @@
 
     formatter = eachSystem (pkgs: pkgs.alejandra);
 
+    # The CLI porcelain, built from nixpkgs only (the purity invariant
+    # holds: no new inputs). Exposed twice: `mandala-fleet-python` is the
+    # composable python MODULE — an operator devshell builds ONE
+    # python3.withPackages env from it plus private plugin packages, so
+    # entry-point discovery sees every engine — and `mandala-cli` is the
+    # standalone application. Lazy eval: lib-only consumers never
+    # instantiate either.
+    packages = eachSystem (pkgs: rec {
+      mandala-fleet-python = pkgs.python3Packages.buildPythonPackage {
+        pname = "mandala-fleet";
+        version = "0.1.0";
+        pyproject = true;
+        src = ./cli;
+        build-system = [pkgs.python3Packages.setuptools];
+        dependencies = [pkgs.python3Packages.typer];
+        pythonImportsCheck = ["mandala_fleet"];
+      };
+      mandala-cli = pkgs.python3Packages.toPythonApplication mandala-fleet-python;
+      default = mandala-cli;
+    });
+
     # Evaluate the engine against the bundled fake fleet: proves the schema
     # validates and the derived fields compute correctly without any
     # operator-specific value entering this repo.
