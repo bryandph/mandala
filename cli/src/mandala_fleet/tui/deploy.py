@@ -65,7 +65,7 @@ class DeployApp(App):
         yield Static(id="build")
         with TabbedContent(id="hosts"):
             with TabPane("ansible", id="tab-playbook"):
-                yield RichLog(id="log-playbook", wrap=False, max_lines=4000)
+                yield RichLog(id="log-playbook", wrap=True, max_lines=4000)
         yield Static(id="recap")
         yield Footer()
 
@@ -113,7 +113,7 @@ class DeployApp(App):
         tabs = self.query_one("#hosts", TabbedContent)
         pane_id = f"tab-{name}"
         if not tabs.query(f"#{pane_id}"):
-            log = RichLog(id=f"log-{name}", wrap=False, max_lines=2000)
+            log = RichLog(id=f"log-{name}", wrap=True, max_lines=2000)
             tabs.add_pane(TabPane(name, log, id=pane_id))
             self._rendered[name] = 0
         log = self.query_one(f"#log-{name}", RichLog)
