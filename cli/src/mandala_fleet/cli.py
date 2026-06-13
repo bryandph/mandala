@@ -100,6 +100,7 @@ def drift(
     ctx: typer.Context,
     do_eval: bool = typer.Option(False, "--eval", help="Evaluate expected toplevels (one slow nix eval)"),
     refresh: bool = typer.Option(False, "--refresh", help="Run the read-only state survey (mandala.fleet.state) first"),
+    as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Deployed-generation drift: contract vs reported fleet state."""
     from pathlib import Path
@@ -133,21 +134,48 @@ def drift(
         drift_mod.save_expected(rev, expected)
     elif drift_mod.cache_fresh(cached_rev, rev):
         expected = cached
-        typer.echo(f"(expected from cache @ {rev[:11]})", err=True)
 
     entries = drift_mod.compare(nodes, drift_mod.read_snapshots(), expected)
+
+    if as_json:
+        from dataclasses import asdict
+
+        typer.echo(json.dumps([asdict(e) for e in entries], indent=2, sort_keys=True))
+        return
+
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold", pad_edge=False)
+    table.add_column("member", style="bold")
+    table.add_column("status")
+    table.add_column("current", style="dim")
+    table.add_column("expected", style="dim")
+    table.add_column("booted", style="dim")
+    table.add_column("captured", style="dim")
     short = lambda p: (p or "-").removeprefix("/nix/store/")[:20]
     for e in entries:
-        typer.echo(f"{e.host}\t{e.status.value}\t{short(e.current)}\t{short(e.expected)}")
-    if expected is None:
-        if cached_rev is not None:
-            typer.echo(
-                f"(expected cache stale: evaluated @ {cached_rev[:11]}, repo now @ "
-                f"{(rev or '?')[:11]} — the contract moved; pass --eval)",
-                err=True,
-            )
-        else:
-            typer.echo("(expected not evaluated — pass --eval for real drift judgement)", err=True)
+        table.add_row(
+            e.host,
+            Text(e.status.value, style=drift_mod.STATUS_STYLE[e.status]),
+            short(e.current),
+            short(e.expected),
+            short(e.booted),
+            (e.captured_at or "-")[:19],
+        )
+
+    if expected is not None:
+        table.caption = f"expected @ {drift_mod.short_rev(rev)}" + ("" if do_eval else " (cached)")
+    elif cached_rev is not None:
+        table.caption = (
+            f"expected cache stale: evaluated @ {drift_mod.short_rev(cached_rev)}, repo now @ "
+            f"{drift_mod.short_rev(rev)} — the contract moved; pass --eval"
+        )
+    else:
+        table.caption = "expected not evaluated — pass --eval for real drift judgement"
+    Console().print(table)
 
 
 @app.command()

@@ -66,6 +66,20 @@ class DriftStatus(str, Enum):
     UNREACHABLE = "unreachable"
 
 
+# One styling vocabulary for every presentation surface (rich CLI table,
+# textual drift tab) — keeping it beside the enum means a new status
+# cannot ship without a style, which the UIs would otherwise KeyError on.
+STATUS_STYLE: dict[DriftStatus, str] = {
+    DriftStatus.IN_SYNC: "green",
+    DriftStatus.DRIFT: "bold red",
+    DriftStatus.REBOOT_PENDING: "yellow",
+    DriftStatus.STALE: "dim yellow",
+    DriftStatus.INCOMPLETE: "dim red",
+    DriftStatus.NO_SNAPSHOT: "dim",
+    DriftStatus.UNREACHABLE: "magenta",
+}
+
+
 @dataclass
 class DriftEntry:
     host: str
@@ -135,6 +149,16 @@ def repo_rev(flake: str) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return f"{rev}-dirty" if dirty else rev
+
+
+def short_rev(rev: str | None) -> str:
+    """Abbreviate a rev for display, keeping the '-dirty' suffix — losing
+    it makes 'cache @ X, repo @ X' read as a contradiction."""
+    if rev is None:
+        return "?"
+    if rev.endswith("-dirty"):
+        return f"{rev.removesuffix('-dirty')[:11]}-dirty"
+    return rev[:11]
 
 
 def cache_fresh(cached_rev: str | None, current_rev: str | None) -> bool:

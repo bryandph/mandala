@@ -29,15 +29,6 @@ from .deploy import DeployScreen
 from .select_table import SelectTable
 from .tasks import ConfirmScreen, TaskScreen
 
-_DRIFT_STYLE = {
-    drift_mod.DriftStatus.IN_SYNC: "green",
-    drift_mod.DriftStatus.DRIFT: "bold red",
-    drift_mod.DriftStatus.REBOOT_PENDING: "yellow",
-    drift_mod.DriftStatus.NO_SNAPSHOT: "dim",
-    drift_mod.DriftStatus.UNREACHABLE: "magenta",
-}
-
-
 def _ansible_dir() -> Path:
     return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
 
@@ -169,7 +160,7 @@ class ExplorerApp(App):
             table.add_named_row(
                 e.host,
                 e.host,
-                Text(e.status.value, style=_DRIFT_STYLE[e.status]),
+                Text(e.status.value, style=drift_mod.STATUS_STYLE[e.status]),
                 short(e.current),
                 short(e.expected),
                 short(e.booted),
@@ -177,11 +168,12 @@ class ExplorerApp(App):
             )
         hint = "S re-survey · e eval expected · R reboot a reboot-pending row"
         if self.expected is not None:
-            hint += f"   expected @ {(self._rev or '?')[:11]}"
+            hint += f"   expected @ {drift_mod.short_rev(self._rev)}"
         elif self._cached_rev is not None:
             hint += (
                 f"   contract MOVED since last eval"
-                f" (cache @ {self._cached_rev[:11]}, repo @ {(self._rev or '?')[:11]}) — press e"
+                f" (cache @ {drift_mod.short_rev(self._cached_rev)},"
+                f" repo @ {drift_mod.short_rev(self._rev)}) — press e"
             )
         else:
             hint += "   (expected NOT evaluated yet — press e)"

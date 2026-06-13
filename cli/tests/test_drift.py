@@ -74,6 +74,19 @@ def test_eval_expected_rejects_hostile_names() -> None:
         drift.eval_expected(".", ["ok-host", "bad''(import <nixpkgs>)"])
 
 
+def test_short_rev_keeps_dirty_suffix() -> None:
+    assert drift.short_rev("a" * 40) == "a" * 11
+    assert drift.short_rev("a" * 40 + "-dirty") == "a" * 11 + "-dirty"
+    assert drift.short_rev(None) == "?"
+
+
+def test_every_status_has_a_style() -> None:
+    # The CLI table and the TUI drift tab index STATUS_STYLE directly; a
+    # status without a style is a KeyError at render time (STALE and
+    # INCOMPLETE were missing once).
+    assert set(drift.STATUS_STYLE) == set(drift.DriftStatus)
+
+
 def test_state_dir_resolved_at_call_time(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path / "a"))
     assert drift.state_dir() == tmp_path / "a"
