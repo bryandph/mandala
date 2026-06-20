@@ -48,8 +48,7 @@ class ExplorerApp(App):
     BINDINGS = [
         Binding("q", "quit", "quit"),
         Binding("r", "reload", "reload"),
-        Binding("e", "eval_expected", "eval expected (drift, slow)"),
-        Binding("S", "survey", "state survey (read-only)"),
+        Binding("S", "refresh_drift", "refresh drift (survey + eval)"),
         Binding("p", "ping", "ping selection"),
         Binding("R", "reboot", "reboot selection"),
         Binding("D", "deploy", "deploy selection"),
@@ -166,17 +165,17 @@ class ExplorerApp(App):
                 short(e.booted),
                 (e.captured_at or "")[:19],
             )
-        hint = "S re-survey · e eval expected · R reboot a reboot-pending row"
+        hint = "S refresh drift (survey + eval) · R reboot a reboot-pending row"
         if self.expected is not None:
             hint += f"   expected @ {drift_mod.short_rev(self._rev)}"
         elif self._cached_rev is not None:
             hint += (
                 f"   contract MOVED since last eval"
                 f" (cache @ {drift_mod.short_rev(self._cached_rev)},"
-                f" repo @ {drift_mod.short_rev(self._rev)}) — press e"
+                f" repo @ {drift_mod.short_rev(self._rev)}) — press S"
             )
         else:
-            hint += "   (expected NOT evaluated yet — press e)"
+            hint += "   (expected NOT evaluated yet — press S)"
         self.query_one("#drift-hint", Static).update(hint)
 
     # -- selection -----------------------------------------------------
@@ -249,7 +248,10 @@ class ExplorerApp(App):
                 "-e", f"reboot_serial={opts['serial']}",
                 "-e", f"drain={'true' if opts['drain'] else 'false'}",
             ]
-            self.push_screen(TaskScreen(f"reboot {target}", argv, _ansible_dir()))
+            self.push_screen(
+                TaskScreen(f"reboot {target}", argv, _ansible_dir()),
+                self._after_mutation,
+            )
 
         self.push_screen(RebootScreen(target), go)
 
@@ -260,7 +262,10 @@ class ExplorerApp(App):
 
         def go(confirmed: bool | None) -> None:
             if confirmed:
-                self.push_screen(DeployScreen(DeployRun(limit=target)))
+                self.push_screen(
+                    DeployScreen(DeployRun(limit=target)),
+                    self._after_mutation,
+                )
 
         self.push_screen(
             ConfirmScreen(f"Deploy '{target}'?\n(eval-once batch build, then deploy-rs per host with magic rollback)"),
@@ -273,6 +278,26 @@ class ExplorerApp(App):
         self.inventory = Inventory(flake=self.inventory.flake)
         self.expected = None
         self._load()
+
+    def action_refresh_drift(self) -> None:
+        """Refresh both drift inputs at once: the expected-toplevel nix
+        eval (a background worker) and the read-only state survey (a
+        pushed TaskScreen) run CONCURRENTLY, not as two separate
+        keystrokes. Each refreshes the drift table as it lands; either
+        completion order converges to the same judgement. Also fired
+        automatically once a deploy or reboot completes (see
+        `_after_mutation`)."""
+        self.action_eval_expected()  # background worker, returns at once
+        self.action_survey()  # pushed TaskScreen, runs alongside the eval
+
+    def _after_mutation(self, rc: int | None) -> None:
+        """A deploy/reboot screen just closed. If the run actually ran to
+        completion (rc is set — an operator cancel pops with rc None),
+        auto-refresh drift so the post-change state is surveyed without
+        having to press S. A non-zero rc (a failed/partial run) still
+        refreshes — seeing the resulting state is exactly what you want."""
+        if rc is not None:
+            self.action_refresh_drift()
 
     def action_eval_expected(self) -> None:
         if self._busy:

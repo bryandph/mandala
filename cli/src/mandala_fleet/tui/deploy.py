@@ -239,7 +239,10 @@ class DeployScreen(Screen):
         if self.standalone:
             self.app.exit(self.run_model.returncode)
         else:
-            self.app.pop_screen()
+            # dismiss (not pop_screen): the explorer pushed us with a
+            # callback that auto-refreshes drift once a run completes.
+            # returncode is None if the operator bailed before it finished.
+            self.dismiss(self.run_model.returncode)
 
 
 class DeployApp(App):
