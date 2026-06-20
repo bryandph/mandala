@@ -14,6 +14,10 @@ offered only when the operator repo ships playbooks/reboot.yaml.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import time
+from collections import deque
 from pathlib import Path
 
 from rich.text import Text
@@ -61,6 +65,7 @@ class ExplorerApp(App):
         self._rev: str | None = None
         self._cached_rev: str | None = None
         self._busy = False
+        self._surveying = False
 
     # -- layout --------------------------------------------------------
 
@@ -321,25 +326,95 @@ class ExplorerApp(App):
         self.run_worker(work, thread=True, exclusive=True)
 
     def action_survey(self) -> None:
-        """The read-only state survey, as a captured TaskScreen — running
-        it raw lets ansible write straight to the terminal under the TUI."""
-
-        def done(_rc: int | None) -> None:
-            self._fill_drift()
-            self.sub_title = "drift refreshed from new snapshots"
-
-        self.push_screen(
-            TaskScreen(
-                "state survey (read-only fact gather)",
-                ["ansible-playbook", "mandala.fleet.state"],
-                _ansible_dir(),
-                env={"MANDALA_FLEET_STATE": str(drift_mod.state_dir())},
-            ),
-            done,
+        """Read-only state survey, run in the BACKGROUND rather than as a
+        screen. `ansible-playbook mandala.fleet.state` writes one
+        <host>.json snapshot per host into the state dir; we count the
+        snapshots freshly written THIS run and report the running tally in
+        the top bar, then refresh drift when it finishes. Output is
+        captured (writing it to the terminal would corrupt the TUI) and
+        surfaced only on failure. Its own worker group so it runs
+        alongside the expected-toplevel eval instead of cancelling it."""
+        if self._surveying:
+            return
+        self._surveying = True
+        directory = drift_mod.state_dir()
+        cwd = _ansible_dir()
+        env = dict(
+            os.environ,
+            MANDALA_FLEET_STATE=str(directory),
+            PYTHONUNBUFFERED="1",
+            ANSIBLE_FORCE_COLOR="0",
         )
+        argv = ["ansible-playbook", "mandala.fleet.state"]
+        # -1s so a snapshot written in the same clock second as launch
+        # still counts as "this run".
+        started = time.time() - 1
+
+        def fresh() -> int:
+            # Per-host snapshots are <host>.json; skip dotfiles so the
+            # .expected.json eval cache (rewritten in this same dir by the
+            # concurrent eval worker) is never miscounted as a host.
+            if not directory.is_dir():
+                return 0
+            n = 0
+            for p in directory.glob("*.json"):
+                if p.name.startswith("."):
+                    continue
+                try:
+                    if p.stat().st_mtime >= started:
+                        n += 1
+                except OSError:
+                    pass
+            return n
+
+        def work() -> None:
+            out: deque[str] = deque(maxlen=2000)
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except OSError as e:
+                self.call_from_thread(self._survey_done, 0, 1, f"failed to launch: {e}")
+                return
+            assert proc.stdout is not None
+            last = -1
+            # Draining stdout (even just to discard) avoids a full-pipe
+            # deadlock; each line is also a cheap cue to recount.
+            for line in proc.stdout:
+                out.append(line.rstrip("\n"))
+                n = fresh()
+                if n != last:
+                    last = n
+                    self.call_from_thread(self._survey_progress, n)
+            rc = proc.wait()
+            err = None if rc == 0 else (out[-1] if out else None)
+            self.call_from_thread(self._survey_done, fresh(), rc, err)
+
+        self.sub_title = "surveying fleet…"
+        self.run_worker(work, thread=True, exclusive=True, group="survey")
+
+    def _survey_progress(self, n: int) -> None:
+        self.sub_title = f"surveying fleet · {n} read…"
+
+    def _survey_done(self, n: int, rc: int, error: str | None = None) -> None:
+        self._surveying = False
+        self._fill_drift()
+        if rc == 0:
+            self.sub_title = f"drift refreshed · surveyed {n} host{'' if n == 1 else 's'}"
+        else:
+            self.sub_title = f"survey failed (exit {rc}): {error or ''}".rstrip()
 
     def _drift_done(self, expected: dict[str, str] | None, error: str | None) -> None:
         self._busy = False
         self.expected = expected
         self._fill_drift()
-        self.sub_title = error or "drift refreshed"
+        # Don't clobber the live survey tally with "drift refreshed" while a
+        # background survey is still counting — but an eval error always wins.
+        if error or not self._surveying:
+            self.sub_title = error or "drift refreshed"
