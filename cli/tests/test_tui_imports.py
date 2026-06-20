@@ -18,12 +18,13 @@ def test_no_textual_internal_overrides() -> None:
 
     from mandala_fleet.tui.deploy import DeployScreen
     from mandala_fleet.tui.select_table import SelectTable
-    from mandala_fleet.tui.tasks import ConfirmScreen, TaskScreen
+    from mandala_fleet.tui.tasks import ConfirmScreen, RebootScreen, TaskScreen
 
     for cls, base in (
         (TaskScreen, Screen),
         (DeployScreen, Screen),
         (ConfirmScreen, ModalScreen),
+        (RebootScreen, ModalScreen),
         (SelectTable, DataTable),
     ):
         for name in ("_render", "render", "_render_content", "render_line", "render_lines"):

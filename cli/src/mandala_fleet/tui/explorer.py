@@ -27,7 +27,7 @@ from ..inventory import Inventory, surfaces
 from ..runner import DeployRun
 from .deploy import DeployScreen
 from .select_table import SelectTable
-from .tasks import ConfirmScreen, TaskScreen
+from .tasks import ConfirmScreen, RebootScreen, TaskScreen
 
 def _ansible_dir() -> Path:
     return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
@@ -231,21 +231,27 @@ class ExplorerApp(App):
         import shutil
 
         if shutil.which("ans-reboot"):
-            argv = ["ans-reboot", "-l", target]
+            base = ["ans-reboot", "-l", target]
         elif (_ansible_dir() / "playbooks/reboot.yaml").is_file():
-            argv = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
+            base = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
         else:
             self.sub_title = "no ans-reboot wrapper or playbooks/reboot.yaml — reboot task unavailable"
             return
 
-        def go(confirmed: bool | None) -> None:
-            if confirmed:
-                self.push_screen(TaskScreen(f"reboot {target}", argv, _ansible_dir()))
+        # RebootScreen returns the chosen batch order + drain safety; both
+        # ride through the wrapper as extra-vars (ans-reboot/ansible-playbook
+        # both forward "$@"). reboot_serial drives the play's `serial`,
+        # drain gates the k8s cordon/drain steps.
+        def go(opts: dict | None) -> None:
+            if not opts:
+                return
+            argv = base + [
+                "-e", f"reboot_serial={opts['serial']}",
+                "-e", f"drain={'true' if opts['drain'] else 'false'}",
+            ]
+            self.push_screen(TaskScreen(f"reboot {target}", argv, _ansible_dir()))
 
-        self.push_screen(
-            ConfirmScreen(f"Reboot '{target}'?\n(rolling, drain-aware — the playbook handles k8s nodes)"),
-            go,
-        )
+        self.push_screen(RebootScreen(target), go)
 
     def action_deploy(self) -> None:
         target = self._target()

@@ -60,6 +60,95 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class RebootScreen(ModalScreen[dict | None]):
+    """Reboot options gate: pick batch order + k8s drain safety.
+
+    Keyboard-driven like ConfirmScreen (no focusable form widgets, so it
+    can't trap arrow/enter the way a RadioSet would) — number keys pick
+    the order, `d` toggles drain, `y` runs. Dismisses with
+    `{"serial": <str>, "drain": <bool>}` or None on cancel; the caller
+    turns that into `-e reboot_serial=… -e drain=…` for the playbook.
+    """
+
+    # (key, label, playbook `serial` value). serial: 1 one-at-a-time,
+    # 2 rolling, "100%" every targeted host at once (0 is rejected by
+    # modern ansible, 100% is the portable "all in one batch").
+    _ORDERS = [
+        ("1", "Serial — one host at a time", "1"),
+        ("2", "Rolling — 2 hosts in flight", "2"),
+        ("3", "All-at-once — every targeted host together", "100%"),
+    ]
+
+    CSS = """
+    RebootScreen { align: center middle; }
+    #reboot-box {
+        width: 76; max-width: 90%; height: auto; padding: 1 2;
+        border: thick $error; background: $surface;
+    }
+    """
+    BINDINGS = [
+        Binding("1", "order('1')", "serial"),
+        Binding("2", "order('2')", "rolling"),
+        Binding("3", "order('3')", "all-at-once"),
+        Binding("d", "toggle_drain", "toggle drain"),
+        Binding("y", "run", "run"),
+        Binding("escape,n", "cancel", "cancel"),
+    ]
+
+    def __init__(self, target: str) -> None:
+        super().__init__()
+        self._target = target
+        self._order = "1"
+        self._drain = True
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(Static(id="reboot-text"), id="reboot-box")
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def action_order(self, key: str) -> None:
+        self._order = key
+        self._refresh()
+
+    def action_toggle_drain(self) -> None:
+        self._drain = not self._drain
+        self._refresh()
+
+    def action_run(self) -> None:
+        serial = next(s for k, _, s in self._ORDERS if k == self._order)
+        self.dismiss({"serial": serial, "drain": self._drain})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _refresh(self) -> None:
+        text = Text()
+        text.append(f"Reboot '{self._target}'?\n\n", style="bold")
+        text.append("Order ", style="bold")
+        text.append("(1/2/3)\n")
+        for key, label, _ in self._ORDERS:
+            on = key == self._order
+            text.append("  ")
+            text.append("●" if on else "○", style="bold green" if on else "dim")
+            text.append(f" {label}\n", style="bold" if on else "dim")
+        text.append("\nk8s ", style="bold")
+        text.append("(d)\n  ")
+        text.append("●" if self._drain else "○", style="bold green" if self._drain else "dim")
+        text.append(
+            " Drain-safe: cordon & drain k8s nodes first"
+            if self._drain
+            else " Skip drain: reboot k8s nodes without draining",
+            style="bold" if self._drain else "dim",
+        )
+        text.append("\n\n")
+        text.append("y", style="bold red")
+        text.append(" to run   ")
+        text.append("esc", style="bold")
+        text.append(" to cancel")
+        self.query_one("#reboot-text", Static).update(text)
+
+
 class TaskScreen(Screen):
     """Run argv, stream output, report the exit code. Esc terminates a
     still-running task before leaving."""
