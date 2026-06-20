@@ -33,6 +33,11 @@ from .deploy import DeployScreen
 from .select_table import SelectTable
 from .tasks import ConfirmScreen, RebootScreen, TaskScreen
 
+# Braille spinner frames for the background-job indicator (see the status
+# machinery below). One shared frame animates every running job at once.
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
 def _ansible_dir() -> Path:
     return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
 
@@ -64,8 +69,65 @@ class ExplorerApp(App):
         self.expected: dict[str, str] | None = None
         self._rev: str | None = None
         self._cached_rev: str | None = None
+        # Background-job state. `_busy` covers any nix eval in flight (the
+        # inventory aggregate on load/reload, or the expected-toplevel eval);
+        # `_surveying` the read-only state survey. Both can run at once.
         self._busy = False
         self._surveying = False
+        self._survey_n = 0  # snapshots surveyed so far this run
+        # Resting bar text shown when no job is running, and the spinner timer.
+        self._status = ""
+        self._status_sticky = False  # an error holds until the next refresh
+        self._spin = 0
+        self._spin_timer = None
+
+    # -- status indicators ---------------------------------------------
+    #
+    # eval and survey run CONCURRENTLY (action_refresh_drift fires both) and
+    # the survey usually finishes first. A single status string meant the
+    # survey's "drift refreshed" stomped the still-running eval, so you
+    # couldn't tell the eval was in flight until the columns moved. Instead
+    # each job owns a running flag; while any are set a timer animates one
+    # spinner and the bar lists every job still running — the eval indicator
+    # stays put after the faster survey lands. With all jobs idle the bar
+    # shows the latest resting message (a result, or a sticky error).
+
+    def _set_status(self, msg: str, *, error: bool = False) -> None:
+        """Set the resting bar message (shown when nothing is running).
+
+        Errors are sticky: a concurrently-finishing success will not
+        overwrite them, so an eval failure survives the survey's "drift
+        refreshed". The stickiness clears when the next refresh begins."""
+        if error or not self._status_sticky:
+            self._status = msg
+            self._status_sticky = error
+        self._render_status()
+
+    def _render_status(self) -> None:
+        jobs: list[str] = []
+        if self._busy:
+            jobs.append("eval")
+        if self._surveying:
+            jobs.append(f"survey ({self._survey_n} read)" if self._survey_n else "survey")
+        if jobs:
+            frame = _SPINNER[self._spin % len(_SPINNER)]
+            self.sub_title = "running   " + "   ·   ".join(f"{frame} {j}" for j in jobs)
+            self._ensure_spinner()
+        else:
+            self.sub_title = self._status
+
+    def _ensure_spinner(self) -> None:
+        if self._spin_timer is None:
+            self._spin_timer = self.set_interval(0.1, self._tick)
+
+    def _tick(self) -> None:
+        self._spin += 1
+        self._render_status()
+        # Stop animating once every job is idle — the resting message needs
+        # no ticking, and a live timer would spin forever.
+        if not (self._busy or self._surveying) and self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
 
     # -- layout --------------------------------------------------------
 
@@ -98,7 +160,10 @@ class ExplorerApp(App):
         """Aggregate eval OFF the UI thread — it takes tens of seconds on
         a real fleet, and blocking on_mount means a gray void instead of
         a first paint."""
-        self.sub_title = f"evaluating {self.inventory.flake}#mandala…"
+        if self._busy:
+            return
+        self._busy = True
+        self._render_status()  # shows the eval spinner
         inv = self.inventory
 
         def work() -> None:
@@ -118,7 +183,11 @@ class ExplorerApp(App):
         self.run_worker(work, thread=True, exclusive=True)
 
     def _load_failed(self, error: str) -> None:
-        self.sub_title = f"aggregate eval failed: {error.splitlines()[-1] if error else 'unknown'}"
+        self._busy = False
+        self._set_status(
+            f"aggregate eval failed: {error.splitlines()[-1] if error else 'unknown'}",
+            error=True,
+        )
 
     def _fill(self) -> None:
         inv = self.inventory
@@ -144,7 +213,8 @@ class ExplorerApp(App):
             groups.add_named_row(group, group, str(len(names)), " ".join(sorted(names)))
 
         self._fill_drift()
-        self.sub_title = (
+        self._busy = False
+        self._set_status(
             f"{len(inv.members)} members, {len(inv.groups)} groups"
             " — space/shift+↑↓ select · p ping · R reboot · D deploy"
         )
@@ -239,7 +309,7 @@ class ExplorerApp(App):
         elif (_ansible_dir() / "playbooks/reboot.yaml").is_file():
             base = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
         else:
-            self.sub_title = "no ans-reboot wrapper or playbooks/reboot.yaml — reboot task unavailable"
+            self._set_status("no ans-reboot wrapper or playbooks/reboot.yaml — reboot task unavailable")
             return
 
         # RebootScreen returns the chosen batch order + drain safety; both
@@ -292,6 +362,7 @@ class ExplorerApp(App):
         completion order converges to the same judgement. Also fired
         automatically once a deploy or reboot completes (see
         `_after_mutation`)."""
+        self._status_sticky = False  # a fresh refresh clears a stale error
         self.action_eval_expected()  # background worker, returns at once
         self.action_survey()  # pushed TaskScreen, runs alongside the eval
 
@@ -308,7 +379,7 @@ class ExplorerApp(App):
         if self._busy:
             return
         self._busy = True
-        self.sub_title = "evaluating expected toplevels (one nix eval)…"
+        self._render_status()  # shows the eval spinner alongside any survey
         nodes = self._deploy_nodes
         flake = self.inventory.flake
 
@@ -337,6 +408,8 @@ class ExplorerApp(App):
         if self._surveying:
             return
         self._surveying = True
+        self._survey_n = 0
+        self._render_status()  # shows the survey spinner alongside any eval
         directory = drift_mod.state_dir()
         cwd = _ansible_dir()
         env = dict(
@@ -396,25 +469,26 @@ class ExplorerApp(App):
             err = None if rc == 0 else (out[-1] if out else None)
             self.call_from_thread(self._survey_done, fresh(), rc, err)
 
-        self.sub_title = "surveying fleet…"
         self.run_worker(work, thread=True, exclusive=True, group="survey")
 
     def _survey_progress(self, n: int) -> None:
-        self.sub_title = f"surveying fleet · {n} read…"
+        self._survey_n = n
+        self._render_status()  # live tally rides the spinner line
 
     def _survey_done(self, n: int, rc: int, error: str | None = None) -> None:
         self._surveying = False
+        self._survey_n = n
         self._fill_drift()
         if rc == 0:
-            self.sub_title = f"drift refreshed · surveyed {n} host{'' if n == 1 else 's'}"
+            self._set_status(f"drift refreshed · surveyed {n} host{'' if n == 1 else 's'}")
         else:
-            self.sub_title = f"survey failed (exit {rc}): {error or ''}".rstrip()
+            self._set_status(f"survey failed (exit {rc}): {error or ''}".rstrip(), error=True)
 
     def _drift_done(self, expected: dict[str, str] | None, error: str | None) -> None:
         self._busy = False
         self.expected = expected
         self._fill_drift()
-        # Don't clobber the live survey tally with "drift refreshed" while a
-        # background survey is still counting — but an eval error always wins.
-        if error or not self._surveying:
-            self.sub_title = error or "drift refreshed"
+        # _render_status keeps the survey spinner up if it is still counting,
+        # so this resting message only surfaces once both jobs are idle; an
+        # eval error is sticky and wins over the survey's success message.
+        self._set_status(error or "drift refreshed", error=error is not None)
