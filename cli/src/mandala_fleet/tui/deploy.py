@@ -64,10 +64,15 @@ class DeployScreen(Screen):
         Binding("s", "summary_tab", "summary tab"),
     ]
 
-    def __init__(self, run: DeployRun, standalone: bool = False) -> None:
+    def __init__(
+        self, run: DeployRun, standalone: bool = False, attached: bool = False
+    ) -> None:
         super().__init__()
         self.run_model = run
         self.standalone = standalone
+        # attached: the run was already launched elsewhere (e.g. by a
+        # Claude-triggered deploy) and we only tail it — never re-launch.
+        self.attached = attached
         self._rendered: dict[str, int] = {}
         self._build_rendered = 0
         self._nom_finished = False
@@ -85,7 +90,8 @@ class DeployScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.run_model.start()
+        if not self.attached:
+            self.run_model.start()
         # Live-wire the internal-json stream into the nom tab — attached
         # before the first poll, so nom sees the build from line one.
         if self.run_model.tailer is not None:

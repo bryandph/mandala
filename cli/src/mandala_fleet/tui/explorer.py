@@ -21,10 +21,12 @@ from collections import deque
 from pathlib import Path
 
 from rich.text import Text
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
+from textual.message import Message
+from textual.widgets import Footer, Header, RichLog, Static, TabbedContent, TabPane
 
 from .. import drift as drift_mod
 from ..inventory import Inventory, surfaces
@@ -42,6 +44,14 @@ def _ansible_dir() -> Path:
     return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
 
 
+class McpActivity(Message):
+    """One MCP tool call observed by the hosted server (for the activity pane)."""
+
+    def __init__(self, event: dict) -> None:
+        super().__init__()
+        self.event = event
+
+
 class ExplorerApp(App):
     """Fleet explorer: tabs to browse and select, keys to act."""
 
@@ -53,6 +63,10 @@ class ExplorerApp(App):
     #views { height: 1fr; }
     #members-table, #groups-table, #drift-table { height: 1fr; }
     #drift-hint { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
+    #mcp-activity {
+        dock: right; width: 52; border-left: solid $surface;
+        padding: 0 1; background: $panel;
+    }
     """
     BINDINGS = [
         Binding("q", "quit", "quit"),
@@ -63,9 +77,19 @@ class ExplorerApp(App):
         Binding("D", "deploy", "deploy selection"),
     ]
 
-    def __init__(self, inventory: Inventory) -> None:
+    def __init__(
+        self,
+        inventory: Inventory,
+        serve_mcp: bool = False,
+        mcp_port: int = 7878,
+        mcp_rotate_token: bool = False,
+    ) -> None:
         super().__init__()
         self.inventory = inventory
+        self._serve_mcp = serve_mcp
+        self._mcp_port = mcp_port
+        self._mcp_rotate_token = mcp_rotate_token
+        self._attached_runs: set[str] = set()
         self.expected: dict[str, str] | None = None
         self._rev: str | None = None
         self._cached_rev: str | None = None
@@ -133,6 +157,8 @@ class ExplorerApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        if self._serve_mcp:
+            yield RichLog(id="mcp-activity", wrap=True, markup=True, max_lines=2000)
         with TabbedContent(initial="tab-members", id="views"):
             with TabPane("members", id="tab-members"):
                 yield SelectTable(id="members-table", zebra_stripes=True, cursor_type="row")
@@ -153,6 +179,69 @@ class ExplorerApp(App):
         drift = self.query_one("#drift-table", SelectTable)
         drift.add_columns("", "member", "status", "current", "expected", "booted", "captured")
         self._load()
+        if self._serve_mcp:
+            self.run_worker(self._serve_mcp_host(), name="mcp-host", exclusive=False)
+
+    # -- embedded MCP host ---------------------------------------------
+
+    async def _serve_mcp_host(self) -> None:
+        """Host the fleet MCP server over loopback HTTP in this app's loop;
+        every tool call posts into the activity pane. Bound for the operator's
+        own session, guarded by a bearer token in a 0600 discovery file."""
+        from ..mcp.host import serve_http
+        from ..mcp.session import ensure_session, session_path
+
+        url = f"http://127.0.0.1:{self._mcp_port}/mcp"
+        token = ensure_session(url, rotate=self._mcp_rotate_token)
+        log = self.query_one("#mcp-activity", RichLog)
+        log.write(Text("Claude activity — MCP host", style="bold"))
+        log.write(Text(f"{url}", style="cyan"))
+        log.write(Text(f"token: {session_path()}", style="dim"))
+        log.write(Text("watching for tool calls…\n", style="dim"))
+        try:
+            await serve_http(
+                self.inventory,
+                token=token,
+                port=self._mcp_port,
+                activity_sink=lambda e: self.post_message(McpActivity(e)),
+            )
+        except Exception as e:  # noqa: BLE001 — surface bind/serve failure in-pane
+            log.write(Text(f"MCP host stopped: {e}", style="bold red"))
+
+    @on(McpActivity)
+    def _on_mcp_activity(self, message: McpActivity) -> None:
+        e = message.event
+        tool, status = e.get("tool", "?"), e.get("status", "?")
+        args = e.get("args") or {}
+        arg_str = " ".join(f"{k}={v!r}" for k, v in args.items())
+        style = "green" if status == "ok" else "bold red"
+        line = Text()
+        line.append(f"▸ {tool}", style="bold")
+        if arg_str:
+            line.append(f"  {arg_str}", style="dim")
+        line.append(f"  [{status}]", style=style)
+        if e.get("detail"):
+            line.append(f"  {e['detail']}", style="red")
+        self.query_one("#mcp-activity", RichLog).write(line)
+        # A client-launched deploy renders like a human one: attach the live
+        # per-host deploy view to the run the tool just registered.
+        if tool == "deploy" and status == "ok":
+            self._attach_latest_deploy()
+
+    def _attach_latest_deploy(self) -> None:
+        from .. import registry
+
+        runs = registry.list_runs()
+        if not runs:
+            return
+        run_id = runs[0].run_id
+        if run_id in self._attached_runs:
+            return
+        run = DeployRun.attach(run_id)
+        if run is None:
+            return
+        self._attached_runs.add(run_id)
+        self.push_screen(DeployScreen(run, attached=True))
 
     # -- data ----------------------------------------------------------
 

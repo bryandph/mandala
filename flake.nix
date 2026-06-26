@@ -50,7 +50,7 @@
         pyproject = true;
         src = ./cli;
         build-system = [pkgs.python3Packages.setuptools];
-        dependencies = with pkgs.python3Packages; [typer textual pyte];
+        dependencies = with pkgs.python3Packages; [typer textual pyte fastmcp];
         # The runner demux / selector-resolution tests are the headless
         # half of the TUI verification — they gate the package build.
         nativeCheckInputs = [pkgs.python3Packages.pytestCheckHook];

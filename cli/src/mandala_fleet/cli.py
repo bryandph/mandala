@@ -184,6 +184,20 @@ def version() -> None:
     typer.echo(__version__)
 
 
+@app.command()
+def mcp(ctx: typer.Context) -> None:
+    """Run the fleet MCP server over stdio (headless — for Claude Code).
+
+    The same server `mandala tui --mcp` hosts over HTTP, here as a plain
+    stdio child process: no port, no token. Reads (members/groups/resolve/
+    ping/host_eval/drift) plus the confirmation-gated action tiers
+    (build/deploy/reboot) and deploy monitoring."""
+    from .mcp import build_server
+
+    inv: Inventory = ctx.obj
+    build_server(inv).run()  # stdio transport (FastMCP default)
+
+
 tui_app = typer.Typer(
     help="Textual TUI tiers: read-only explorer + drift dashboard; deploy runner",
     invoke_without_command=True,
@@ -191,13 +205,33 @@ tui_app = typer.Typer(
 
 
 @tui_app.callback(invoke_without_command=True)
-def tui_main(ctx: typer.Context) -> None:
-    """`mandala tui` opens the read-only fleet explorer."""
+def tui_main(
+    ctx: typer.Context,
+    mcp: bool = typer.Option(
+        False, "--mcp", help="Host the fleet MCP server (loopback HTTP) and show a live Claude-activity pane"
+    ),
+    mcp_port: int = typer.Option(
+        7878, "--mcp-port", help="Port for the embedded MCP HTTP endpoint"
+    ),
+    mcp_rotate_token: bool = typer.Option(
+        False, "--mcp-rotate-token", help="Mint a fresh bearer token before serving"
+    ),
+) -> None:
+    """`mandala tui` opens the read-only fleet explorer.
+
+    With `--mcp` it also hosts the fleet MCP server over a loopback HTTP
+    endpoint (bearer-token guarded) so an AI operator can drive the fleet
+    while you watch every call in the activity pane."""
     if ctx.invoked_subcommand is not None:
         return
     from .tui.explorer import ExplorerApp
 
-    ExplorerApp(ctx.obj).run()
+    ExplorerApp(
+        ctx.obj,
+        serve_mcp=mcp,
+        mcp_port=mcp_port,
+        mcp_rotate_token=mcp_rotate_token,
+    ).run()
 
 
 @tui_app.command("deploy")

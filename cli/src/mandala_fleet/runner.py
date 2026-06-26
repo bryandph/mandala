@@ -3,10 +3,16 @@ demux the per-host JSONL event streams into host state machines.
 
 The playbook remains the engine — the --limit guard, throttle, and
 deploy-rs magic rollback are never bypassed; this module only launches
-it (with MANDALA_FLEET_EVENTS pointed at a private directory) and tails
-the event files the mandala.fleet plugins append. The TUI renders from
-these models without knowing which engine emitted the events — the
-protocol (module_utils/events.py, v1) is the whole contract.
+it (with MANDALA_FLEET_EVENTS pointed at a run directory) and tails the
+event files the mandala.fleet plugins append. The TUI renders from these
+models without knowing which engine emitted the events — the protocol
+(module_utils/events.py, v1) is the whole contract.
+
+By default a run launches into the discoverable run registry (registry.py)
+rather than a private mkdtemp, so a second TUI, the CLI, or the fleet MCP
+server can attach to an in-flight or recent run and render it from the same
+event streams. Passing an explicit `events_dir` keeps the old private
+behavior (and is what the tests use).
 
 Headless-safe and frontend-agnostic: nothing here imports textual.
 """
@@ -16,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -187,10 +192,39 @@ class DeployRun:
     ansible_dir: Path | None = None
     playbook: str | None = None
     events_dir: Path | None = None
+    run_id: str | None = None
     _proc: subprocess.Popen | None = None
     tailer: EventTailer | None = None
     output: deque = field(default_factory=lambda: deque(maxlen=4000))
     started_at: float | None = None
+    # Observer mode: attached to a run another process launched (e.g. a
+    # Claude-triggered deploy). No subprocess is owned; liveness/returncode
+    # are derived from the registry pid + sticky terminal host states.
+    _attached: bool = False
+    _meta_pid: int | None = None
+
+    @classmethod
+    def attach(cls, run_id: str) -> DeployRun | None:
+        """Read-only attach to an already-launched registry run: tail its
+        events without owning a subprocess, so a run started by another
+        frontend can be rendered identically. None if the run is gone."""
+        from . import registry
+
+        obs = registry.open_run(run_id)
+        if obs is None:
+            return None
+        meta = obs.info.meta
+        run = cls(
+            limit=meta.get("limit", ""),
+            dry_activate=bool(meta.get("dry_activate", False)),
+            events_dir=obs.info.path,
+            run_id=run_id,
+        )
+        run.tailer = obs.tailer
+        run._attached = True
+        run._meta_pid = meta.get("pid")
+        run.started_at = time.monotonic()  # for elapsed display only
+        return run
 
     def resolve_paths(self) -> None:
         if self.ansible_dir is None:
@@ -199,7 +233,11 @@ class DeployRun:
             wrapper = self.ansible_dir / "playbooks/deploy.yaml"
             self.playbook = "playbooks/deploy.yaml" if wrapper.is_file() else "mandala.fleet.deploy"
         if self.events_dir is None:
-            self.events_dir = Path(tempfile.mkdtemp(prefix="mandala-events-"))
+            # Default into the discoverable registry; lazy import keeps the
+            # registry's `from .runner import ...` from cycling at load time.
+            from . import registry
+
+            self.run_id, self.events_dir = registry.new_run_dir()
 
     def start(self) -> None:
         self.resolve_paths()
@@ -234,6 +272,23 @@ class DeployRun:
         except OSError as e:
             self.output.append(f"failed to launch {argv[0]}: {e}")
             return
+        # Record the run so other frontends (a second TUI, the MCP server)
+        # can discover it and tail the same events. Keyed on the live
+        # subprocess pid so an observer can judge liveness without owning it.
+        try:
+            from . import registry
+
+            registry.write_meta(self.events_dir, {
+                "run_id": self.run_id,
+                "limit": self.limit,
+                "dry_activate": self.dry_activate,
+                "throttle": self.throttle,
+                "playbook": str(self.playbook),
+                "pid": self._proc.pid,
+                "started_at": time.time(),
+            })
+        except OSError:
+            pass  # a registry write must never sink the run itself
         # Dedicated reader thread: readline() blocks safely HERE instead
         # of stalling the UI tick on a partial line.
         import threading
@@ -251,12 +306,25 @@ class DeployRun:
 
     @property
     def returncode(self) -> int | None:
+        if self._attached:
+            if not self.finished:
+                return None
+            # Derive an exit code from the sticky terminal host states: any
+            # failed/rolled-back host means the run did not cleanly succeed.
+            states = {h.state for h in (self.tailer.hosts.values() if self.tailer else [])}
+            return 1 if (states & {HostState.FAILED, HostState.ROLLED_BACK}) else 0
         return None if self._proc is None else self._proc.poll()
 
     @property
     def finished(self) -> bool:
+        if self._attached:
+            from . import registry
+
+            return not registry.pid_alive(self._meta_pid)
         return self.returncode is not None
 
     def terminate(self) -> None:
+        if self._attached:
+            return  # an observer never owns the subprocess
         if self._proc is not None and self._proc.poll() is None:
             self._proc.terminate()
