@@ -55,6 +55,7 @@ _STATE_GLYPH = {
 class DeployScreen(Screen):
     CSS = """
     #build { height: 3; border: solid $surface; padding: 0 1; }
+    #hosts { height: 1fr; }
     #recap { dock: bottom; height: 1; padding: 0 1; }
     """
     BINDINGS = [

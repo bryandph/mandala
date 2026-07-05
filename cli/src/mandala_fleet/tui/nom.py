@@ -46,6 +46,12 @@ def _color(value: str) -> str | None:
 class NomPane(Static):
     """Feed internal-json lines via .feed(); everything else is automatic."""
 
+    # Static defaults to height:auto, which would size this pane to its own
+    # rendered content — the pyte screen — locking the PTY at the _dims()
+    # floor forever. 1fr claims the tab's full height so content_size (and
+    # therefore nom's terminal) tracks the actual available space.
+    DEFAULT_CSS = "NomPane { height: 1fr; }"
+
     def __init__(self, **kwargs) -> None:
         super().__init__("", **kwargs)
         self._proc: subprocess.Popen | None = None
