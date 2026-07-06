@@ -22,9 +22,9 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from .. import drift as drift_mod
-from ..inventory import Inventory, InventoryError
+from ..inventory import Inventory, InventoryError, surfaces
 from ..registry import RunLiveness
-from ..runner import HostState
+from ..runner import COMMAND_LOG, HostState
 from .errors import from_called_process, from_completed
 
 
@@ -60,13 +60,26 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         mcp.add_middleware(ActivityMiddleware(activity_sink))
 
     @mcp.tool
-    def members() -> dict[str, dict]:
-        """Every fleet member (NixOS + facts-only) with its aggregate
-        metadata — platform, arch, role, tags, management surfaces."""
+    def members(full: bool = False) -> dict:
+        """Every fleet member (NixOS + facts-only). Compact by default —
+        platform, arch, category, role, tags, surfaces (a=ansible
+        d=deploy-rs s=sops) per member — because the full aggregate dump
+        is tens of KB and blows client tool-result caps. `full=true`
+        returns everything; `host_eval` gives one member's full record."""
         try:
-            return inv.members
+            roster = inv.members
         except InventoryError as e:
             raise ToolError(str(e)) from e
+        if full:
+            return roster
+        keep = ("platform", "architecture", "category", "role", "tags")
+        return {
+            name: {
+                **{k: m[k] for k in keep if k in m},
+                "surfaces": surfaces(m),
+            }
+            for name, m in roster.items()
+        }
 
     @mcp.tool
     def groups() -> dict[str, list[str]]:
@@ -93,15 +106,23 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             raise ToolError(str(e)) from e
 
     @mcp.tool
-    def ping(selector: str) -> dict:
+    def ping(selector: str, forks: int = 15, connect_timeout: int = 10) -> dict:
         """Ansible reachability probe over a resolved selector — per-host
         reachable/unreachable. Read-only: it changes no fleet state. The raw
-        ansible output is included so an unreachable host can be debugged."""
+        ansible output is included so an unreachable host can be debugged.
+        `forks` probes hosts concurrently and `connect_timeout` (seconds)
+        caps each ssh attempt, so a whole-fleet probe with a few dead
+        workstations finishes inside a client's tool-call budget instead
+        of serially waiting out every unreachable host."""
         try:
             limit = inv.to_limit(selector)
         except InventoryError as e:
             raise ToolError(str(e)) from e
-        argv = ["ansible", limit, "-m", "ping", "-o"]
+        argv = [
+            "ansible", limit, "-m", "ping", "-o",
+            "-f", str(max(1, forks)),
+            "-T", str(max(1, connect_timeout)),
+        ]
         try:
             proc = subprocess.run(
                 argv, cwd=_ansible_dir(), env=_adhoc_env(),
@@ -227,7 +248,12 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
     def _run_snapshot(obs) -> dict:
         """Per-host states + build progress for one registry run. A
         failed/rolled-back host carries its raw stream so the client can
-        debug it (the same text the operator reads in the failed host tab)."""
+        debug it (the same text the operator reads in the failed host tab).
+        A command run (reboot, …) has no event streams: its snapshot is
+        liveness (pid, then the reaped rc) plus the tail of its teed
+        output.log."""
+        if obs.info.kind != "deploy":
+            return _command_snapshot(obs)
         obs.poll()
         hosts = {}
         for name, h in obs.tailer.hosts.items():
@@ -252,6 +278,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             phase = "fan-out"
         return {
             "run_id": obs.info.run_id,
+            "kind": obs.info.kind,
             "meta": obs.info.meta,
             "liveness": liveness.value,
             "phase": phase,
@@ -266,19 +293,41 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             },
         }
 
+    def _command_snapshot(obs, tail: int = 120) -> dict:
+        liveness = obs.liveness()
+        log_path = obs.info.path / COMMAND_LOG
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        return {
+            "run_id": obs.info.run_id,
+            "kind": obs.info.kind,
+            "meta": obs.info.meta,
+            "liveness": liveness.value,
+            "phase": "running" if liveness is RunLiveness.RUNNING else "done",
+            "log": str(log_path),
+            "output_tail": lines[-tail:],
+        }
+
     @mcp.tool
     def deploy_status(
         run_id: str | None = None, limit: int = 10, wait_seconds: int = 0
     ) -> dict:
-        """Live and recent deploy state from the shared run registry — so a
-        deploy launched from any frontend (TUI, CLI, or this server) is
-        observable. With a `run_id`, report just that run; otherwise the most
-        recent `limit` runs. Per-host states come from the protocol's sticky
-        terminal states, so a confirmed host stays confirmed and a rolled-back
-        host stays flagged. `milestones` is the raw per-host event sequence —
-        repeats (activate, wait, activate, …) are genuine re-entries from the
-        engine, not display noise. `phase` summarizes where a live run is:
-        `batch-build` (play 1, no per-host events yet) → `fan-out` → `done`.
+        """Live and recent run state from the shared run registry — EVERY
+        registered run kind (deploys and command runs like reboot), from
+        any frontend (TUI, CLI, or this server). With a `run_id`, report
+        just that run; otherwise the most recent `limit` runs — which also
+        surfaces orphaned/lingering runs (`liveness: running` with an old
+        `started_at`). Deploy runs report per-host states from the
+        protocol's sticky terminal states, so a confirmed host stays
+        confirmed and a rolled-back host stays flagged; `milestones` is the
+        raw per-host event sequence — repeats (activate, wait, activate, …)
+        are genuine re-entries from the engine, not display noise. `phase`
+        summarizes where a live deploy is: `batch-build` (play 1, no
+        per-host events yet) → `fan-out` → `done`. Command runs report
+        liveness (pid, then the reaped exit code in `meta.rc`) plus the
+        tail of their teed `output.log`.
 
         `wait_seconds` (with a `run_id`) blocks until the run leaves the
         `running` state or the wait elapses — one call instead of a poll
@@ -447,8 +496,13 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         `drain` options the TUI offers. Requires `confirm` to equal the
         resolved `--limit` target, else it refuses WITHOUT launching. Prefers
         the operator's `ans-reboot` wrapper (which carries the env the k8s
-        drain needs), falling back to `playbooks/reboot.yaml`. Runs to
-        completion; a failure returns the ansible output."""
+        drain needs), falling back to `playbooks/reboot.yaml`.
+
+        Launches as a REGISTERED BACKGROUND RUN and returns `run_id` at
+        once — a rolling reboot far outlives any client timeout, and this
+        way the run stays observable (TUI, `deploy_status`) instead of
+        orphaning. Follow with `deploy_status(run_id, wait_seconds=…)`;
+        the playbook output streams to the returned `log` file either way."""
         import shutil
 
         try:
@@ -475,18 +529,29 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             "-e", f"reboot_serial={serial}",
             "-e", f"drain={'true' if drain else 'false'}",
         ]
-        try:
-            proc = subprocess.run(argv, cwd=ansible_dir, capture_output=True, text=True)
-        except FileNotFoundError as e:
-            raise ToolError(f"{base[0]} not found on PATH") from e
-        if proc.returncode != 0:
-            return {"limit": target, **from_completed("reboot failed", proc)}
+        from ..runner import CommandRun
+
+        run = CommandRun(
+            argv=argv,
+            kind="reboot",
+            cwd=ansible_dir,
+            extra_meta={"limit": target, "serial": serial, "drain": drain},
+        )
+        run.start()
+        if not run.launched:
+            return {
+                "ok": False,
+                "error": f"failed to launch {argv[0]} — see log",
+                "run_id": run.run_id,
+                "log": str(run.log_path),
+            }
         return {
             "ok": True,
+            "run_id": run.run_id,
             "limit": target,
             "serial": serial,
             "drain": drain,
-            "output": (proc.stdout + proc.stderr).strip(),
+            "log": str(run.log_path),
         }
 
     return mcp

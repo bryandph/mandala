@@ -219,3 +219,71 @@ class TaskScreen(Screen):
         # dismiss (not pop): callers that pushed with a callback get the
         # exit code and can refresh their views.
         self.dismiss(None if self._proc is None else self._proc.poll())
+
+
+class AttachedLogScreen(Screen):
+    """Read-only observer of a registered command run (an MCP-launched
+    reboot): tail its output.log live and report liveness/exit from the
+    run registry. Never owns the subprocess — esc just detaches, the
+    run keeps going."""
+
+    BINDINGS = [Binding("escape,q", "close", "detach (run keeps going)")]
+
+    def __init__(self, title: str, run_id: str) -> None:
+        super().__init__()
+        self._title = title
+        self._run_id = run_id
+        self._offset = 0
+        self._settled = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield RichLog(wrap=True, max_lines=8000)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.app.sub_title = self._title
+        self.set_interval(0.5, self._pump)
+        self._pump()
+
+    def _pump(self) -> None:
+        from ..registry import RunLiveness, open_run
+        from ..runner import COMMAND_LOG
+
+        log = self.query_one(RichLog)
+        obs = open_run(self._run_id)
+        if obs is None:
+            if not self._settled:
+                self._settled = True
+                log.write(Text(f"run {self._run_id} is gone (pruned?)", style="bold red"))
+            return
+        path = obs.info.path / COMMAND_LOG
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._offset)
+                chunk = fh.read()
+                self._offset = fh.tell()
+        except OSError:
+            chunk = ""
+        for line in chunk.splitlines():
+            log.write(to_text(line))
+        if self._settled:
+            return
+        liveness = obs.liveness()
+        if liveness is not RunLiveness.RUNNING:
+            self._settled = True
+            rc = obs.info.meta.get("rc")
+            style = "bold green" if liveness is RunLiveness.FINISHED else "bold red"
+            log.write(Text(f"— {liveness.value} (rc={rc})", style=style))
+
+    def action_close(self) -> None:
+        from ..registry import RunLiveness, open_run
+
+        # An observer never terminates the run; hand back its rc (None
+        # while still running) so _after_mutation can refresh drift once
+        # a finished reboot's screen closes.
+        obs = open_run(self._run_id)
+        rc = None
+        if obs is not None and obs.liveness() is not RunLiveness.RUNNING:
+            rc = obs.info.meta.get("rc")
+        self.dismiss(rc)

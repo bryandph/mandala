@@ -224,25 +224,39 @@ class ExplorerApp(App):
         if e.get("detail"):
             line.append(f"  {e['detail']}", style="red")
         self.query_one("#mcp-activity", RichLog).write(line)
-        # A client-launched deploy renders like a human one: attach the live
-        # per-host deploy view to the run the tool just registered.
+        # A client-launched run renders like a human one: attach the live
+        # per-host deploy view (deploys) or the log-tail observer (reboots)
+        # to the run the tool just registered.
         if tool == "deploy" and status == "ok":
-            self._attach_latest_deploy()
+            self._attach_latest_run("deploy")
+        elif tool == "reboot" and status == "ok":
+            self._attach_latest_run("reboot")
 
-    def _attach_latest_deploy(self) -> None:
+    def _attach_latest_run(self, kind: str) -> None:
         from .. import registry
+        from .tasks import AttachedLogScreen
 
-        runs = registry.list_runs()
-        if not runs:
+        for info in registry.list_runs():  # most-recent first
+            if info.kind != kind:
+                continue
+            # A refused call (confirm mismatch) launches nothing but still
+            # logs ok — only a run whose pid is alive is the one just fired.
+            if not registry.pid_alive(info.pid):
+                return
+            run_id = info.run_id
+            if run_id in self._attached_runs:
+                return
+            self._attached_runs.add(run_id)
+            if kind == "deploy":
+                run = DeployRun.attach(run_id)
+                if run is not None:
+                    self.push_screen(DeployScreen(run, attached=True))
+                return
+            title = f"{kind} {info.meta.get('limit', '')}".strip()
+            self.push_screen(
+                AttachedLogScreen(title, run_id), self._after_mutation
+            )
             return
-        run_id = runs[0].run_id
-        if run_id in self._attached_runs:
-            return
-        run = DeployRun.attach(run_id)
-        if run is None:
-            return
-        self._attached_runs.add(run_id)
-        self.push_screen(DeployScreen(run, attached=True))
 
     # -- data ----------------------------------------------------------
 

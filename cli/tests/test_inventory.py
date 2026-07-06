@@ -34,7 +34,30 @@ def test_unknown_selectors_fail_by_name() -> None:
         _inv().resolve("ghost")
 
 
-def test_to_limit_pins_groups_but_passes_plain_lists() -> None:
+def test_to_limit_always_pins_the_resolved_set() -> None:
     inv = _inv()
     assert inv.to_limit("@k3s") == "cache,web"
-    assert inv.to_limit("web,cache") == "web,cache"  # untouched, no @
+    # Plain lists are canonicalized (sorted) and validated, so the confirm
+    # string is stable however the operator spelled the selector.
+    assert inv.to_limit("web,cache") == "cache,web"
+    with pytest.raises(InventoryError, match="no such member: ghost"):
+        inv.to_limit("ghost")
+
+
+def test_all_keyword_and_exclusions() -> None:
+    inv = _inv()
+    assert inv.resolve("all") == ["cache", "router", "web"]
+    assert inv.resolve("all,!router") == ["cache", "web"]
+    assert inv.resolve("all,!@k3s") == ["router"]
+    # A bare exclusion implies `all` as the base set.
+    assert inv.resolve("!@k3s") == ["router"]
+    with pytest.raises(InventoryError, match="resolves to no members"):
+        inv.resolve("all,!all")
+    with pytest.raises(InventoryError, match="empty selector"):
+        inv.resolve("")
+
+
+def test_ansible_colon_spelling() -> None:
+    # `all:!vishnu`-style separators work like commas.
+    assert _inv().resolve("all:!router") == ["cache", "web"]
+    assert _inv().to_limit("@k3s:router") == "cache,router,web"

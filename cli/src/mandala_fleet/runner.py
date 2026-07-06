@@ -328,3 +328,91 @@ class DeployRun:
             return  # an observer never owns the subprocess
         if self._proc is not None and self._proc.poll() is None:
             self._proc.terminate()
+
+
+# Command-run output file: sits beside the event JSONLs in the run dir
+# (EventTailer globs *.jsonl, so it never routes this).
+COMMAND_LOG = "output.log"
+
+
+@dataclass
+class CommandRun:
+    """A registered background command (reboot playbook, …): the argv runs
+    detached with stdout+stderr teed to `output.log` under a registry run
+    dir, `meta.json` carries kind + pid so any frontend can discover and
+    tail it, and a reaper thread records the exit code into meta when the
+    subprocess exits. The launching client (an MCP call, a TUI screen)
+    can therefore vanish — timeout, quit — without orphaning the run
+    unobservably or losing its output."""
+
+    argv: list[str]
+    kind: str
+    cwd: Path | None = None
+    extra_meta: dict = field(default_factory=dict)
+    run_id: str | None = None
+    run_dir: Path | None = None
+    _proc: subprocess.Popen | None = None
+
+    @property
+    def log_path(self) -> Path | None:
+        return None if self.run_dir is None else self.run_dir / COMMAND_LOG
+
+    def start(self) -> None:
+        from . import registry
+
+        self.run_id, self.run_dir = registry.new_run_dir()
+        env = dict(os.environ)
+        env.setdefault("ANSIBLE_FORCE_COLOR", "0")
+        env["PYTHONUNBUFFERED"] = "1"
+        log = open(self.log_path, "a", encoding="utf-8")
+        log.write(f"$ {' '.join(self.argv)}  (cwd={self.cwd or '.'})\n")
+        log.flush()
+        try:
+            self._proc = subprocess.Popen(
+                self.argv,
+                cwd=self.cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as e:
+            log.write(f"failed to launch {self.argv[0]}: {e}\n")
+            log.close()
+            registry.write_meta(self.run_dir, {
+                "run_id": self.run_id,
+                "kind": self.kind,
+                "pid": None,
+                "rc": 127,
+                "error": str(e),
+                "started_at": time.time(),
+                **self.extra_meta,
+            })
+            return
+        log.close()  # the subprocess holds its own fd now
+        registry.write_meta(self.run_dir, {
+            "run_id": self.run_id,
+            "kind": self.kind,
+            "pid": self._proc.pid,
+            "argv": self.argv,
+            "started_at": time.time(),
+            **self.extra_meta,
+        })
+
+        # Reap in the background: liveness flips from pid-alive to the
+        # recorded rc, so an observer's judgement survives the launcher's
+        # client disappearing (only the launcher PROCESS dying loses it).
+        import threading
+
+        def reap() -> None:
+            rc = self._proc.wait()
+            try:
+                registry.update_meta(self.run_dir, rc=rc, finished_at=time.time())
+            except OSError:
+                pass  # the run dir may have been pruned underneath us
+
+        threading.Thread(target=reap, daemon=True).start()
+
+    @property
+    def launched(self) -> bool:
+        return self._proc is not None

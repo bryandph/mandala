@@ -91,6 +91,13 @@ class RunInfo:
     def pid(self) -> int | None:
         return self.meta.get("pid")
 
+    @property
+    def kind(self) -> str:
+        """What launched into this run dir: `deploy` (event-streaming
+        playbook) or a command kind (`reboot`, …) whose only stream is
+        its teed output.log."""
+        return self.meta.get("kind", "deploy")
+
 
 def read_meta(path: Path) -> dict:
     try:
@@ -100,9 +107,19 @@ def read_meta(path: Path) -> dict:
 
 
 def write_meta(path: Path, meta: dict) -> None:
-    (Path(path) / _META).write_text(
-        json.dumps(meta, indent=1, sort_keys=True)
-    )
+    # Atomic replace: the launcher REWRITES meta (the reaper recording rc)
+    # while observers poll it — a partial read must never surface as an
+    # empty meta / wrong kind.
+    target = Path(path) / _META
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, indent=1, sort_keys=True))
+    os.replace(tmp, target)
+
+
+def update_meta(path: Path, **fields) -> None:
+    """Merge fields into an existing meta.json (read-modify-write) — how
+    a launcher records the exit code once its command run finishes."""
+    write_meta(path, {**read_meta(path), **fields})
 
 
 def list_runs() -> list[RunInfo]:
@@ -155,10 +172,19 @@ class ObservedRun:
         return self.tailer.poll()
 
     def liveness(self) -> RunLiveness:
+        # Meta is written and UPDATED by the launcher (pid at start, rc when
+        # the reaper fires) — re-read it so a long-attached observer sees
+        # the exit code land instead of judging from a stale snapshot.
+        self.info.meta = read_meta(self.info.path)
         # A live pid means the fan-out is still going, even if one host has
         # already reached a sticky terminal state.
         if pid_alive(self.info.pid):
             return RunLiveness.RUNNING
+        # A command run (reboot, …) has no host event streams; its launcher
+        # records the exit code into meta when the subprocess exits.
+        rc = self.info.meta.get("rc")
+        if rc is not None:
+            return RunLiveness.FINISHED if rc == 0 else RunLiveness.FAILED
         states = {h.state for h in self.tailer.hosts.values()}
         if HostState.ROLLED_BACK in states:
             return RunLiveness.ROLLED_BACK

@@ -114,3 +114,23 @@ def test_open_run_liveness_rollback_and_unknown(tmp_path: Path, monkeypatch) -> 
     assert obs_unk.liveness() is RunLiveness.UNKNOWN
 
     assert registry.open_run("nonesuch") is None
+
+
+def test_command_run_liveness_from_reaped_rc(monkeypatch) -> None:
+    """A command run (reboot) has no host event streams: liveness comes
+    from the pid, then the exit code the launcher's reaper recorded —
+    and a long-attached observer must see the rc land (meta re-read)."""
+    run_id, path = registry.new_run_dir()
+    registry.write_meta(path, {"run_id": run_id, "kind": "reboot", "pid": 4242})
+    obs = registry.open_run(run_id)
+    assert obs.info.kind == "reboot"
+
+    monkeypatch.setattr(registry, "pid_alive", lambda pid: pid == 4242)
+    assert obs.liveness() is RunLiveness.RUNNING
+
+    # The reaper fires AFTER the observer attached: pid replaced, rc merged.
+    registry.update_meta(path, pid=None, rc=0)
+    assert obs.liveness() is RunLiveness.FINISHED
+
+    registry.update_meta(path, rc=2)
+    assert obs.liveness() is RunLiveness.FAILED

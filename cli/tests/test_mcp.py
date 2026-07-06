@@ -47,6 +47,23 @@ def test_lists_read_drift_and_action_tools() -> None:
     } <= names
 
 
+def test_members_compact_by_default_full_on_request() -> None:
+    mcp = build_server(_inv())
+    compact = _call(mcp, "members", {})
+    # Compact: only the whitelisted keys + surfaces, never the full dump.
+    assert compact["web"] == {"platform": "metal", "surfaces": "---"}
+    full = _call(mcp, "members", {"full": True})
+    assert full["web"] == {"platform": "metal"}
+
+
+def test_selector_taxonomy_reaches_the_tools() -> None:
+    # `all` and `!` exclusions resolve through the same core the gated
+    # actions confirm against.
+    data = _call(build_server(_inv()), "resolve", {"selector": "all,!@gateway"})
+    assert data["members"] == ["cache", "web"]
+    assert data["limit"] == "cache,web"
+
+
 def test_deploy_real_activation_refused_without_confirm() -> None:
     inv = _inv()
     data = _call(build_server(inv), "deploy", {"selector": "@k3s", "dry_activate": False})
@@ -59,6 +76,69 @@ def test_reboot_refused_without_matching_confirm() -> None:
     data = _call(build_server(_inv()), "reboot", {"selector": "@k3s", "confirm": "web"})
     assert data["refused"] is True
     assert data["required_confirm"] == "cache,web"
+
+
+def test_reboot_launches_registered_background_run(monkeypatch, tmp_path) -> None:
+    """A confirmed reboot returns run_id immediately (no blocking on the
+    playbook) and registers a kind=reboot run — observable via
+    deploy_status and the TUI even if this client times out."""
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    import shutil
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/fake/ans-reboot" if name == "ans-reboot" else None
+    )
+
+    class _FakePopen:
+        pid = 54321
+
+        def __init__(self, argv, **kwargs):
+            self.argv = argv
+
+        def wait(self):
+            return 0
+
+    from mandala_fleet import registry, runner
+
+    monkeypatch.setattr(runner.subprocess, "Popen", _FakePopen)
+    data = _call(
+        build_server(_inv()),
+        "reboot",
+        {"selector": "@k3s", "serial": "2", "confirm": "cache,web"},
+    )
+    assert data["ok"] is True and data["run_id"]
+    assert data["log"].endswith("output.log")
+
+    # The reaper thread records rc=0 (the fake wait) — poll until it lands.
+    import time
+
+    path = registry.runs_dir() / data["run_id"]
+    deadline = time.monotonic() + 10
+    while "rc" not in (meta := registry.read_meta(path)):
+        assert time.monotonic() < deadline, "reaper never recorded rc"
+        time.sleep(0.05)
+    assert meta["kind"] == "reboot" and meta["limit"] == "cache,web"
+    assert meta["argv"][0] == "ans-reboot"
+    assert "reboot_serial=2" in meta["argv"]
+
+
+def test_deploy_status_reports_command_runs(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    from mandala_fleet import registry
+    from mandala_fleet.runner import COMMAND_LOG
+
+    run_id, path = registry.new_run_dir()
+    registry.write_meta(
+        path, {"run_id": run_id, "kind": "reboot", "pid": None, "rc": 2, "limit": "web"}
+    )
+    (path / COMMAND_LOG).write_text("$ ans-reboot -l web\nfatal: boom\n")
+
+    data = _call(build_server(_inv()), "deploy_status", {"run_id": run_id})
+    assert data["kind"] == "reboot"
+    assert data["liveness"] == "failed" and data["phase"] == "done"
+    assert data["output_tail"][-1] == "fatal: boom"
+    # Nothing host/build-shaped leaks into a command-run snapshot.
+    assert "hosts" not in data and "build" not in data
 
 
 def test_deploy_dry_run_launches_without_confirm(monkeypatch, tmp_path) -> None:

@@ -5,9 +5,11 @@ where one host rolls back must flag that host without disturbing the
 others' states."""
 
 import json
+import sys
+import time
 from pathlib import Path
 
-from mandala_fleet.runner import EventTailer, HostState
+from mandala_fleet.runner import COMMAND_LOG, CommandRun, EventTailer, HostState
 
 
 def _write(path: Path, events: list[dict]) -> None:
@@ -87,3 +89,49 @@ def test_failed_without_rollback_and_version_gate(tmp_path: Path) -> None:
     tailer = EventTailer(tmp_path)
     tailer.poll()
     assert tailer.hosts["delta"].state == HostState.FAILED
+
+
+def _wait_for_rc(path: Path, timeout: float = 10.0) -> dict:
+    """Poll meta.json until the reaper thread records the exit code."""
+    from mandala_fleet import registry
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        meta = registry.read_meta(path)
+        if "rc" in meta:
+            return meta
+        time.sleep(0.05)
+    raise AssertionError("reaper never recorded rc")
+
+
+def test_command_run_registers_tees_and_reaps(monkeypatch, tmp_path: Path) -> None:
+    """The whole command-run contract: a registered run dir with kind+pid
+    meta, output teed to output.log (surviving the launcher's client), and
+    the exit code reaped into meta so observers can judge liveness."""
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    run = CommandRun(
+        argv=[sys.executable, "-c", "print('rebooting-ish'); raise SystemExit(3)"],
+        kind="reboot",
+        extra_meta={"limit": "web"},
+    )
+    run.start()
+    assert run.launched and run.run_id
+
+    meta = _wait_for_rc(run.run_dir)
+    assert meta["kind"] == "reboot" and meta["limit"] == "web"
+    assert meta["rc"] == 3
+    log = (run.run_dir / COMMAND_LOG).read_text()
+    assert "rebooting-ish" in log
+    assert log.startswith("$ ")  # the argv header for post-mortems
+
+
+def test_command_run_failed_launch_is_still_registered(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    run = CommandRun(argv=["/nonexistent/ans-reboot"], kind="reboot")
+    run.start()
+    assert not run.launched
+    from mandala_fleet import registry
+
+    meta = registry.read_meta(run.run_dir)
+    assert meta["rc"] == 127 and "error" in meta
+    assert "failed to launch" in (run.run_dir / COMMAND_LOG).read_text()

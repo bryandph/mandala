@@ -74,28 +74,51 @@ class Inventory:
         return self.aggregate["groups"]
 
     def resolve(self, selector: str) -> list[str]:
-        """`@group` or member name -> sorted member names. Comma-separated
-        selectors union (`@k3s,vishnu`)."""
-        if "," in selector:
-            names: set[str] = set()
-            for part in selector.split(","):
-                if part:
-                    names.update(self.resolve(part))
-            return sorted(names)
-        if selector.startswith("@"):
-            group = selector[1:]
+        """Selector taxonomy -> sorted member names. Parts (separated by
+        `,` or ansible's `:`) union; a `!`-prefixed part excludes after
+        the unions, and `all` is the whole membership — so `all,!vishnu`
+        (or ansible-spelled `all:!vishnu`) is "everything except vishnu".
+        A bare exclusion (`!@k3s`) implies `all` as the base set."""
+        include: set[str] = set()
+        exclude: set[str] = set()
+        saw_include = False
+        for part in selector.replace(":", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            negate = part.startswith("!")
+            names = self._resolve_part(part[1:] if negate else part)
+            if negate:
+                exclude.update(names)
+            else:
+                saw_include = True
+                include.update(names)
+        if not saw_include:
+            if not exclude:
+                raise InventoryError("empty selector")
+            include = set(self.members)
+        resolved = sorted(include - exclude)
+        if not resolved:
+            raise InventoryError(f"selector resolves to no members: {selector}")
+        return resolved
+
+    def _resolve_part(self, part: str) -> list[str]:
+        """One taxonomy atom: `all`, `@group`, or a member name."""
+        if part == "all":
+            return sorted(self.members)
+        if part.startswith("@"):
+            group = part[1:]
             try:
                 return sorted(self.groups[group])
             except KeyError as e:
                 raise InventoryError(f"no such group: {group}") from e
-        if selector not in self.members:
-            raise InventoryError(f"no such member: {selector}")
-        return [selector]
+        if part not in self.members:
+            raise InventoryError(f"no such member: {part}")
+        return [part]
 
     def to_limit(self, selector: str) -> str:
-        """Selector -> explicit ansible --limit list. `@group` expands to
-        the exact projected members, so the fan-out target set is pinned
-        by the CLI's resolution, not re-derived ansible-side."""
-        if "@" not in selector:
-            return selector
+        """Selector -> explicit ansible --limit list. Always fully
+        resolved, so the fan-out target set (`all`, `@group`, exclusions)
+        is pinned by the CLI's resolution, not re-derived ansible-side —
+        and an unknown member is refused before anything launches."""
         return ",".join(self.resolve(selector))
