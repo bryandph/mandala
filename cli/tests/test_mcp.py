@@ -139,4 +139,116 @@ def test_resolve_tool_parity_with_core() -> None:
             return await client.call_tool("resolve", {"selector": "@k3s"})
 
     result = asyncio.run(_call())
-    assert result.data == inv.resolve("@k3s") == ["cache", "web"]
+    # `limit` is the exact confirm string the gated actions require.
+    assert result.data["members"] == inv.resolve("@k3s") == ["cache", "web"]
+    assert result.data["limit"] == inv.to_limit("@k3s") == "cache,web"
+
+
+class _FakeProc:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def test_ping_separates_stderr_diagnostics(monkeypatch) -> None:
+    """stderr (deprecation chatter, side-band git progress ansible relabels
+    as [ERROR]) must not pollute `output` — it rides in `diagnostics`."""
+    from mandala_fleet.mcp import server as server_mod
+
+    fake = _FakeProc(
+        stdout='web | SUCCESS => {"ping": "pong"}\n',
+        stderr="[ERROR]: remote: Counting objects: 100% (14/14)\n",
+    )
+    monkeypatch.setattr(
+        server_mod.subprocess, "run", lambda *a, **k: fake
+    )
+    data = _call(build_server(_inv()), "ping", {"selector": "web"})
+    assert data["reachable"] == {"web": True}
+    assert "Counting objects" not in data["output"]
+    assert "Counting objects" in data["diagnostics"]
+
+
+def test_restart_service_refused_without_confirm() -> None:
+    data = _call(
+        build_server(_inv()),
+        "restart_service",
+        {"selector": "@k3s", "unit": "k3s"},
+    )
+    assert data["refused"] is True
+    assert data["required_confirm"] == "cache,web"
+
+
+def test_restart_service_rejects_unclean_unit_names() -> None:
+    import pytest
+
+    with pytest.raises(Exception, match="unit name"):
+        _call(
+            build_server(_inv()),
+            "restart_service",
+            {"selector": "@k3s", "unit": "k3s state=stopped", "confirm": "cache,web"},
+        )
+
+
+def test_restart_service_runs_and_parses_hosts(monkeypatch) -> None:
+    from mandala_fleet.mcp import server as server_mod
+
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return _FakeProc(
+            stdout="cache | CHANGED => {}\nweb | FAILED! => {}\n", returncode=2
+        )
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+    data = _call(
+        build_server(_inv()),
+        "restart_service",
+        {"selector": "@k3s", "unit": "k3s", "confirm": "cache,web"},
+    )
+    assert seen["argv"][:2] == ["ansible", "cache,web"]
+    assert "ansible.builtin.systemd_service" in seen["argv"]
+    assert data["restarted"] == {"cache": True, "web": False}
+    assert data["ok"] is False and data["exit_code"] == 2
+
+
+def test_deploy_status_phase_and_wait(monkeypatch, tmp_path) -> None:
+    import json
+
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    from mandala_fleet import registry
+
+    # Live pid + no host events yet → the batch-build play (play 1).
+    run_id, path = registry.new_run_dir()
+    registry.write_meta(path, {"run_id": run_id, "pid": 1, "limit": "cache,web"})
+    data = _call(build_server(_inv()), "deploy_status", {"run_id": run_id})
+    assert data["liveness"] == "running" and data["phase"] == "batch-build"
+
+    # Dead pid + terminal host → done; wait_seconds returns immediately.
+    run_id2, path2 = registry.new_run_dir()
+    registry.write_meta(path2, {"run_id": run_id2, "pid": None, "limit": "cache"})
+    with open(path2 / "cache.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(
+            {"v": 1, "host": "cache", "plugin": "deploy",
+             "event": "milestone", "milestone": "confirm"}) + "\n")
+    data = _call(
+        build_server(_inv()),
+        "deploy_status",
+        {"run_id": run_id2, "wait_seconds": 30},
+    )
+    assert data["liveness"] == "finished" and data["phase"] == "done"
+
+
+def test_drift_summary_and_status_filter(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    from mandala_fleet import drift as drift_mod
+
+    monkeypatch.setattr(drift_mod, "repo_rev", lambda flake: "deadbeef")
+
+    mcp = build_server(_inv())
+    # Empty state dir → both deploy nodes judge no-snapshot.
+    data = _call(mcp, "drift", {})
+    assert data["summary"] == {"no-snapshot": 2} and data["total"] == 2
+
+    # The filter narrows entries; summary stays whole-fleet.
+    data = _call(mcp, "drift", {"statuses": ["drift"]})
+    assert data["entries"] == [] and data["summary"] == {"no-snapshot": 2}

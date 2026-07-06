@@ -10,7 +10,11 @@ a tool argument explicitly asks for them, mirroring the CLI's opt-ins.
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
+import time
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
@@ -19,12 +23,27 @@ from fastmcp.exceptions import ToolError
 
 from .. import drift as drift_mod
 from ..inventory import Inventory, InventoryError
+from ..registry import RunLiveness
 from ..runner import HostState
 from .errors import from_called_process, from_completed
 
 
 def _ansible_dir() -> Path:
     return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
+
+
+def _adhoc_env() -> dict[str, str]:
+    """Env for ad-hoc ansible runs: silence deprecation chatter that would
+    otherwise ride along in every tool result."""
+    return dict(os.environ, ANSIBLE_DEPRECATION_WARNINGS="False")
+
+
+# systemd unit names an MCP client may restart: a plain name (dots, @, :)
+# only — anything shell-ish or path-ish is refused before ansible sees it.
+_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@:._-]*$")
+
+# Blocking waits stay under typical MCP client timeouts.
+_MAX_WAIT_SECONDS = 570
 
 
 def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
@@ -59,12 +78,17 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             raise ToolError(str(e)) from e
 
     @mcp.tool
-    def resolve(selector: str) -> list[str]:
-        """Expand a selector (`@group`, a member, or a comma-list) to sorted
-        member names — identical to `mandala resolve` and the `--limit` set a
-        deploy would fan out to."""
+    def resolve(selector: str) -> dict:
+        """Expand a selector (`@group`, a member, or a comma-list) —
+        identical to `mandala resolve` and the `--limit` set a deploy would
+        fan out to. Returns the sorted `members` plus the comma-joined
+        `limit` string, which is exactly the `confirm` value the gated
+        actions (deploy, reboot, restart_service) require."""
         try:
-            return inv.resolve(selector)
+            return {
+                "members": inv.resolve(selector),
+                "limit": inv.to_limit(selector),
+            }
         except InventoryError as e:
             raise ToolError(str(e)) from e
 
@@ -80,7 +104,8 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         argv = ["ansible", limit, "-m", "ping", "-o"]
         try:
             proc = subprocess.run(
-                argv, cwd=_ansible_dir(), capture_output=True, text=True
+                argv, cwd=_ansible_dir(), env=_adhoc_env(),
+                capture_output=True, text=True,
             )
         except FileNotFoundError as e:
             raise ToolError("ansible not found on PATH") from e
@@ -98,12 +123,20 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
                 continue
             token = rest.strip().split(" ", 1)[0].rstrip("!:")
             reachable[host] = token == "SUCCESS"
-        return {
+        result = {
             "limit": limit,
             "reachable": reachable,
             "exit_code": proc.returncode,
-            "output": (proc.stdout + proc.stderr).strip(),
+            # stdout only: stderr rides separately so warnings and side-band
+            # noise (ansible relabels any subprocess stderr, e.g. git fetch
+            # progress from an inventory eval, as [ERROR]) can't masquerade
+            # as probe failures.
+            "output": proc.stdout.strip(),
         }
+        stderr = proc.stderr.strip()
+        if stderr:
+            result["diagnostics"] = stderr
+        return result
 
     @mcp.tool
     def host_eval(member: str, toplevel: bool = False) -> dict:
@@ -129,13 +162,25 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         return result
 
     @mcp.tool
-    def drift(refresh: bool = False, do_eval: bool = False) -> dict:
+    def drift(
+        refresh: bool = False,
+        do_eval: bool = False,
+        statuses: list[str] | None = None,
+    ) -> dict:
         """Deployed-generation drift (contract vs reported state) — the same
         exact-out-path judgement `mandala drift` makes. A plain read uses
         existing snapshots and the rev-keyed expectation cache: no survey, no
         eval. `refresh` runs the read-only state survey first; `do_eval`
         re-evaluates the expected toplevels (one slow nix eval). An eval
-        failure is returned as a structured `eval_error`, not raised."""
+        failure is returned as a structured `eval_error`, not raised.
+
+        The result always carries a `summary` ({status: count} over the whole
+        fleet) and `total`; `statuses` filters the `entries` list to just
+        those statuses (e.g. `["drift", "unreachable"]`) so one noisy status
+        — every host goes `reboot-pending` after a kernel bump — doesn't
+        drown the rest. `expected_source: "none"` means NO expected-toplevel
+        comparison happened (no cache for this rev and `do_eval` false):
+        current-vs-expected judgements are then absent, not clean."""
         try:
             nodes = (
                 inv.aggregate.get("projections", {}).get("deploy", {}).get("nodes", [])
@@ -168,9 +213,13 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
 
         entries = drift_mod.compare(nodes, drift_mod.read_snapshots(), expected)
         result["rev"] = rev
-        result["entries"] = [
-            {**asdict(e), "status": e.status.value} for e in entries
-        ]
+        dicts = [{**asdict(e), "status": e.status.value} for e in entries]
+        result["summary"] = dict(Counter(d["status"] for d in dicts))
+        result["total"] = len(dicts)
+        if statuses:
+            wanted = set(statuses)
+            dicts = [d for d in dicts if d["status"] in wanted]
+        result["entries"] = dicts
         return result
 
     # -- monitoring + action tiers ------------------------------------
@@ -191,10 +240,21 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
                 entry["raw"] = list(h.lines)
             hosts[name] = entry
         b = obs.tailer.build
+        liveness = obs.liveness()
+        # A coarse phase so an early snapshot doesn't read as stalled: the
+        # deploy playbook batch-builds every profile FIRST (play 1, no host
+        # events yet), then fans out per host.
+        if liveness is not RunLiveness.RUNNING:
+            phase = "done"
+        elif not hosts:
+            phase = "batch-build"
+        else:
+            phase = "fan-out"
         return {
             "run_id": obs.info.run_id,
             "meta": obs.info.meta,
-            "liveness": obs.liveness().value,
+            "liveness": liveness.value,
+            "phase": phase,
             "hosts": hosts,
             "build": {
                 "built": b.built,
@@ -207,20 +267,38 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         }
 
     @mcp.tool
-    def deploy_status(run_id: str | None = None, limit: int = 10) -> dict:
+    def deploy_status(
+        run_id: str | None = None, limit: int = 10, wait_seconds: int = 0
+    ) -> dict:
         """Live and recent deploy state from the shared run registry — so a
         deploy launched from any frontend (TUI, CLI, or this server) is
         observable. With a `run_id`, report just that run; otherwise the most
         recent `limit` runs. Per-host states come from the protocol's sticky
         terminal states, so a confirmed host stays confirmed and a rolled-back
-        host stays flagged."""
+        host stays flagged. `milestones` is the raw per-host event sequence —
+        repeats (activate, wait, activate, …) are genuine re-entries from the
+        engine, not display noise. `phase` summarizes where a live run is:
+        `batch-build` (play 1, no per-host events yet) → `fan-out` → `done`.
+
+        `wait_seconds` (with a `run_id`) blocks until the run leaves the
+        `running` state or the wait elapses — one call instead of a poll
+        loop; capped at 570s to stay under client timeouts. The returned
+        `liveness` tells whether it finished or the wait timed out."""
         from .. import registry
 
         if run_id is not None:
             obs = registry.open_run(run_id)
             if obs is None:
                 raise ToolError(f"no such run: {run_id}")
-            return _run_snapshot(obs)
+            snap = _run_snapshot(obs)
+            deadline = time.monotonic() + min(max(wait_seconds, 0), _MAX_WAIT_SECONDS)
+            while (
+                snap["liveness"] == RunLiveness.RUNNING.value
+                and time.monotonic() < deadline
+            ):
+                time.sleep(2)
+                snap = _run_snapshot(obs)
+            return snap
         runs = []
         for info in registry.list_runs()[: max(1, limit)]:
             obs = registry.open_run(info.run_id)
@@ -263,8 +341,10 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         engine: `--limit`, throttle, and deploy-rs magic rollback are never
         bypassed. Defaults to dry-activate (build + copy, no switch). A REAL
         activation (`dry_activate=false`) requires `confirm` to equal the
-        resolved `--limit` target, else it refuses WITHOUT launching. Returns
-        the run id; poll `deploy_status` for progress."""
+        resolved `--limit` target — take it from `resolve`'s `limit` field, a
+        prior run's `limit`, or this tool's refusal (`required_confirm`) —
+        else it refuses WITHOUT launching. Returns the run id; follow with
+        `deploy_status` (its `wait_seconds` blocks until the run settles)."""
         try:
             target = inv.to_limit(selector)
         except InventoryError as e:
@@ -288,6 +368,72 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             "dry_activate": dry_activate,
             "events_dir": str(run.events_dir),
         }
+
+    @mcp.tool
+    def restart_service(
+        selector: str,
+        unit: str,
+        confirm: str | None = None,
+        forks: int = 4,
+    ) -> dict:
+        """Restart one systemd unit on the resolved members via ad-hoc
+        ansible (`systemd_service state=restarted`) — the middle ground
+        between a full deploy (no-op when the closure hasn't changed) and a
+        reboot (far too big a hammer for picking up a service-level change,
+        e.g. k3s re-reading registries.yaml). `forks` bounds how many hosts
+        restart at once, so a fleet-wide restart rolls instead of stampeding.
+
+        Mutating, so it takes the deploy/reboot confirm gate: `confirm` must
+        equal the resolved `--limit` target (the `limit` field of `resolve`),
+        else it refuses WITHOUT running. Unit names are validated to a plain
+        systemd name — no paths, no shell."""
+        try:
+            target = inv.to_limit(selector)
+        except InventoryError as e:
+            raise ToolError(str(e)) from e
+        if not _UNIT_RE.match(unit):
+            raise ToolError(f"not a plain systemd unit name: {unit!r}")
+        if confirm != target:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": "restart_service requires `confirm` to equal the resolved target",
+                "required_confirm": target,
+                "unit": unit,
+            }
+        argv = [
+            "ansible", target,
+            "-m", "ansible.builtin.systemd_service",
+            "-a", f"name={unit} state=restarted",
+            "-f", str(max(1, forks)),
+        ]
+        try:
+            proc = subprocess.run(
+                argv, cwd=_ansible_dir(), env=_adhoc_env(),
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError as e:
+            raise ToolError("ansible not found on PATH") from e
+        # Ad-hoc result lines: "host | CHANGED => {..." / "host | FAILED! => …";
+        # parse regardless of exit code — the per-host map is the signal.
+        restarted: dict[str, bool] = {}
+        for line in proc.stdout.splitlines():
+            m = re.match(r"^(\S+) \| ([A-Z]+)", line)
+            if m:
+                restarted[m.group(1)] = m.group(2) in ("CHANGED", "SUCCESS")
+        result = {
+            "ok": proc.returncode == 0,
+            "limit": target,
+            "unit": unit,
+            "restarted": restarted,
+            "exit_code": proc.returncode,
+        }
+        if proc.returncode != 0:
+            result["output"] = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        if stderr:
+            result["diagnostics"] = stderr
+        return result
 
     @mcp.tool
     def reboot(

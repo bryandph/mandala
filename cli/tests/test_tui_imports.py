@@ -29,3 +29,16 @@ def test_no_textual_internal_overrides() -> None:
     ):
         for name in ("_render", "render", "_render_content", "render_line", "render_lines"):
             assert getattr(cls, name) is getattr(base, name), f"{cls.__name__}.{name} shadows textual"
+
+
+def test_mcp_panel_toggle_binding() -> None:
+    """The activity pane is hidable: the `m` binding + action exist, and
+    the binding is hidden (check_action → None) when no MCP host runs."""
+    from mandala_fleet.tui.explorer import ExplorerApp
+
+    assert any(b.key == "m" and b.action == "toggle_mcp" for b in ExplorerApp.BINDINGS)
+    app = ExplorerApp.__new__(ExplorerApp)  # no App.__init__: header-only check
+    app._serve_mcp = False
+    assert app.check_action("toggle_mcp", ()) is None
+    app._serve_mcp = True
+    assert app.check_action("toggle_mcp", ()) is True

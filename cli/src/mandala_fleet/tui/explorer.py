@@ -75,6 +75,7 @@ class ExplorerApp(App):
         Binding("p", "ping", "ping selection"),
         Binding("R", "reboot", "reboot selection"),
         Binding("D", "deploy", "deploy selection"),
+        Binding("m", "toggle_mcp", "mcp panel"),
     ]
 
     def __init__(
@@ -437,6 +438,22 @@ class ExplorerApp(App):
         )
 
     # -- maintenance ---------------------------------------------------
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Hide the mcp-panel binding from the footer entirely when this
+        session hosts no MCP server — a key for a pane that can't exist is
+        noise."""
+        if action == "toggle_mcp" and not self._serve_mcp:
+            return None
+        return True
+
+    def action_toggle_mcp(self) -> None:
+        """Show/hide the MCP activity pane — the host keeps serving either
+        way; only the pane's screen estate is reclaimed."""
+        if not self._serve_mcp:
+            return
+        panel = self.query_one("#mcp-activity", RichLog)
+        panel.display = not panel.display
 
     def action_reload(self) -> None:
         self.inventory = Inventory(flake=self.inventory.flake)
