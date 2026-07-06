@@ -31,6 +31,36 @@ from pathlib import Path
 # v2 = v1 + the `nixlog` event type (verbatim internal-json for nom).
 SUPPORTED_EVENT_VERSIONS = frozenset({1, 2})
 
+
+def ansible_dir() -> Path:
+    """The operator repo's ansible root when present, else the cwd —
+    the one working-directory convention every frontend shares."""
+    return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
+
+
+def reboot_argv(target: str, serial: str, drain: bool) -> list[str] | None:
+    """The reboot launch line, shared by the TUI action and the MCP tool.
+
+    Prefers the operator's `ans-reboot` wrapper: it carries controller-side
+    env raw ansible-playbook lacks — the delegated k8s drain pins
+    ANSIBLE_LOCAL_PYTHON_INTERPRETER to a python WITH the kubernetes lib
+    (the global interpreter default does not win for delegated tasks, so
+    without the wrapper the drain fails "kubernetes library is missing").
+    Falls back to playbooks/reboot.yaml; None when neither exists.
+    """
+    import shutil
+
+    if shutil.which("ans-reboot"):
+        base = ["ans-reboot", "-l", target]
+    elif (ansible_dir() / "playbooks/reboot.yaml").is_file():
+        base = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
+    else:
+        return None
+    return base + [
+        "-e", f"reboot_serial={serial}",
+        "-e", f"drain={'true' if drain else 'false'}",
+    ]
+
 # Raw lines kept per host for the inspector view.
 _MAX_LINES = 2000
 
@@ -228,7 +258,7 @@ class DeployRun:
 
     def resolve_paths(self) -> None:
         if self.ansible_dir is None:
-            self.ansible_dir = Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
+            self.ansible_dir = ansible_dir()
         if self.playbook is None:
             wrapper = self.ansible_dir / "playbooks/deploy.yaml"
             self.playbook = "playbooks/deploy.yaml" if wrapper.is_file() else "mandala.fleet.deploy"

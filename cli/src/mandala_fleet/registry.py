@@ -192,6 +192,11 @@ class ObservedRun:
             return RunLiveness.FAILED
         if states and states <= _TERMINAL:
             return RunLiveness.FINISHED
+        # A deploy that died in the batch build never emitted host events —
+        # judge from the build stream so it lands failed, not unknown.
+        build = self.tailer.build
+        if build.done and build.rc not in (0, None):
+            return RunLiveness.FAILED
         return RunLiveness.UNKNOWN
 
 

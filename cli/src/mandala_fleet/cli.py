@@ -190,8 +190,8 @@ def mcp(ctx: typer.Context) -> None:
 
     The same server `mandala tui --mcp` hosts over HTTP, here as a plain
     stdio child process: no port, no token. Reads (members/groups/resolve/
-    ping/host_eval/drift) plus the confirmation-gated action tiers
-    (build/deploy/reboot) and deploy monitoring."""
+    ping/host_eval/drift/reload) plus the confirmation-gated action tiers
+    (build/deploy/restart_service/reboot) and run monitoring."""
     from .mcp import build_server
 
     inv: Inventory = ctx.obj

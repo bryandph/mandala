@@ -42,13 +42,16 @@ def ensure_session(url: str, *, pid: int | None = None, rotate: bool = False) ->
         token = secrets.token_urlsafe(32)
     path = session_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Create owner-only from the start, then write (a pre-existing file keeps
-    # its mode, so chmod to be sure).
     payload = json.dumps(
         {"url": url, "token": token, "pid": pid if pid is not None else os.getpid()},
         indent=1,
         sort_keys=True,
     )
-    path.write_text(payload)
+    # Owner-only from the very first byte: O_CREAT's mode applies at
+    # creation, so the token is never world-readable even briefly; the
+    # chmod tightens a pre-existing file created under an older umask.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(payload)
     os.chmod(path, 0o600)
     return token

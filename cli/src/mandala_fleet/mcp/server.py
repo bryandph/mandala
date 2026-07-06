@@ -16,7 +16,6 @@ import subprocess
 import time
 from collections import Counter
 from dataclasses import asdict
-from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -24,12 +23,8 @@ from fastmcp.exceptions import ToolError
 from .. import drift as drift_mod
 from ..inventory import Inventory, InventoryError, surfaces
 from ..registry import RunLiveness
-from ..runner import COMMAND_LOG, HostState
-from .errors import from_called_process, from_completed
-
-
-def _ansible_dir() -> Path:
-    return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
+from ..runner import COMMAND_LOG, HostState, ansible_dir, reboot_argv
+from .errors import from_called_process
 
 
 def _adhoc_env() -> dict[str, str]:
@@ -42,22 +37,49 @@ def _adhoc_env() -> dict[str, str]:
 # only — anything shell-ish or path-ish is refused before ansible sees it.
 _UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@:._-]*$")
 
+# The reboot playbook's `serial`: a batch count or a percentage. Anything
+# else is refused — ansible parses `-e "a=1 b=2"` as MULTIPLE extra-vars,
+# so an unvalidated string here would be an extra-vars injection point.
+_SERIAL_RE = re.compile(r"^[0-9]+%?$")
+
 # Blocking waits stay under typical MCP client timeouts.
 _MAX_WAIT_SECONDS = 570
 
 
-def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
+def build_server(inventory, activity_sink=None, set_inventory=None) -> FastMCP:
     """A transport-agnostic FastMCP server over the inventory. Registering
     tools never evaluates the fleet — the first read triggers the one
     `nix eval .#mandala`, gated by schemaVersion in the inventory core.
 
-    `activity_sink`, when given, receives `{tool, args, status, detail}` per
-    tool call (the TUI-hosted transport feeds this into its activity pane)."""
-    mcp = FastMCP("mandala-fleet")
-    if activity_sink is not None:
-        from .activity import ActivityMiddleware
+    `inventory` is an Inventory OR a zero-arg callable returning the
+    current one — the TUI passes a getter so its `r` reload (which rebinds
+    a fresh Inventory) is what the hosted server serves, not the object
+    captured at launch. `set_inventory`, when given, is how the `reload`
+    tool commits a freshly evaluated Inventory back to the host; with a
+    plain Inventory it defaults to an internal slot swap.
 
-        mcp.add_middleware(ActivityMiddleware(activity_sink))
+    `activity_sink`, when given, receives `{tool, args, status, detail,
+    seq, elapsed, result}` per tool call (the TUI-hosted transport feeds
+    this into its activity pane). Mutating calls are ALWAYS appended to
+    the per-user audit log, sink or no sink."""
+    if callable(inventory):
+        get_inv = inventory
+    else:
+        _slot = [inventory]
+        get_inv = lambda: _slot[0]  # noqa: E731
+        if set_inventory is None:
+            set_inventory = lambda new: _slot.__setitem__(0, new)  # noqa: E731
+
+    mcp = FastMCP("mandala-fleet")
+
+    from .activity import ActivityMiddleware, audit_event
+
+    def _sink(event: dict) -> None:
+        audit_event(event)
+        if activity_sink is not None:
+            activity_sink(event)
+
+    mcp.add_middleware(ActivityMiddleware(_sink))
 
     @mcp.tool
     def members(full: bool = False) -> dict:
@@ -67,7 +89,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         is tens of KB and blows client tool-result caps. `full=true`
         returns everything; `host_eval` gives one member's full record."""
         try:
-            roster = inv.members
+            roster = get_inv().members
         except InventoryError as e:
             raise ToolError(str(e)) from e
         if full:
@@ -86,7 +108,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         """Taxonomy groups and their member names — the `@group` fan-out
         spelling shared by deploy, ansible `-l`, and `deployBatch`."""
         try:
-            return inv.groups
+            return get_inv().groups
         except InventoryError as e:
             raise ToolError(str(e)) from e
 
@@ -97,6 +119,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         fan out to. Returns the sorted `members` plus the comma-joined
         `limit` string, which is exactly the `confirm` value the gated
         actions (deploy, reboot, restart_service) require."""
+        inv = get_inv()
         try:
             return {
                 "members": inv.resolve(selector),
@@ -115,7 +138,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         workstations finishes inside a client's tool-call budget instead
         of serially waiting out every unreachable host."""
         try:
-            limit = inv.to_limit(selector)
+            limit = get_inv().to_limit(selector)
         except InventoryError as e:
             raise ToolError(str(e)) from e
         argv = [
@@ -125,7 +148,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         ]
         try:
             proc = subprocess.run(
-                argv, cwd=_ansible_dir(), env=_adhoc_env(),
+                argv, cwd=ansible_dir(), env=_adhoc_env(),
                 capture_output=True, text=True,
             )
         except FileNotFoundError as e:
@@ -165,6 +188,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         the evaluated system `toplevel` out-path is computed only when
         `toplevel=true` (one slow nix eval). A failed eval is returned as a
         structured `eval_error`, not raised, so the client can debug it."""
+        inv = get_inv()
         try:
             roster = inv.members
         except InventoryError as e:
@@ -202,6 +226,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         drown the rest. `expected_source: "none"` means NO expected-toplevel
         comparison happened (no cache for this rev and `do_eval` false):
         current-vs-expected judgements are then absent, not clean."""
+        inv = get_inv()
         try:
             nodes = (
                 inv.aggregate.get("projections", {}).get("deploy", {}).get("nodes", [])
@@ -212,7 +237,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         result: dict = {"refreshed": False, "expected_source": "none"}
 
         if refresh:
-            rc = drift_mod.refresh_snapshots(_ansible_dir())
+            rc = drift_mod.refresh_snapshots(ansible_dir())
             result["refreshed"] = True
             result["survey_rc"] = rc
 
@@ -242,6 +267,25 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             dicts = [d for d in dicts if d["status"] in wanted]
         result["entries"] = dicts
         return result
+
+    @mcp.tool
+    def reload() -> dict:
+        """Re-read the fleet contract: evaluate a FRESH inventory aggregate
+        (the one slow `nix eval .#mandala`) and swap it in as what every
+        other tool serves. Use after the contract changes — a member added,
+        tags moved, groups reshaped — because the aggregate is otherwise
+        cached for the life of the server. Hosted in the TUI, the swap
+        refreshes the operator's tables too, exactly like pressing `r`."""
+        if set_inventory is None:
+            raise ToolError("reload unavailable: this host cannot swap the inventory")
+        fresh = Inventory(flake=get_inv().flake)
+        try:
+            roster = fresh.members  # force the slow aggregate eval HERE
+            n_groups = len(fresh.groups)
+        except InventoryError as e:
+            raise ToolError(str(e)) from e
+        set_inventory(fresh)
+        return {"ok": True, "members": len(roster), "groups": n_groups}
 
     # -- monitoring + action tiers ------------------------------------
 
@@ -356,11 +400,16 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         return {"runs": runs}
 
     @mcp.tool
-    def build(selector: str) -> dict:
+    def build(selector: str, wait_seconds: int = 120) -> dict:
         """Build the resolved members' system `toplevel`(s) with `nix build` —
         WITHOUT activating anything (local store only), so no confirmation is
-        required. A build failure is returned as a structured error with the
-        nix output, so the client can debug it."""
+        required. Launches as a REGISTERED BACKGROUND RUN (a cold multi-host
+        build outlives any client timeout) and waits up to `wait_seconds`
+        (cap 570) for it to finish: a finished build returns `ok` +
+        `out_paths` (or the failing output), a still-running one returns
+        `building: true` — follow with `deploy_status(run_id,
+        wait_seconds=…)`. Output streams to the returned `log` either way."""
+        inv = get_inv()
         try:
             targets = inv.resolve(selector)
         except InventoryError as e:
@@ -373,14 +422,41 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
             "nix", "build", "--no-link", "--print-out-paths",
             "--no-warn-dirty", *installables,
         ]
+        from .. import registry
+        from ..runner import CommandRun
+
+        run = CommandRun(argv=argv, kind="build", extra_meta={"members": targets})
+        run.start()
+        result = {
+            "run_id": run.run_id,
+            "members": targets,
+            "log": str(run.log_path),
+        }
+        if not run.launched:
+            return {**result, "ok": False, "error": "failed to launch nix — see log"}
+        obs = registry.open_run(run.run_id)
+        deadline = time.monotonic() + min(max(wait_seconds, 0), _MAX_WAIT_SECONDS)
+        while obs.liveness() is RunLiveness.RUNNING and time.monotonic() < deadline:
+            time.sleep(1)
+        if obs.liveness() is RunLiveness.RUNNING:
+            return {**result, "building": True}
+        rc = obs.info.meta.get("rc")
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True)
-        except FileNotFoundError as e:
-            raise ToolError("nix not found on PATH") from e
-        if proc.returncode != 0:
-            return {"members": targets, **from_completed("nix build failed", proc)}
-        out_paths = [p for p in proc.stdout.splitlines() if p.strip()]
-        return {"ok": True, "members": targets, "out_paths": out_paths}
+            lines = (run.log_path).read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except OSError:
+            lines = []
+        if rc != 0:
+            return {
+                **result, "ok": False, "exit_code": rc,
+                "error": "nix build failed",
+                "output": "\n".join(lines[-80:]),
+            }
+        # The teed log interleaves nix's stderr chatter with the printed
+        # out-paths; the out-paths are the unindented store paths.
+        out_paths = [l for l in lines if l.startswith("/nix/store/")]
+        return {**result, "ok": True, "out_paths": out_paths}
 
     @mcp.tool
     def deploy(
@@ -395,7 +471,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         else it refuses WITHOUT launching. Returns the run id; follow with
         `deploy_status` (its `wait_seconds` blocks until the run settles)."""
         try:
-            target = inv.to_limit(selector)
+            target = get_inv().to_limit(selector)
         except InventoryError as e:
             raise ToolError(str(e)) from e
         if not dry_activate and confirm != target:
@@ -430,14 +506,16 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         between a full deploy (no-op when the closure hasn't changed) and a
         reboot (far too big a hammer for picking up a service-level change,
         e.g. k3s re-reading registries.yaml). `forks` bounds how many hosts
-        restart at once, so a fleet-wide restart rolls instead of stampeding.
+        restart AT ONCE — a concurrency cap, NOT a rolling gate: there is
+        no fail-fast or health check between batches, so every resolved
+        host is eventually restarted even if the first batch breaks.
 
         Mutating, so it takes the deploy/reboot confirm gate: `confirm` must
         equal the resolved `--limit` target (the `limit` field of `resolve`),
         else it refuses WITHOUT running. Unit names are validated to a plain
         systemd name — no paths, no shell."""
         try:
-            target = inv.to_limit(selector)
+            target = get_inv().to_limit(selector)
         except InventoryError as e:
             raise ToolError(str(e)) from e
         if not _UNIT_RE.match(unit):
@@ -458,7 +536,7 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         ]
         try:
             proc = subprocess.run(
-                argv, cwd=_ansible_dir(), env=_adhoc_env(),
+                argv, cwd=ansible_dir(), env=_adhoc_env(),
                 capture_output=True, text=True,
             )
         except FileNotFoundError as e:
@@ -503,12 +581,14 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
         way the run stays observable (TUI, `deploy_status`) instead of
         orphaning. Follow with `deploy_status(run_id, wait_seconds=…)`;
         the playbook output streams to the returned `log` file either way."""
-        import shutil
-
         try:
-            target = inv.to_limit(selector)
+            target = get_inv().to_limit(selector)
         except InventoryError as e:
             raise ToolError(str(e)) from e
+        if not _SERIAL_RE.match(serial):
+            # `-e "a=1 b=2"` sets MULTIPLE extra-vars — refuse anything but
+            # a plain batch count / percentage before ansible parses it.
+            raise ToolError(f"not a serial batch count or percentage: {serial!r}")
         if confirm != target:
             return {
                 "ok": False,
@@ -516,25 +596,17 @@ def build_server(inv: Inventory, activity_sink=None) -> FastMCP:
                 "reason": "reboot requires `confirm` to equal the resolved target",
                 "required_confirm": target,
             }
-        ansible_dir = _ansible_dir()
-        if shutil.which("ans-reboot"):
-            base = ["ans-reboot", "-l", target]
-        elif (ansible_dir / "playbooks/reboot.yaml").is_file():
-            base = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
-        else:
+        argv = reboot_argv(target, serial, drain)
+        if argv is None:
             raise ToolError(
                 "no ans-reboot wrapper or playbooks/reboot.yaml — reboot unavailable"
             )
-        argv = base + [
-            "-e", f"reboot_serial={serial}",
-            "-e", f"drain={'true' if drain else 'false'}",
-        ]
         from ..runner import CommandRun
 
         run = CommandRun(
             argv=argv,
             kind="reboot",
-            cwd=ansible_dir,
+            cwd=ansible_dir(),
             extra_meta={"limit": target, "serial": serial, "drain": drain},
         )
         run.start()

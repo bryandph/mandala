@@ -8,10 +8,19 @@ asyncio.run(), so no pytest-asyncio plugin is needed.
 
 import asyncio
 
+import pytest
 from fastmcp import Client
 
 from mandala_fleet.inventory import Inventory
 from mandala_fleet.mcp import build_server
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(monkeypatch, tmp_path):
+    """Every call now audits mutating tools into state_dir()/mcp/ — keep
+    the suite out of the real per-user state root. Tests that need a
+    specific dir still override with their own setenv."""
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path / "default-state"))
 
 
 def _inv() -> Inventory:
@@ -173,7 +182,8 @@ def test_deploy_status_sees_out_of_band_run(monkeypatch, tmp_path) -> None:
 
 def test_activity_sink_records_start_then_settle() -> None:
     """Every call emits start → ok/error sharing a seq, so the TUI can show
-    the call as PENDING (spinner) while it runs and pop it when it lands."""
+    the call as PENDING (spinner) while it runs and pop it when it lands.
+    The settle event carries the call duration."""
     seen: list[dict] = []
     mcp = build_server(_inv(), activity_sink=seen.append)
     _call(mcp, "resolve", {"selector": "@k3s"})
@@ -181,6 +191,31 @@ def test_activity_sink_records_start_then_settle() -> None:
     assert [e["status"] for e in events] == ["start", "ok"]
     assert events[0]["seq"] == events[1]["seq"]
     assert events[0]["args"] == {"selector": "@k3s"}
+    assert events[1]["elapsed"] >= 0
+
+
+def test_activity_settle_summarizes_result_and_audits(monkeypatch, tmp_path) -> None:
+    """A mutating call's settle event carries the ok/refused/run_id summary
+    (how the TUI attaches the exact run), and lands in the persistent
+    audit trail — transport or sink notwithstanding."""
+    import json
+
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    seen: list[dict] = []
+    mcp = build_server(_inv(), activity_sink=seen.append)
+    _call(mcp, "deploy", {"selector": "@k3s", "dry_activate": False})
+
+    settle = next(e for e in seen if e["tool"] == "deploy" and e["status"] == "ok")
+    assert settle["result"] == {"ok": False, "refused": True}
+
+    lines = (tmp_path / "mcp" / "audit.jsonl").read_text().splitlines()
+    record = json.loads(lines[-1])
+    assert record["tool"] == "deploy" and record["result"]["refused"] is True
+    assert record["ts"] > 0
+
+    # Reads never hit the audit trail.
+    _call(mcp, "resolve", {"selector": "@k3s"})
+    assert len((tmp_path / "mcp" / "audit.jsonl").read_text().splitlines()) == len(lines)
 
 
 def test_token_asgi_middleware_guards_http() -> None:
@@ -337,3 +372,133 @@ def test_drift_summary_and_status_filter(monkeypatch, tmp_path) -> None:
     # The filter narrows entries; summary stays whole-fleet.
     data = _call(mcp, "drift", {"statuses": ["drift"]})
     assert data["entries"] == [] and data["summary"] == {"no-snapshot": 2}
+
+
+def test_reboot_rejects_extra_var_injection_in_serial() -> None:
+    """ansible parses `-e "a=1 b=2"` as MULTIPLE extra-vars — a serial
+    that isn't a plain batch count/percentage must be refused before it
+    reaches the playbook argv."""
+    with pytest.raises(Exception, match="serial batch count"):
+        _call(
+            build_server(_inv()),
+            "reboot",
+            {"selector": "@k3s", "serial": "1 drain=false", "confirm": "cache,web"},
+        )
+
+
+def test_server_serves_live_inventory_via_getter() -> None:
+    """The TUI passes a getter so its `r` reload is what the hosted server
+    serves — not the Inventory captured at launch."""
+    holder = {"inv": _inv()}
+    mcp = build_server(lambda: holder["inv"])
+    assert set(_call(mcp, "members", {})) == {"web", "cache", "router"}
+
+    fresh = Inventory(flake=".")
+    fresh.__dict__["aggregate"] = {
+        "schemaVersion": 1,
+        "members": {"web": {}, "newbie": {}},
+        "groups": {},
+        "projections": {"deploy": {"nodes": []}},
+    }
+    holder["inv"] = fresh
+    assert set(_call(mcp, "members", {})) == {"web", "newbie"}
+
+
+def test_reload_swaps_served_inventory(monkeypatch) -> None:
+    """`reload` evaluates a fresh aggregate and swaps it in for every
+    other tool (stdio mode: the internal slot)."""
+    from mandala_fleet.mcp import server as server_mod
+
+    fresh = Inventory(flake=".")
+    fresh.__dict__["aggregate"] = {
+        "schemaVersion": 1,
+        "members": {"web": {}, "cache": {}, "router": {}, "newbie": {}},
+        "groups": {"k3s": ["cache", "web"]},
+        "projections": {"deploy": {"nodes": ["cache", "web"]}},
+    }
+    monkeypatch.setattr(server_mod, "Inventory", lambda flake: fresh)
+
+    mcp = build_server(_inv())
+    data = _call(mcp, "reload", {})
+    assert data == {"ok": True, "members": 4, "groups": 1}
+    assert "newbie" in _call(mcp, "members", {})
+
+
+def test_reload_unavailable_without_setter() -> None:
+    # Getter-only wiring (a host that owns the inventory but gave no way
+    # to commit a swap) refuses instead of silently diverging.
+    inv = _inv()
+    mcp = build_server(lambda: inv)
+    with pytest.raises(Exception, match="reload unavailable"):
+        _call(mcp, "reload", {})
+
+
+def test_deploy_status_batch_build_failure_lands_failed(monkeypatch, tmp_path) -> None:
+    """A deploy that dies in the batch build (play 1 — no host events at
+    all) must judge failed from the build stream, not unknown."""
+    import json
+
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    from mandala_fleet import registry
+
+    run_id, path = registry.new_run_dir()
+    registry.write_meta(path, {"run_id": run_id, "pid": None, "limit": "cache,web"})
+    with open(path / "build.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(
+            {"v": 1, "plugin": "build", "event": "status", "state": "done", "rc": 1}
+        ) + "\n")
+
+    data = _call(build_server(_inv()), "deploy_status", {"run_id": run_id})
+    assert data["liveness"] == "failed"
+
+
+def test_build_runs_registered_and_returns_out_paths(monkeypatch, tmp_path) -> None:
+    """`build` launches a registered background run; a finished one
+    returns ok + the unindented store paths from the teed log."""
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    from mandala_fleet import registry, runner
+
+    class _FakeRun:
+        launched = True
+
+        def __init__(self, argv, kind, cwd=None, extra_meta=None):
+            self.argv, self.kind = argv, kind
+            self.extra_meta = extra_meta or {}
+            self.run_id = None
+            self.run_dir = None
+
+        @property
+        def log_path(self):
+            return None if self.run_dir is None else self.run_dir / runner.COMMAND_LOG
+
+        def start(self):
+            self.run_id, self.run_dir = registry.new_run_dir()
+            self.log_path.write_text(
+                "these derivations will be built:\n"
+                "  /nix/store/x-toplevel.drv\n"
+                "/nix/store/aaa-nixos-system-web\n"
+            )
+            registry.write_meta(self.run_dir, {
+                "run_id": self.run_id, "kind": self.kind, "pid": None, "rc": 0,
+                **self.extra_meta,
+            })
+
+    monkeypatch.setattr(runner, "CommandRun", _FakeRun)
+    data = _call(build_server(_inv()), "build", {"selector": "@k3s"})
+    assert data["ok"] is True
+    assert data["out_paths"] == ["/nix/store/aaa-nixos-system-web"]
+    assert data["members"] == ["cache", "web"]
+    # Registered like any other run — discoverable via deploy_status.
+    status = _call(build_server(_inv()), "deploy_status", {"run_id": data["run_id"]})
+    assert status["kind"] == "build" and status["liveness"] == "finished"
+
+
+def test_session_file_owner_only_and_token_stable(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MANDALA_FLEET_STATE", str(tmp_path))
+    from mandala_fleet.mcp.session import ensure_session, session_path
+
+    token = ensure_session("http://127.0.0.1:7878/mcp", pid=1)
+    assert session_path().stat().st_mode & 0o777 == 0o600
+    # Stable across sessions; --mcp-rotate-token mints a fresh one.
+    assert ensure_session("http://127.0.0.1:7878/mcp", pid=2) == token
+    assert ensure_session("http://127.0.0.1:7878/mcp", pid=3, rotate=True) != token

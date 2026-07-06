@@ -14,11 +14,11 @@ offered only when the operator repo ships playbooks/reboot.yaml.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import time
 from collections import deque
-from pathlib import Path
 
 from rich.text import Text
 from textual import on
@@ -30,7 +30,7 @@ from textual.widgets import Footer, Header, RichLog, Static, TabbedContent, TabP
 
 from .. import drift as drift_mod
 from ..inventory import Inventory, surfaces
-from ..runner import DeployRun
+from ..runner import DeployRun, ansible_dir, reboot_argv
 from .deploy import DeployScreen
 from .select_table import SelectTable
 from .tasks import ConfirmScreen, RebootScreen, TaskScreen
@@ -40,16 +40,22 @@ from .tasks import ConfirmScreen, RebootScreen, TaskScreen
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-def _ansible_dir() -> Path:
-    return Path("ansible") if Path("ansible/ansible.cfg").is_file() else Path(".")
-
-
 class McpActivity(Message):
     """One MCP tool call observed by the hosted server (for the activity pane)."""
 
     def __init__(self, event: dict) -> None:
         super().__init__()
         self.event = event
+
+
+class McpInventorySwap(Message):
+    """The hosted server's `reload` tool evaluated a fresh inventory —
+    adopt it on the UI thread and repaint, exactly like pressing `r`
+    (minus the eval, which already happened inside the tool call)."""
+
+    def __init__(self, inventory: Inventory) -> None:
+        super().__init__()
+        self.inventory = inventory
 
 
 class ExplorerApp(App):
@@ -95,6 +101,8 @@ class ExplorerApp(App):
         self._serve_mcp = serve_mcp
         self._mcp_port = mcp_port
         self._mcp_rotate_token = mcp_rotate_token
+        self._mcp_shutdown: asyncio.Event | None = None
+        self._mcp_worker = None
         self._attached_runs: set[str] = set()
         self.expected: dict[str, str] | None = None
         self._rev: str | None = None
@@ -102,7 +110,9 @@ class ExplorerApp(App):
         # Background-job state. `_busy` covers any nix eval in flight (the
         # inventory aggregate on load/reload, or the expected-toplevel eval);
         # `_surveying` the read-only state survey. Both can run at once.
+        # A reload requested while a worker runs is queued, not dropped.
         self._busy = False
+        self._reload_pending = False
         self._surveying = False
         self._survey_n = 0  # snapshots surveyed so far this run
         # In-flight MCP tool calls (seq → activity event): the hosted
@@ -202,14 +212,21 @@ class ExplorerApp(App):
         drift.add_columns("", "member", "status", "current", "expected", "booted", "captured")
         self._load()
         if self._serve_mcp:
-            self.run_worker(self._serve_mcp_host(), name="mcp-host", exclusive=False)
+            self._mcp_shutdown = asyncio.Event()
+            self._mcp_worker = self.run_worker(
+                self._serve_mcp_host(), name="mcp-host", exclusive=False
+            )
 
     # -- embedded MCP host ---------------------------------------------
 
     async def _serve_mcp_host(self) -> None:
         """Host the fleet MCP server over loopback HTTP in this app's loop;
         every tool call posts into the activity pane. Bound for the operator's
-        own session, guarded by a bearer token in a 0600 discovery file."""
+        own session, guarded by a bearer token in a 0600 discovery file.
+
+        The server reads the inventory through a getter, so an operator
+        `r` reload (which rebinds self.inventory) is served immediately —
+        not the object captured at launch."""
         from ..mcp.host import serve_http
         from ..mcp.session import ensure_session, session_path
 
@@ -222,13 +239,33 @@ class ExplorerApp(App):
         log.write(Text("watching for tool calls…\n", style="dim"))
         try:
             await serve_http(
-                self.inventory,
+                lambda: self.inventory,
                 token=token,
                 port=self._mcp_port,
                 activity_sink=lambda e: self.post_message(McpActivity(e)),
+                set_inventory=lambda inv: self.post_message(McpInventorySwap(inv)),
+                shutdown=self._mcp_shutdown,
             )
         except Exception as e:  # noqa: BLE001 — surface bind/serve failure in-pane
-            log.write(Text(f"MCP host stopped: {e}", style="bold red"))
+            try:
+                log.write(Text(f"MCP host stopped: {e}", style="bold red"))
+            except Exception:  # noqa: BLE001 — pane may be gone mid-teardown
+                pass
+
+    async def action_quit(self) -> None:
+        """Quit, stopping the embedded MCP host FIRST. Uvicorn must stop
+        accepting and drain before the app tears the loop down — an abrupt
+        worker cancel leaves the socket briefly accepting while the
+        streamable-http task group is already gone, so late client retries
+        spew "Task group is not initialized" over the restored terminal."""
+        if self._mcp_shutdown is not None:
+            self._mcp_shutdown.set()
+            if self._mcp_worker is not None:
+                try:
+                    await asyncio.wait_for(self._mcp_worker.wait(), timeout=5)
+                except Exception:  # noqa: BLE001 — quit anyway; worker is torn down with the app
+                    pass
+        self.exit()
 
     @on(McpActivity)
     def _on_mcp_activity(self, message: McpActivity) -> None:
@@ -251,27 +288,44 @@ class ExplorerApp(App):
         args = e.get("args") or {}
         arg_str = " ".join(f"{k}={v!r}" for k, v in args.items())
         style = "green" if status == "ok" else "bold red"
+        label = status
+        if e.get("elapsed") is not None:
+            label += f" · {e['elapsed']:.1f}s"
         line = Text()
         line.append(f"▸ {tool}", style="bold")
         if arg_str:
             line.append(f"  {arg_str}", style="dim")
-        line.append(f"  [{status}]", style=style)
+        line.append(f"  [{label}]", style=style)
         if e.get("detail"):
             line.append(f"  {e['detail']}", style="red")
         self.query_one("#mcp-activity", RichLog).write(line)
         # A client-launched run renders like a human one: attach the live
         # per-host deploy view (deploys) or the log-tail observer (reboots)
-        # to the run the tool just registered.
-        if tool == "deploy" and status == "ok":
-            self._attach_latest_run("deploy")
-        elif tool == "reboot" and status == "ok":
-            self._attach_latest_run("reboot")
+        # to the run the tool just registered. The settle event's result
+        # summary names the exact run; without one (older events) fall
+        # back to the newest live run of that kind.
+        if tool in ("deploy", "reboot") and status == "ok":
+            res = e.get("result")
+            if res is None:
+                self._attach_run(tool, None)
+            elif res.get("ok") and res.get("run_id"):
+                self._attach_run(tool, res["run_id"])
         elif (
             tool == "drift"
             and status == "ok"
             and (args.get("refresh") or args.get("do_eval"))
         ):
             self._mcp_drift_landed()
+
+    @on(McpInventorySwap)
+    def _on_mcp_inventory_swap(self, message: McpInventorySwap) -> None:
+        """The MCP `reload` tool committed a freshly evaluated inventory —
+        adopt it and repaint. The slow eval already ran inside the tool
+        call, so `_load`'s worker just reads the cached aggregate."""
+        self.inventory = message.inventory
+        self.expected = None
+        self._load()
+        self._set_status("inventory reloaded (mcp)")
 
     def _render_mcp_pending(self) -> None:
         """The panel's pending strip: one spinner line per in-flight tool
@@ -307,31 +361,42 @@ class ExplorerApp(App):
         self._fill_drift()
         self._set_status("drift refreshed (mcp)")
 
-    def _attach_latest_run(self, kind: str) -> None:
+    def _attach_run(self, kind: str, run_id: str | None) -> None:
+        """Attach the matching observer screen to a registry run. With a
+        `run_id` (from the settle event's result summary) it's exact;
+        without one, fall back to the newest run of this kind."""
         from .. import registry
         from .tasks import AttachedLogScreen
 
-        for info in registry.list_runs():  # most-recent first
-            if info.kind != kind:
-                continue
-            # A refused call (confirm mismatch) launches nothing but still
-            # logs ok — only a run whose pid is alive is the one just fired.
-            if not registry.pid_alive(info.pid):
-                return
-            run_id = info.run_id
-            if run_id in self._attached_runs:
-                return
-            self._attached_runs.add(run_id)
-            if kind == "deploy":
-                run = DeployRun.attach(run_id)
-                if run is not None:
-                    self.push_screen(DeployScreen(run, attached=True))
-                return
-            title = f"{kind} {info.meta.get('limit', '')}".strip()
-            self.push_screen(
-                AttachedLogScreen(title, run_id), self._after_mutation
+        if run_id is not None:
+            obs = registry.open_run(run_id)
+            info = None if obs is None else obs.info
+        else:
+            info = next(
+                (i for i in registry.list_runs() if i.kind == kind), None
             )
+        if info is None:
             return
+        # A refused call (confirm mismatch) launches nothing but still
+        # logs ok — only a run whose pid is alive is the one just fired.
+        if not registry.pid_alive(info.pid):
+            return
+        if info.run_id in self._attached_runs:
+            return
+        self._attached_runs.add(info.run_id)
+        if kind == "deploy":
+            run = DeployRun.attach(info.run_id)
+            if run is not None:
+                # Same callback as an operator deploy: refresh drift once
+                # the run completes and its screen closes.
+                self.push_screen(
+                    DeployScreen(run, attached=True), self._after_mutation
+                )
+            return
+        title = f"{kind} {info.meta.get('limit', '')}".strip()
+        self.push_screen(
+            AttachedLogScreen(title, info.run_id), self._after_mutation
+        )
 
     # -- data ----------------------------------------------------------
 
@@ -340,6 +405,11 @@ class ExplorerApp(App):
         a real fleet, and blocking on_mount means a gray void instead of
         a first paint."""
         if self._busy:
+            # A reload while the eval worker runs must be QUEUED, not
+            # silently dropped — the freshly-rebound Inventory would
+            # otherwise evaluate on the UI thread the first time anything
+            # touches .aggregate.
+            self._reload_pending = True
             return
         self._busy = True
         self._render_status()  # shows the eval spinner
@@ -357,9 +427,15 @@ class ExplorerApp(App):
             self._cached_rev, cached = drift_mod.load_expected()
             if drift_mod.cache_fresh(self._cached_rev, self._rev):
                 self.expected = cached
-            self.call_from_thread(self._fill)
+            self.call_from_thread(self._fill, inv)
 
         self.run_worker(work, thread=True, exclusive=True)
+
+    def _consume_pending_reload(self) -> None:
+        """Run a reload queued while a worker was busy (see `_load`)."""
+        if self._reload_pending and not self._busy:
+            self._reload_pending = False
+            self._load()
 
     def _load_failed(self, error: str) -> None:
         self._busy = False
@@ -367,9 +443,18 @@ class ExplorerApp(App):
             f"aggregate eval failed: {error.splitlines()[-1] if error else 'unknown'}",
             error=True,
         )
+        self._consume_pending_reload()
 
-    def _fill(self) -> None:
-        inv = self.inventory
+    def _fill(self, inv: Inventory | None = None) -> None:
+        if inv is None:
+            inv = self.inventory
+        elif inv is not self.inventory:
+            # The contract was reloaded while this eval ran — don't paint
+            # the stale aggregate; the queued reload repaints from the
+            # fresh inventory.
+            self._busy = False
+            self._consume_pending_reload()
+            return
 
         members = self.query_one("#members-table", SelectTable)
         members.reset_rows()
@@ -397,9 +482,15 @@ class ExplorerApp(App):
             f"{len(inv.members)} members, {len(inv.groups)} groups"
             " — space/shift+↑↓ select · p ping · R reboot · D deploy"
         )
+        self._consume_pending_reload()
 
     @property
     def _deploy_nodes(self) -> list[str]:
+        # Never force the slow aggregate eval on the UI thread: a
+        # just-reloaded (unevaluated) inventory reports no nodes until its
+        # background eval lands.
+        if "aggregate" not in self.inventory.__dict__:
+            return []
         deploy = self.inventory.aggregate.get("projections", {}).get("deploy", {})
         return list(deploy.get("nodes", []))
 
@@ -462,7 +553,7 @@ class ExplorerApp(App):
         self.push_screen(TaskScreen(
             f"ping {target}",
             ["ansible", target, "-m", "ping"],
-            _ansible_dir(),
+            ansible_dir(),
             # Deliberately the DEFAULT stdout callback: --one-line AND the
             # oneline/minimal callbacks are deprecated in core 2.19
             # (removed 2.23) with no core replacement (ansible/ansible
@@ -475,35 +566,23 @@ class ExplorerApp(App):
         target = self._target()
         if target is None:
             return
-        # Prefer the operator's wrapper: it carries the controller-side env
-        # raw ansible-playbook lacks — the delegated k8s drain pins
-        # ANSIBLE_LOCAL_PYTHON_INTERPRETER to a python WITH the kubernetes
-        # lib (the global interpreter default does not win for delegated
-        # tasks, so without the wrapper the drain fails "kubernetes
-        # library is missing").
-        import shutil
-
-        if shutil.which("ans-reboot"):
-            base = ["ans-reboot", "-l", target]
-        elif (_ansible_dir() / "playbooks/reboot.yaml").is_file():
-            base = ["ansible-playbook", "playbooks/reboot.yaml", "-l", target]
-        else:
+        if reboot_argv(target, "1", True) is None:  # availability pre-check
             self._set_status("no ans-reboot wrapper or playbooks/reboot.yaml — reboot task unavailable")
             return
-
         # RebootScreen returns the chosen batch order + drain safety; both
-        # ride through the wrapper as extra-vars (ans-reboot/ansible-playbook
-        # both forward "$@"). reboot_serial drives the play's `serial`,
-        # drain gates the k8s cordon/drain steps.
+        # ride as extra-vars through `reboot_argv` (shared with the MCP
+        # tool — the wrapper-preference rationale lives there).
+        # reboot_serial drives the play's `serial`, drain gates the k8s
+        # cordon/drain steps.
         def go(opts: dict | None) -> None:
             if not opts:
                 return
-            argv = base + [
-                "-e", f"reboot_serial={opts['serial']}",
-                "-e", f"drain={'true' if opts['drain'] else 'false'}",
-            ]
+            argv = reboot_argv(target, opts["serial"], opts["drain"])
+            if argv is None:
+                self._set_status("no ans-reboot wrapper or playbooks/reboot.yaml — reboot task unavailable")
+                return
             self.push_screen(
-                TaskScreen(f"reboot {target}", argv, _ansible_dir()),
+                TaskScreen(f"reboot {target}", argv, ansible_dir()),
                 self._after_mutation,
             )
 
@@ -576,11 +655,15 @@ class ExplorerApp(App):
             return
         self._busy = True
         self._render_status()  # shows the eval spinner alongside any survey
-        nodes = self._deploy_nodes
-        flake = self.inventory.flake
+        inv = self.inventory
+        flake = inv.flake
 
         def work() -> None:
             try:
+                # Node resolution may force the aggregate eval — keep it
+                # off the UI thread with the rest of the slow work.
+                deploy = inv.aggregate.get("projections", {}).get("deploy", {})
+                nodes = list(deploy.get("nodes", []))
                 expected = drift_mod.eval_expected(flake, nodes)
             except Exception as e:  # noqa: BLE001 — surfaced, not raised
                 self.call_from_thread(self._drift_done, None, f"eval failed: {e}")
@@ -607,7 +690,7 @@ class ExplorerApp(App):
         self._survey_n = 0
         self._render_status()  # shows the survey spinner alongside any eval
         directory = drift_mod.state_dir()
-        cwd = _ansible_dir()
+        cwd = ansible_dir()
         env = dict(
             os.environ,
             MANDALA_FLEET_STATE=str(directory),
@@ -688,3 +771,4 @@ class ExplorerApp(App):
         # so this resting message only surfaces once both jobs are idle; an
         # eval error is sticky and wins over the survey's success message.
         self._set_status(error or "drift refreshed", error=error is not None)
+        self._consume_pending_reload()
