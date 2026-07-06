@@ -171,11 +171,16 @@ def test_deploy_status_sees_out_of_band_run(monkeypatch, tmp_path) -> None:
     assert data["hosts"]["cache"]["state"] == "confirmed"
 
 
-def test_activity_sink_records_each_call() -> None:
+def test_activity_sink_records_start_then_settle() -> None:
+    """Every call emits start → ok/error sharing a seq, so the TUI can show
+    the call as PENDING (spinner) while it runs and pop it when it lands."""
     seen: list[dict] = []
     mcp = build_server(_inv(), activity_sink=seen.append)
     _call(mcp, "resolve", {"selector": "@k3s"})
-    assert any(e["tool"] == "resolve" and e["status"] == "ok" for e in seen)
+    events = [e for e in seen if e["tool"] == "resolve"]
+    assert [e["status"] for e in events] == ["start", "ok"]
+    assert events[0]["seq"] == events[1]["seq"]
+    assert events[0]["args"] == {"selector": "@k3s"}
 
 
 def test_token_asgi_middleware_guards_http() -> None:

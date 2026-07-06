@@ -63,9 +63,14 @@ class ExplorerApp(App):
     #views { height: 1fr; }
     #members-table, #groups-table, #drift-table { height: 1fr; }
     #drift-hint { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
-    #mcp-activity {
+    #mcp-panel {
         dock: right; width: 52; border-left: solid $surface;
-        padding: 0 1; background: $panel;
+        background: $panel;
+    }
+    #mcp-activity { height: 1fr; padding: 0 1; }
+    #mcp-pending {
+        dock: bottom; height: auto; padding: 0 1;
+        border-top: solid $surface; display: none;
     }
     """
     BINDINGS = [
@@ -100,6 +105,11 @@ class ExplorerApp(App):
         self._busy = False
         self._surveying = False
         self._survey_n = 0  # snapshots surveyed so far this run
+        # In-flight MCP tool calls (seq → activity event): the hosted
+        # server's start events land here and the matching ok/error pops
+        # them, so a running call spins in the status bar and the panel's
+        # pending strip exactly like an operator-launched job.
+        self._mcp_pending: dict[int, dict] = {}
         # Resting bar text shown when no job is running, and the spinner timer.
         self._status = ""
         self._status_sticky = False  # an error holds until the next refresh
@@ -134,6 +144,11 @@ class ExplorerApp(App):
             jobs.append("eval")
         if self._surveying:
             jobs.append(f"survey ({self._survey_n} read)" if self._survey_n else "survey")
+        # A hosted MCP call in flight is a job like any other — a
+        # client-launched drift eval spins in the bar exactly as if the
+        # operator had pressed S.
+        for e in self._mcp_pending.values():
+            jobs.append(f"mcp {e.get('tool', '?')}")
         if jobs:
             frame = _SPINNER[self._spin % len(_SPINNER)]
             self.sub_title = "running   " + "   ·   ".join(f"{frame} {j}" for j in jobs)
@@ -148,9 +163,13 @@ class ExplorerApp(App):
     def _tick(self) -> None:
         self._spin += 1
         self._render_status()
+        self._render_mcp_pending()
         # Stop animating once every job is idle — the resting message needs
         # no ticking, and a live timer would spin forever.
-        if not (self._busy or self._surveying) and self._spin_timer is not None:
+        if (
+            not (self._busy or self._surveying or self._mcp_pending)
+            and self._spin_timer is not None
+        ):
             self._spin_timer.stop()
             self._spin_timer = None
 
@@ -159,7 +178,9 @@ class ExplorerApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         if self._serve_mcp:
-            yield RichLog(id="mcp-activity", wrap=True, markup=True, max_lines=2000)
+            with Vertical(id="mcp-panel"):
+                yield RichLog(id="mcp-activity", wrap=True, markup=True, max_lines=2000)
+                yield Static(id="mcp-pending")
         with TabbedContent(initial="tab-members", id="views"):
             with TabPane("members", id="tab-members"):
                 yield SelectTable(id="members-table", zebra_stripes=True, cursor_type="row")
@@ -213,6 +234,20 @@ class ExplorerApp(App):
     def _on_mcp_activity(self, message: McpActivity) -> None:
         e = message.event
         tool, status = e.get("tool", "?"), e.get("status", "?")
+        seq = e.get("seq")
+        if status == "start":
+            # The call is now PENDING: it spins in the status bar (like an
+            # operator-launched eval/survey) and in the panel's pending
+            # strip until its ok/error event pops it.
+            if seq is not None:
+                self._mcp_pending[seq] = e
+            self._render_status()
+            self._render_mcp_pending()
+            return
+        if seq is not None:
+            self._mcp_pending.pop(seq, None)
+        self._render_status()
+        self._render_mcp_pending()
         args = e.get("args") or {}
         arg_str = " ".join(f"{k}={v!r}" for k, v in args.items())
         style = "green" if status == "ok" else "bold red"
@@ -231,6 +266,46 @@ class ExplorerApp(App):
             self._attach_latest_run("deploy")
         elif tool == "reboot" and status == "ok":
             self._attach_latest_run("reboot")
+        elif (
+            tool == "drift"
+            and status == "ok"
+            and (args.get("refresh") or args.get("do_eval"))
+        ):
+            self._mcp_drift_landed()
+
+    def _render_mcp_pending(self) -> None:
+        """The panel's pending strip: one spinner line per in-flight tool
+        call. Collapses entirely when nothing is running."""
+        if not self._serve_mcp:
+            return
+        strip = self.query_one("#mcp-pending", Static)
+        if not self._mcp_pending:
+            strip.display = False
+            return
+        strip.display = True
+        self._ensure_spinner()  # animate even if no eval/survey is running
+        frame = _SPINNER[self._spin % len(_SPINNER)]
+        text = Text()
+        for i, e in enumerate(self._mcp_pending.values()):
+            if i:
+                text.append("\n")
+            text.append(f"{frame} {e.get('tool', '?')}", style="bold yellow")
+            args = e.get("args") or {}
+            arg_str = " ".join(f"{k}={v!r}" for k, v in args.items())
+            if arg_str:
+                text.append(f"  {arg_str}", style="dim")
+        strip.update(text)
+
+    def _mcp_drift_landed(self) -> None:
+        """An MCP `drift(refresh/do_eval)` call just wrote fresh snapshots
+        and/or the expected cache into the shared state dir — pick them up
+        exactly as if the operator's own S-refresh had landed."""
+        self._rev = drift_mod.repo_rev(self.inventory.flake)
+        self._cached_rev, cached = drift_mod.load_expected()
+        if drift_mod.cache_fresh(self._cached_rev, self._rev):
+            self.expected = cached
+        self._fill_drift()
+        self._set_status("drift refreshed (mcp)")
 
     def _attach_latest_run(self, kind: str) -> None:
         from .. import registry
@@ -462,11 +537,12 @@ class ExplorerApp(App):
         return True
 
     def action_toggle_mcp(self) -> None:
-        """Show/hide the MCP activity pane — the host keeps serving either
-        way; only the pane's screen estate is reclaimed."""
+        """Show/hide the MCP activity panel (log + pending strip) — the
+        host keeps serving either way; only the panel's screen estate is
+        reclaimed. In-flight calls still spin in the status bar."""
         if not self._serve_mcp:
             return
-        panel = self.query_one("#mcp-activity", RichLog)
+        panel = self.query_one("#mcp-panel", Vertical)
         panel.display = not panel.display
 
     def action_reload(self) -> None:
