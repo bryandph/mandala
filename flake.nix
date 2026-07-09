@@ -198,6 +198,46 @@
         assert topo.vlans.mgmt.prefixLength == 24;
         assert topo.vlans.storage.subnet == null;
         assert topo.vlans.storage.prefixLength == null;
+        # lib.net: id → v4/ULA derivation (digit-mirror convention).
+        assert (self.lib.net.forTopology topo).address "mgmt" 102 == "10.0.2.102";
+        assert (self.lib.net.forTopology topo).ula "mgmt" 102 == "fd00:dead:beef:2::102";
+        assert (self.lib.net.forTopology topo).host "mgmt" 7
+        == {
+          vlan = "mgmt";
+          id = 7;
+          address = "10.0.2.7";
+          ula = "fd00:dead:beef:2::7";
+        };
+        # /16: v4 id spans two octets; the ULA group is the id itself.
+        assert self.lib.net.v4 {
+          subnet = "10.0.0.0/16";
+          prefixLength = 16;
+        } 261
+        == "10.0.1.5";
+        assert self.lib.net.ula {
+          subnet = "10.0.0.0/16";
+          prefixLength = 16;
+          ula = "fd00:dead:beef:5::/64";
+        } 261
+        == "fd00:dead:beef:5::261";
+        # v4-authored attachments recover the id, then derive the same ULA.
+        assert self.lib.net.ulaFromV4 {
+          subnet = "10.0.2.0/24";
+          prefixLength = 24;
+          ula = "fd00:dead:beef:2::/64";
+        } "10.0.2.102"
+        == "fd00:dead:beef:2::102";
+        # evalMemberWith realizes id-authored attachments against topology.
+        assert (lib.head (self.lib.evalMemberWith topo {
+          name = "id-authored";
+          networks = [
+            {
+              vlan = "mgmt";
+              id = 16;
+            }
+          ];
+        }).networks).ula
+        == "fd00:dead:beef:2::16";
         assert pki.cas.example-intermediate.signedBy == "example-root";
         assert builtins.length (builtins.attrNames pki.cas) == 2;
         assert member.fqdn == "example-node.example.test";

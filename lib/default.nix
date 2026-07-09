@@ -48,6 +48,19 @@
       ];
     }).config.mesh;
 
+  # Address-derivation primitives (id + topology → v4/ULA). Pure math;
+  # `net.forTopology topology` yields the name-keyed authoring API.
+  net = import ./net.nix {inherit lib;};
+
+  # evalMember with `{vlan, id}` attachments realized against topology
+  # first — id-authored reservations satisfy the address invariant, and
+  # every consumer of the validated member sees concrete address/ula.
+  evalMemberWith = topology: data:
+    evalMember (data
+      // {
+        networks = net.resolveNetworks topology (data.networks or []);
+      });
+
   # Evaluate one member's data against the member schema, plus the
   # cross-field invariants the module system can't express per-option
   # (NixOS consumers enforce the same invariants as host assertions).

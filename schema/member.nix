@@ -124,10 +124,16 @@ in {
             description = "Name referencing topology.vlans.<name>.";
             example = "servers";
           };
+          id = mkOption {
+            type = types.nullOr types.int;
+            default = null;
+            description = "Integer host identifier — the offset from the VLAN subnet's network address (id 102 on a /24 → .102; id 261 on 10.5.0.0/16 → 10.5.1.5). When set, lib.net derives address (subnet + id) and ula (the id as one decimal-literal group on the VLAN's ULA /64, e.g. id 102 → ::102) unless those are explicitly authored; realize via lib.evalMemberWith or lib.net.resolveNetworks.";
+            example = 102;
+          };
           address = mkOption {
             type = types.nullOr types.str;
             default = null;
-            description = "IPv4 address on this network (no CIDR — prefix length derived from topology). Required when assignment = reservation.";
+            description = "IPv4 address on this network (no CIDR — prefix length derived from topology). Required when assignment = reservation. Derived from `id` when realized via lib.net.";
             example = "172.16.15.100";
           };
           ula = mkOption {
