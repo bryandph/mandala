@@ -212,13 +212,15 @@
         assert self.lib.net.v4 {
           subnet = "10.0.0.0/16";
           prefixLength = 16;
-        } 261
+        }
+        261
         == "10.0.1.5";
         assert self.lib.net.ula {
           subnet = "10.0.0.0/16";
           prefixLength = 16;
           ula = "fd00:dead:beef:5::/64";
-        } 261
+        }
+        261
         == "fd00:dead:beef:5::261";
         # v4-authored attachments recover the id, then derive the same ULA.
         assert self.lib.net.ulaFromV4 {
@@ -228,15 +230,16 @@
         } "10.0.2.102"
         == "fd00:dead:beef:2::102";
         # evalMemberWith realizes id-authored attachments against topology.
-        assert (lib.head (self.lib.evalMemberWith topo {
-          name = "id-authored";
-          networks = [
-            {
-              vlan = "mgmt";
-              id = 16;
-            }
-          ];
-        }).networks).ula
+        assert (lib.head
+          (self.lib.evalMemberWith topo {
+            name = "id-authored";
+            networks = [
+              {
+                vlan = "mgmt";
+                id = 16;
+              }
+            ];
+          }).networks).ula
         == "fd00:dead:beef:2::16";
         assert pki.cas.example-intermediate.signedBy == "example-root";
         assert builtins.length (builtins.attrNames pki.cas) == 2;

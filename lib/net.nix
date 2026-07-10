@@ -44,8 +44,7 @@
     assert lib.assertMsg (vlanCfg.ula or null != null)
     "mandala net.ula: VLAN has no authored ULA prefix";
     assert lib.assertMsg (id > 0 && id <= 9999)
-    "mandala net.ula: id ${toString id} does not fit one decimal-literal group";
-      "${lib.removeSuffix "::/64" vlanCfg.ula}::${toString id}";
+    "mandala net.ula: id ${toString id} does not fit one decimal-literal group"; "${lib.removeSuffix "::/64" vlanCfg.ula}::${toString id}";
 
   # ULA for an attachment that authors a v4 address instead of an id:
   # recover the id (offset from the network address), then derive.
