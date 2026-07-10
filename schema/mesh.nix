@@ -21,6 +21,12 @@ in {
             description = "Assigned overlay IPv4 address.";
             example = "10.16.42.29";
           };
+          ip6 = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Assigned overlay IPv6 (ULA) address; null = v4-only member.";
+            example = "fd42:cafe:feed:2a::29";
+          };
           name = mkOption {
             type = types.nullOr types.str;
             default = null;
