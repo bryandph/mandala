@@ -2,6 +2,9 @@ result
 result-*
 .direnv/
 
+# Cargo build artifacts (mandala-rs workspace)
+target/
+
 # Python bytecode (e.g. ansible action plugins under
 # ansible/collections/.../plugins) — regenerated at runtime, never tracked.
 __pycache__/

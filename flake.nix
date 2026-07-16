@@ -36,6 +36,47 @@
 
     formatter = eachSystem (pkgs: pkgs.alejandra);
 
+    # Rust workspace devshell (OpenSpec change mandala-rust-rewrite).
+    # Deliberately a plain nixpkgs mkShell: the purity invariant above
+    # (no inputs beyond nixpkgs) rules out the devenv/rust-overlay
+    # wiring used elsewhere in the org — and the shell's toolchain is
+    # the exact rustPlatform the mandala-rs package derivation builds
+    # with, so `cargo build` in dev and `nix build` never skew.
+    # The eval-worker spike will extend this with libnixexpr-c
+    # (pkgs.nix dev output) + bindgen once the bindings are chosen.
+    devShells = eachSystem (pkgs: {
+      default = pkgs.mkShell {
+        packages = with pkgs; [
+          # Toolchain — same nixpkgs rustc as rustPlatform.buildRustPackage
+          rustc
+          cargo
+          clippy
+          rustfmt
+          rust-analyzer
+          # Cargo extensions
+          cargo-edit
+          cargo-outdated
+          cargo-audit
+          cargo-hack
+          cargo-nextest
+          cargo-llvm-cov
+          taplo
+          # Native build deps (openssl-sys and friends)
+          pkg-config
+          openssl
+          # Nix-side tooling (CI runs `nix fmt -- --check .`)
+          alejandra
+          statix
+          deadnix
+          nixd
+        ];
+
+        # nixpkgs rustc ships without the rust-src component;
+        # rust-analyzer needs it for std-library navigation.
+        env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+      };
+    });
+
     # The CLI porcelain, built from nixpkgs only (the purity invariant
     # holds: no new inputs). Exposed twice: `mandala-fleet-python` is the
     # composable python MODULE — an operator devshell builds ONE
