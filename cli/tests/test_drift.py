@@ -67,6 +67,40 @@ def test_drift_and_reboot_pending(tmp_path: Path) -> None:
     assert entries["pending"].status == drift.DriftStatus.REBOOT_PENDING
 
 
+def _boot(**overrides) -> dict:
+    facts = {"kernel": "/nix/store/k1", "kernel_modules": "/nix/store/m1",
+             "initrd": "/nix/store/i1", "kernel_params": "root=x loglevel=4"}
+    facts.update(overrides)
+    return facts
+
+
+def test_activated_only_when_nothing_boot_critical_moved(tmp_path: Path) -> None:
+    old = "/nix/store/zzz-old"
+    # Identical boot-critical quad: the new generation is fully live.
+    _snap(tmp_path, "act", booted=old, current_boot=_boot(), booted_boot=_boot())
+    # Whitespace-only cmdline delta is the survey's echo wrapper, not a change.
+    _snap(tmp_path, "ws", booted=old, booted_boot=_boot(),
+          current_boot=_boot(kernel_params=" root=x  loglevel=4 "))
+    # Any of the quad moving keeps the strict judgement.
+    _snap(tmp_path, "kern", booted=old, booted_boot=_boot(),
+          current_boot=_boot(kernel="/nix/store/k2"))
+    _snap(tmp_path, "initrd", booted=old, booted_boot=_boot(),
+          current_boot=_boot(initrd="/nix/store/i2"))
+    # Pre-boot-facts snapshots and half-missing facts stay conservative.
+    _snap(tmp_path, "legacy", booted=old)
+    _snap(tmp_path, "partial", booted=old, booted_boot=_boot(),
+          current_boot=_boot(kernel=""))
+    hosts = ["act", "ws", "kern", "initrd", "legacy", "partial"]
+    entries = {e.host: e for e in drift.compare(
+        hosts, drift.read_snapshots(tmp_path),
+        {h: "/nix/store/aaa-x" for h in hosts}, now=NOW,
+    )}
+    assert entries["act"].status == drift.DriftStatus.ACTIVATED
+    assert entries["ws"].status == drift.DriftStatus.ACTIVATED
+    for host in ("kern", "initrd", "legacy", "partial"):
+        assert entries[host].status == drift.DriftStatus.REBOOT_PENDING
+
+
 def test_eval_expected_rejects_hostile_names() -> None:
     # The aggregate is a trust boundary: a name with '' would escape the
     # Nix indented string. Reject before any subprocess is spawned.

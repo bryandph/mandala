@@ -4,9 +4,9 @@
 # The survey pattern: fan out, read each member's deployment state, write
 # one JSON snapshot per host on the CONTROLLER. The drift dashboard
 # (mandala CLI/TUI) compares these snapshots against locally evaluated
-# toplevels; this playbook never changes anything on a host (two
-# readlinks), and unreachable members are recorded as such instead of
-# failing the run.
+# toplevels; this playbook never changes anything on a host (a few
+# readlinks and file reads), and unreachable members are recorded as
+# such instead of failing the run.
 #
 # Targets the deploy_rs guard group — drift is only meaningful for
 # members something deploys to.
@@ -42,7 +42,25 @@
       changed_when: false
       failed_when: false
 
+    - name: Read boot-critical facts (kernel, modules, initrd, cmdline)
+      # The subset of a generation that only takes effect at boot. Fixed
+      # 8-line output (4 per system): a failed readlink/cat yields an
+      # empty line so positions stay stable; the drift comparator treats
+      # empty facts conservatively (as "changed").
+      ansible.builtin.shell: |
+        for sys in /run/current-system /run/booted-system; do
+          for f in kernel kernel-modules initrd; do
+            readlink -f "$sys/$f" || echo ""
+          done
+          echo "$(cat "$sys/kernel-params" 2>/dev/null)"
+        done
+      register: boot_facts
+      changed_when: false
+      failed_when: false
+
     - name: Write per-host state snapshot (controller)
+      vars:
+        boot_lines: "{{ boot_facts.stdout_lines | default([]) }}"
       ansible.builtin.copy:
         mode: "0644"
         dest: "{{ fleet_state_dir }}/{{ inventory_hostname }}.json"
@@ -52,6 +70,18 @@
             'unreachable': system_links is unreachable,
             'current': system_links.stdout_lines | default([]) | first | default(None),
             'booted': system_links.stdout_lines | default([]) | last | default(None),
+            'current_boot': {
+              'kernel': boot_lines[0],
+              'kernel_modules': boot_lines[1],
+              'initrd': boot_lines[2],
+              'kernel_params': boot_lines[3],
+            } if boot_lines | length == 8 else None,
+            'booted_boot': {
+              'kernel': boot_lines[4],
+              'kernel_modules': boot_lines[5],
+              'initrd': boot_lines[6],
+              'kernel_params': boot_lines[7],
+            } if boot_lines | length == 8 else None,
             'captured_at': now(utc=true).isoformat()
           } | to_nice_json }}
       delegate_to: localhost

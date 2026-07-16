@@ -223,7 +223,10 @@ def build_server(inventory, activity_sink=None, set_inventory=None) -> FastMCP:
         fleet) and `total`; `statuses` filters the `entries` list to just
         those statuses (e.g. `["drift", "unreachable"]`) so one noisy status
         — every host goes `reboot-pending` after a kernel bump — doesn't
-        drown the rest. `expected_source: "none"` means NO expected-toplevel
+        drown the rest. `reboot-pending` fires only on a boot-critical
+        change between booted and current (kernel, kernel-modules, initrd,
+        kernel-params); an activated-but-unrebooted generation with none
+        of those reports `activated` instead. `expected_source: "none"` means NO expected-toplevel
         comparison happened (no cache for this rev and `do_eval` false):
         current-vs-expected judgements are then absent, not clean."""
         inv = get_inv()

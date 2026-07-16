@@ -2,8 +2,8 @@
 
 Data path mirrors the survey pattern: the read-only state playbook
 (mandala.fleet.state) fans out, reads each member's /run/current-system
-and /run/booted-system links, and writes one JSON snapshot per host on
-the controller. This module compares those snapshots against the
+and /run/booted-system links plus each system's boot-critical facts,
+and writes one JSON snapshot per host on the controller. This module compares those snapshots against the
 locally evaluated toplevels (`nixosConfigurations.<h>.config.system
 .build.toplevel.outPath` — what /run/current-system points at after a
 successful deploy).
@@ -15,6 +15,12 @@ Drift is EXACT out-path equality — deliberately strict: a moved
 contract IS drift. Time gets the same strictness: snapshots older than
 the staleness threshold judge as STALE rather than pretending an old
 observation is current.
+
+A booted/current split is judged by its boot-critical subset — kernel,
+kernel-modules, initrd, kernel-params: what switch-to-configuration
+cannot apply live (the same quad nixos-needsreboot compares). Only a
+change there is REBOOT_PENDING; otherwise the new generation is fully
+live and reports ACTIVATED.
 
 State lives under $MANDALA_FLEET_STATE, else $XDG_STATE_HOME/mandala/
 fleet (resolved at CALL time, not import time): per-user, persistent
@@ -59,7 +65,8 @@ def state_dir() -> Path:
 class DriftStatus(str, Enum):
     IN_SYNC = "in-sync"
     DRIFT = "drift"
-    REBOOT_PENDING = "reboot-pending"
+    REBOOT_PENDING = "reboot-pending"  # boot-critical change awaits a reboot
+    ACTIVATED = "activated"  # booted != current, but nothing boot-critical moved
     STALE = "stale"  # snapshot too old to support a judgement
     INCOMPLETE = "incomplete"  # snapshot exists but lacks the system links
     NO_SNAPSHOT = "no-snapshot"  # never surveyed
@@ -73,6 +80,7 @@ STATUS_STYLE: dict[DriftStatus, str] = {
     DriftStatus.IN_SYNC: "green",
     DriftStatus.DRIFT: "bold red",
     DriftStatus.REBOOT_PENDING: "yellow",
+    DriftStatus.ACTIVATED: "dim green",
     DriftStatus.STALE: "dim yellow",
     DriftStatus.INCOMPLETE: "dim red",
     DriftStatus.NO_SNAPSHOT: "dim",
@@ -206,6 +214,34 @@ def _too_old(captured_at: str | None, max_age: timedelta | None, now: datetime) 
     return (now - when) > max_age
 
 
+# Boot-critical subset of a toplevel (see module docstring): compared
+# between booted and current to decide REBOOT_PENDING vs ACTIVATED.
+_BOOT_CRITICAL = ("kernel", "kernel_modules", "initrd", "kernel_params")
+
+
+def _boot_critical_changed(snap: dict) -> bool:
+    """Whether booted -> current crosses a boot-critical change.
+
+    Conservative: a snapshot without boot facts (written by a pre-upgrade
+    survey) or with a fact missing on either side judges as changed — an
+    unproven reboot-safety claim must not soften REBOOT_PENDING.
+    """
+    current, booted = snap.get("current_boot"), snap.get("booted_boot")
+    if not isinstance(current, dict) or not isinstance(booted, dict):
+        return True
+    for key in _BOOT_CRITICAL:
+        a, b = current.get(key), booted.get(key)
+        if not a or not b:
+            return True
+        if key == "kernel_params":
+            # The cmdline is compared as a token sequence — the survey's
+            # echo wrapper may introduce surrounding whitespace.
+            a, b = " ".join(a.split()), " ".join(b.split())
+        if a != b:
+            return True
+    return False
+
+
 def compare(
     deploy_nodes: list[str],
     snapshots: dict[str, dict],
@@ -242,7 +278,11 @@ def compare(
         elif entry.expected is not None and current != entry.expected:
             entry.status = DriftStatus.DRIFT
         elif booted and booted != current:
-            entry.status = DriftStatus.REBOOT_PENDING
+            entry.status = (
+                DriftStatus.REBOOT_PENDING
+                if _boot_critical_changed(snap)
+                else DriftStatus.ACTIVATED
+            )
         else:
             entry.status = DriftStatus.IN_SYNC
         entries.append(entry)
