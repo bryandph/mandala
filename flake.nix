@@ -71,6 +71,15 @@
           nixd
         ];
 
+        # The eval worker (mandala-eval-worker) links libnixexpr-c /
+        # libnixflake-c through the `nix-bindings-sys` FFI: pkg-config finds the
+        # stable C API `.pc` files in `nix`'s `dev` output (put it in
+        # buildInputs so the pkg-config setup hook paths its dev pkgconfig),
+        # and bindgen needs libclang, which `rustPlatform.bindgenHook` wires
+        # (LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS).
+        buildInputs = [pkgs.nix];
+        nativeBuildInputs = [pkgs.rustPlatform.bindgenHook];
+
         # nixpkgs rustc ships without the rust-src component;
         # rust-analyzer needs it for std-library navigation.
         env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
@@ -119,6 +128,17 @@
           ];
         };
         cargoLock.lockFile = ./Cargo.lock;
+
+        # The eval worker links the stable Nix C API (libnixexpr-c /
+        # libnixflake-c) via `nix-bindings-sys`. pkg-config resolves the `-c`
+        # `.pc` files from `nix`'s `dev` output (buildInputs → the pkg-config
+        # setup hook paths it); bindgenHook supplies libclang for the FFI
+        # binding generation. This keeps the flake purity invariant intact —
+        # `nix` and clang come from nixpkgs, no new flake inputs; the binding
+        # crate itself is a vendored cargo dep in Cargo.lock.
+        nativeBuildInputs = [pkgs.pkg-config pkgs.rustPlatform.bindgenHook];
+        buildInputs = [pkgs.nix];
+
         # cargo test over the workspace runs in the check phase (the unit
         # tests in each crate) — the Rust half of the package gate, the
         # mirror of `mandala-cli`'s pytestCheckHook.

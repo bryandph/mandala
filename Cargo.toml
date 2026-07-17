@@ -10,6 +10,7 @@ members = [
   "crates/mandala-core",
   "crates/mandala-mcp",
   "crates/mandala",
+  "crates/mandala-eval-worker",
 ]
 
 [workspace.package]

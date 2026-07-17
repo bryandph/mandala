@@ -9,6 +9,8 @@
 
 use std::collections::BTreeMap;
 
+pub mod eval;
+
 /// The mandala porcelain version, surfaced by the CLI `version` command and
 /// the MCP server banner.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
