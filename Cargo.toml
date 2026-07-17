@@ -8,9 +8,11 @@
 resolver = "3"
 members = [
   "crates/mandala-core",
+  "crates/mandala-context",
   "crates/mandala-mcp",
   "crates/mandala",
   "crates/mandala-eval-worker",
+  "crates/mandala-tui",
 ]
 
 [workspace.package]
@@ -22,6 +24,7 @@ repository = "https://github.com/bryanhuff/mandala"
 
 [workspace.dependencies]
 mandala-core = { path = "crates/mandala-core" }
+mandala-context = { path = "crates/mandala-context" }
 mandala-mcp = { path = "crates/mandala-mcp" }
 
 # A single shared profile knob: the release binary is what ships, so keep it

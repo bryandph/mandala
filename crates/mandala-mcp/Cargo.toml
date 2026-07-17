@@ -33,3 +33,11 @@ tokio = { version = "1", features = [
 # Same minimal chrono as mandala-core: the `drift` tool passes `Utc::now()` +
 # `default_max_age()` into `drift::compare`.
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+
+[dev-dependencies]
+# The follower-proxy spike (`tests/context_proxy.rs`, mandala-native-tui task
+# 1.2): routes the real dispatch core through a context endpoint. Section 3
+# promotes this to a normal dependency when `mandala mcp` grows
+# leader/follower modes.
+mandala-context.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }

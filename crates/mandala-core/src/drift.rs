@@ -449,10 +449,15 @@ pub fn save_expected(
 }
 
 /// Serialize with a one-space pretty formatter (Python `indent=1`). Shared
-/// with [`crate::registry`] so `meta.json` is written byte-identically to the
-/// `.expected.json` cache (both are the Python `json.dumps(indent=1,
-/// sort_keys=True)` format — see the module docstring's byte-format contract).
-pub(crate) fn to_pretty_1space<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
+/// with [`crate::registry`] (`meta.json`) and mandala-context's discovery
+/// writer, so every state-dir JSON file carries the same `json.dumps(
+/// indent=1, sort_keys=True)` bytes — see the module docstring's byte-format
+/// contract. Pass sorted maps (`BTreeMap`): the formatter fixes indentation,
+/// the map type fixes key order.
+///
+/// # Errors
+/// `serde_json` serialization failures (unrepresentable values).
+pub fn to_pretty_1space<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
