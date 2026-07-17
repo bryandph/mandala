@@ -342,6 +342,40 @@ impl Inventory {
     pub fn to_limit(&self, selector: &str) -> Result<String, InventoryError> {
         Ok(self.resolve(selector)?.join(","))
     }
+
+    /// The top-level `projections` value (`None` if the aggregate carries no
+    /// projections). Parity with the Python `inv.aggregate.get("projections",
+    /// {})`.
+    #[must_use]
+    pub fn projections(&self) -> Option<&Value> {
+        self.aggregate.extra.get("projections")
+    }
+
+    /// The deploy-rs node names from the deploy projection, in the aggregate's
+    /// order (unsorted — [`crate::drift::compare`] and the `deploy nodes`
+    /// command sort as needed). Parity with the Python
+    /// `aggregate["projections"]["deploy"]["nodes"]`.
+    #[must_use]
+    pub fn deploy_nodes(&self) -> Vec<String> {
+        self.projections()
+            .and_then(|p| p.get("deploy"))
+            .and_then(|d| d.get("nodes"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The projected ansible dynamic-inventory value (`None` if the ansible
+    /// flakeModule was not imported). Parity with the Python
+    /// `aggregate["projections"]["ansibleInventory"]`.
+    #[must_use]
+    pub fn ansible_inventory(&self) -> Option<&Value> {
+        self.projections().and_then(|p| p.get("ansibleInventory"))
+    }
 }
 
 #[cfg(test)]

@@ -9,12 +9,15 @@
 
 use std::collections::BTreeMap;
 
+pub mod cli;
 pub mod drift;
+pub mod engines;
 pub mod eval;
 pub mod inventory;
 pub mod registry;
 pub mod runner;
 
+pub use cli::{Cli, Engine};
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
 pub use registry::{ObservedRun, RunInfo, RunLiveness, list_runs, new_run_dir, open_run};
