@@ -18,7 +18,10 @@ pub mod runner;
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
 pub use registry::{ObservedRun, RunInfo, RunLiveness, list_runs, new_run_dir, open_run};
-pub use runner::{BuildModel, EventTailer, HostRun, HostState};
+pub use runner::{
+    BuildModel, COMMAND_LOG, CommandRun, DeployRun, EventTailer, HostRun, HostState, ansible_dir,
+    reboot_argv,
+};
 
 /// The mandala porcelain version, surfaced by the CLI `version` command and
 /// the MCP server banner.

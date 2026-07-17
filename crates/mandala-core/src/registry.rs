@@ -48,6 +48,14 @@ pub type Meta = serde_json::Map<String, Value>;
 /// The run-registry root, resolved at call time (mirrors [`state_dir`]).
 #[must_use]
 pub fn runs_dir() -> PathBuf {
+    // Tests point the runners' `new_run_dir()` at a private tmp base via a
+    // thread-local override (the runner's write-side tests spawn subprocesses
+    // that go through `new_run_dir()` — which reads `state_dir()` — so this is
+    // the env-free, race-free seam, mirroring the `pid_alive` hook below).
+    #[cfg(test)]
+    if let Some(base) = test_hooks::runs_base() {
+        return base;
+    }
     state_dir().join("runs")
 }
 
@@ -356,15 +364,18 @@ fn open_run_in(base: &Path, run_id: &str) -> Option<ObservedRun> {
 
 /// A test-only monkeypatch seam for [`pid_alive`], mirroring the Python tests'
 /// `monkeypatch.setattr(registry, "pid_alive", …)`. Thread-local so parallel
-/// tests never race; a [`test_hooks::Guard`] clears it on drop.
+/// tests never race; a [`test_hooks::Guard`] clears it on drop. `pub(crate)`
+/// so the runner's tests can fake liveness for `DeployRun::attach` too.
 #[cfg(test)]
-mod test_hooks {
+pub(crate) mod test_hooks {
     use std::cell::RefCell;
+    use std::path::PathBuf;
 
     type Hook = Box<dyn Fn(Option<i64>) -> bool>;
 
     thread_local! {
         static PID_ALIVE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static RUNS_BASE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
 
     /// If a hook is installed on this thread, evaluate it.
@@ -384,6 +395,26 @@ mod test_hooks {
     pub fn install(f: impl Fn(Option<i64>) -> bool + 'static) -> Guard {
         PID_ALIVE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
         Guard
+    }
+
+    /// The thread-local run-registry root override, if any (consulted by
+    /// [`super::runs_dir`]).
+    pub fn runs_base() -> Option<PathBuf> {
+        RUNS_BASE.with(|b| b.borrow().clone())
+    }
+
+    /// A drop-guard clearing the run-base override.
+    pub struct RunsBaseGuard;
+    impl Drop for RunsBaseGuard {
+        fn drop(&mut self) {
+            RUNS_BASE.with(|b| *b.borrow_mut() = None);
+        }
+    }
+
+    /// Point `new_run_dir()` at `base` for the current thread; returns a guard.
+    pub fn install_runs_base(base: PathBuf) -> RunsBaseGuard {
+        RUNS_BASE.with(|b| *b.borrow_mut() = Some(base));
+        RunsBaseGuard
     }
 }
 
