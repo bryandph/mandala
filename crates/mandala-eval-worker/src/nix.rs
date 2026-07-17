@@ -1,275 +1,210 @@
-//! A minimal, single-threaded wrapper over the Nix C API (libnixexpr-c +
-//! libnixflake-c) via the raw `nix-bindings-sys` FFI.
+//! A minimal, single-threaded warm Nix evaluator built on the **safe**
+//! `nix-bindings` crate (which wraps libnixexpr-c / libnixflake-c). This module
+//! contains no hand-rolled `unsafe` FFI: setup, flake locking, value navigation
+//! and deep forcing all go through the crate's safe wrappers.
 //!
 //! The whole point of the worker is a *warm* `EvalState`: the store, the
-//! evaluator, and nixpkgs setup are paid for once, then a locked flake's
-//! output attrset is cached (pinned as a GC root with `nix_gc_incref`) so a
-//! repeated `aggregate` re-forces a memoized thunk instead of re-locking and
-//! re-evaluating from cold.
+//! evaluator, and nixpkgs setup are paid for once, then a locked flake is
+//! cached ([`LockedFlake`] holds a GC-managed graph) so a repeated `aggregate`
+//! re-derives its output attrset from the already-locked flake and re-forces
+//! memoized thunks instead of re-locking and re-evaluating from cold.
 //!
 //! ## Parity with `nix eval --json`
 //!
 //! [`Evaluator::aggregate`] navigates to `<flake>#mandala` and walks the value
 //! recursively, **forcing every node before reading its type** (see
-//! [`Evaluator::value_to_json`]). That per-node force is the correctness crux:
-//! the C API's attr/list getters hand back *thunks*, and reading a thunk's type
-//! without forcing it yields `NIX_TYPE_THUNK` — the "shallow / pure-data"
+//! [`Evaluator::value_to_json_at`]). That per-node force is the correctness
+//! crux: attr/list getters hand back *thunks*, and reading a thunk's type
+//! without forcing it yields [`ValueType::Thunk`] — the "shallow / pure-data"
 //! symptom. Forcing each node produces the same fully-evaluated tree that
 //! `nix eval --json` serializes.
 //!
+//! ### String context is discarded, never realised
+//!
+//! The safe crate's only string accessors ([`Value::as_string`] et al.) call
+//! `nix_string_realise`, which **builds** the derivations in a string's context
+//! (`realiseString` → `realiseContext` → `buildPaths`). `nix eval --json` does
+//! the opposite: it prints a context string's bytes *without* building. The
+//! aggregate carries such strings for real — e.g. 33 `ssh_host_*-cert.pub`
+//! store paths — and `config.system.build.toplevel.outPath` is a whole NixOS
+//! system's store path. Realising any of those would build them.
+//!
+//! So every string leaf is read through [`builtins.unsafeDiscardStringContext`]
+//! first (see [`read_string_no_context`]): stripping the context leaves
+//! `as_string` with nothing to build, and the discard never alters the string
+//! bytes, so the output is byte-identical to `nix eval --json`. This reproduces
+//! exactly what the previous raw-FFI worker did with the non-realising
+//! `nix_get_string` accessor (which the safe layer does not expose).
+//!
 //! ## Flake fetching (git-aware, not `path:`)
 //!
-//! We lock through the flake C API (`nix_flake_lock` in `virtual` mode) with
-//! the flake reference given as a bare filesystem path. On a git working tree
-//! that resolves to `git+file://` — git-tracked files only — matching the CLI
+//! We lock through the flake API ([`LockMode::Virtual`]) with the flake
+//! reference given as a bare filesystem path. On a git working tree that
+//! resolves to `git+file://` — git-tracked files only — matching the CLI
 //! `.#mandala` installable. (`builtins.getFlake "path:…"` was rejected: it
 //! demands `--impure` on a dirty tree and then copies untracked cruft such as
 //! `.git/fsmonitor--daemon.ipc`, which is not a regular file.)
 
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
+// The safe crate's constructors hand back `Arc<Context>` / `Arc<Store>` /
+// `Arc<FlakeSettings>` (its wrappers are `Send` but deliberately `!Sync`, so the
+// C API's per-context error buffer can't be raced). The flake API *requires*
+// these Arcs by signature. This is the crate's own documented pattern — it
+// allows the very same lint in its test suite — and the worker pins all use to
+// one thread, so the non-`Sync` Arc is sound.
+#![allow(clippy::arc_with_non_send_sync)]
 
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString, c_void};
-use std::os::raw::{c_char, c_uint};
-use std::ptr;
+use std::sync::Arc;
 
-use nix_bindings_sys as ffi;
+use nix_bindings::flake::{
+    FetchersSettings, FlakeReference, FlakeReferenceParseFlags, FlakeSettings, LockFlags, LockMode,
+    LockedFlake,
+};
+use nix_bindings::{Context, EvalState, EvalStateBuilder, NixValueOps, Store, Value, ValueType};
 use serde_json::Value as Json;
 
 /// A human-readable evaluation error (the worker never surfaces raw bytes).
 pub type EvalError = String;
 
-/// `nix_get_string` / `nix_err_msg` callback: append the delivered bytes to a
-/// `Vec<u8>` handed through `user_data`. May be invoked more than once.
-extern "C" fn collect_cb(start: *const c_char, n: c_uint, user_data: *mut c_void) {
-    if start.is_null() || user_data.is_null() {
-        return;
-    }
-    let buf = unsafe { &mut *user_data.cast::<Vec<u8>>() };
-    let slice = unsafe { std::slice::from_raw_parts(start.cast::<u8>(), n as usize) };
-    buf.extend_from_slice(slice);
+/// Render any error type that carries a `Display` impl as an [`EvalError`]. The
+/// safe crate's `Error` is `Display`, and the aggregate / toplevel paths carry
+/// no secrets, so this stays diagnostic.
+fn e2s<E: std::fmt::Display>(e: E) -> EvalError {
+    e.to_string()
 }
 
-/// Read the last error message off a context (never emits secret bytes; the
-/// aggregate and toplevel paths carry no secrets, but this stays diagnostic).
-unsafe fn last_error(ctx: *mut ffi::nix_c_context) -> String {
-    let mut n: c_uint = 0;
-    let p = unsafe { ffi::nix_err_msg(ptr::null_mut(), ctx, &mut n) };
-    if p.is_null() {
-        return "unknown nix error".to_string();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n as usize) };
-    String::from_utf8_lossy(slice).into_owned()
+/// Force `val` via a shared reference. The Nix C API mutates the underlying
+/// thunk on first force, but the operation is idempotent, so `&Value` is sound
+/// ([`NixValueOps::force`] takes `&self`).
+fn force(val: &Value) -> Result<(), EvalError> {
+    NixValueOps::force(val).map_err(e2s)
 }
 
-/// A warm Nix evaluator with a per-flake locked-outputs cache.
+/// Read a forced string `val` **without realising its context** (i.e. without
+/// building the derivations the string references). `discard` must be the
+/// `builtins.unsafeDiscardStringContext` function value: applying it strips the
+/// context so the subsequent [`Value::as_string`] (which realises) has nothing
+/// to build, while leaving the string bytes untouched. See the module docs.
+fn read_string_no_context(val: &Value, discard: &Value) -> Result<String, EvalError> {
+    let stripped = discard.call(val).map_err(e2s)?;
+    stripped.as_string().map_err(e2s)
+}
+
+/// A warm Nix evaluator with a per-flake locked-flake cache.
 ///
-/// Single-threaded by construction: the C API context is thread-local and every
-/// call writes its error buffer, so the worker touches this from one thread.
+/// Single-threaded by construction: the safe wrappers are `Send` but not
+/// `Sync` (the underlying C API context is thread-local and every call writes
+/// its error buffer), and the worker touches this from one pinned thread.
 pub struct Evaluator {
-    ctx: *mut ffi::nix_c_context,
-    state: *mut ffi::EvalState,
-    flake_settings: *mut ffi::nix_flake_settings,
-    fetch_settings: *mut ffi::nix_fetchers_settings,
-    /// flake path → pinned (`nix_gc_incref`'d) output attrset value.
-    cache: BTreeMap<String, *mut ffi::nix_value>,
+    ctx: Arc<Context>,
+    state: EvalState,
+    flake_settings: Arc<FlakeSettings>,
+    fetch_settings: FetchersSettings,
+    /// flake path → locked flake (its outputs are re-derived per call from the
+    /// warm `EvalState`, which memoizes the heavy nixpkgs / module-system eval).
+    cache: BTreeMap<String, LockedFlake>,
 }
 
 impl Evaluator {
     /// Initialise the libraries, open the default store, and build a warm
     /// `EvalState` with flake support wired in.
     pub fn new() -> Result<Self, EvalError> {
-        unsafe {
-            let ctx = ffi::nix_c_context_create();
-            if ctx.is_null() {
-                return Err("nix_c_context_create returned null".to_string());
-            }
-            if ffi::nix_libutil_init(ctx) != ffi::nix_err_NIX_OK {
-                return Err(format!("libutil init: {}", last_error(ctx)));
-            }
-            if ffi::nix_libstore_init(ctx) != ffi::nix_err_NIX_OK {
-                return Err(format!("libstore init: {}", last_error(ctx)));
-            }
-            if ffi::nix_libexpr_init(ctx) != ffi::nix_err_NIX_OK {
-                return Err(format!("libexpr init: {}", last_error(ctx)));
-            }
+        // `Context::new` runs the one-shot libutil / libstore / libexpr inits.
+        let ctx = Arc::new(Context::new().map_err(e2s)?);
 
-            // Experimental features: the CLI resolves these from global config
-            // PLUS the target flake's `nixConfig.extra-experimental-features`
-            // (honoured under `accept-flake-config`). The C flake settings do
-            // not replay a flake's nixConfig, so we set the union the parent
-            // nixspace flake needs explicitly — `pipe-operators` for the
-            // `mightyiam/files` modules that use `|>`, on top of the standard
-            // flake stack. Overridable via `MANDALA_EVAL_EXPERIMENTAL_FEATURES`.
-            let features = std::env::var("MANDALA_EVAL_EXPERIMENTAL_FEATURES")
-                .unwrap_or_else(|_| "nix-command flakes fetch-tree pipe-operators".to_string());
-            let cfeatures =
-                CString::new(features).map_err(|_| "bad experimental-features".to_string())?;
-            if ffi::nix_setting_set(ctx, c"experimental-features".as_ptr(), cfeatures.as_ptr())
-                != ffi::nix_err_NIX_OK
-            {
-                return Err(format!("set experimental-features: {}", last_error(ctx)));
-            }
+        // Experimental features: the CLI resolves these from global config PLUS
+        // the target flake's `nixConfig.extra-experimental-features` (honoured
+        // under `accept-flake-config`). The C flake settings do not replay a
+        // flake's nixConfig, so we set the union the parent nixspace flake needs
+        // explicitly — `pipe-operators` for the `mightyiam/files` modules that
+        // use `|>`, on top of the standard flake stack. Set before the
+        // `EvalState` is built so it takes effect. Overridable via
+        // `MANDALA_EVAL_EXPERIMENTAL_FEATURES`.
+        let features = std::env::var("MANDALA_EVAL_EXPERIMENTAL_FEATURES")
+            .unwrap_or_else(|_| "nix-command flakes fetch-tree pipe-operators".to_string());
+        ctx.set_setting("experimental-features", &features)
+            .map_err(e2s)?;
 
-            let fetch_settings = ffi::nix_fetchers_settings_new(ctx);
-            if fetch_settings.is_null() {
-                return Err(format!("fetchers settings: {}", last_error(ctx)));
-            }
-            let flake_settings = ffi::nix_flake_settings_new(ctx);
-            if flake_settings.is_null() {
-                return Err(format!("flake settings: {}", last_error(ctx)));
-            }
+        let store = Arc::new(Store::open(&ctx, None).map_err(e2s)?);
+        let flake_settings = Arc::new(FlakeSettings::new(&ctx).map_err(e2s)?);
+        let fetch_settings = FetchersSettings::new(&ctx).map_err(e2s)?;
 
-            let store = ffi::nix_store_open(ctx, ptr::null(), ptr::null_mut());
-            if store.is_null() {
-                return Err(format!("store open: {}", last_error(ctx)));
-            }
+        let state = EvalStateBuilder::new(&store)
+            .map_err(e2s)?
+            .with_flake_settings(&flake_settings)
+            .map_err(e2s)?
+            .build()
+            .map_err(e2s)?;
 
-            let builder = ffi::nix_eval_state_builder_new(ctx, store);
-            if builder.is_null() {
-                return Err(format!("eval state builder: {}", last_error(ctx)));
-            }
-            if ffi::nix_eval_state_builder_load(ctx, builder) != ffi::nix_err_NIX_OK {
-                return Err(format!("eval state builder load: {}", last_error(ctx)));
-            }
-            if ffi::nix_flake_settings_add_to_eval_state_builder(ctx, flake_settings, builder)
-                != ffi::nix_err_NIX_OK
-            {
-                return Err(format!("flake settings → builder: {}", last_error(ctx)));
-            }
-            let state = ffi::nix_eval_state_build(ctx, builder);
-            ffi::nix_eval_state_builder_free(builder);
-            if state.is_null() {
-                return Err(format!("eval state build: {}", last_error(ctx)));
-            }
-
-            Ok(Self {
-                ctx,
-                state,
-                flake_settings,
-                fetch_settings,
-                cache: BTreeMap::new(),
-            })
-        }
+        Ok(Self {
+            ctx,
+            state,
+            flake_settings,
+            fetch_settings,
+            cache: BTreeMap::new(),
+        })
     }
 
-    /// Lock `flake` and return its (cached, GC-pinned) output attrset value.
-    fn flake_outputs(&mut self, flake: &str) -> Result<*mut ffi::nix_value, EvalError> {
-        if let Some(v) = self.cache.get(flake) {
-            return Ok(*v);
+    /// Ensure `flake` is locked (in `virtual` mode: compute the lock in memory,
+    /// never write `flake.lock` — read-only eval semantics, matching
+    /// `nix eval`) and cached.
+    fn ensure_locked(&mut self, flake: &str) -> Result<(), EvalError> {
+        if self.cache.contains_key(flake) {
+            return Ok(());
         }
-        let outputs = unsafe { self.lock_outputs(flake)? };
-        unsafe { ffi::nix_gc_incref(self.ctx, outputs.cast()) };
-        self.cache.insert(flake.to_string(), outputs);
-        Ok(outputs)
-    }
 
-    unsafe fn lock_outputs(&self, flake: &str) -> Result<*mut ffi::nix_value, EvalError> {
-        unsafe {
-            let parse_flags =
-                ffi::nix_flake_reference_parse_flags_new(self.ctx, self.flake_settings);
-            ffi::nix_flake_reference_parse_flags_set_base_directory(
-                self.ctx,
-                parse_flags,
-                flake.as_ptr().cast(),
-                flake.len(),
-            );
+        // Base directory = the flake path itself; the reference is the bare
+        // path (no `path:` prefix) → git+file on a working tree.
+        let parse_flags = FlakeReferenceParseFlags::new(&self.ctx, &self.flake_settings)
+            .map_err(e2s)?
+            .set_base_directory(flake)
+            .map_err(e2s)?;
+        let (flake_ref, _fragment) = FlakeReference::parse(
+            &self.ctx,
+            &self.fetch_settings,
+            &self.flake_settings,
+            &parse_flags,
+            flake,
+        )
+        .map_err(e2s)?;
 
-            let mut flake_ref: *mut ffi::nix_flake_reference = ptr::null_mut();
-            let mut fragment: Vec<u8> = Vec::new();
-            // Bare path (no `path:` prefix) → git+file on a working tree.
-            let err = ffi::nix_flake_reference_and_fragment_from_string(
-                self.ctx,
-                self.fetch_settings,
-                self.flake_settings,
-                parse_flags,
-                flake.as_ptr().cast(),
-                flake.len(),
-                &mut flake_ref,
-                Some(collect_cb),
-                (&mut fragment as *mut Vec<u8>).cast(),
-            );
-            ffi::nix_flake_reference_parse_flags_free(parse_flags);
-            if err != ffi::nix_err_NIX_OK || flake_ref.is_null() {
-                return Err(format!("parse flake ref: {}", last_error(self.ctx)));
-            }
+        let lock_flags = LockFlags::new(&self.ctx, &self.flake_settings)
+            .map_err(e2s)?
+            .set_mode(LockMode::Virtual)
+            .map_err(e2s)?;
+        let locked = LockedFlake::lock(
+            &self.ctx,
+            &self.fetch_settings,
+            &self.flake_settings,
+            &self.state,
+            &lock_flags,
+            &flake_ref,
+        )
+        .map_err(e2s)?;
 
-            let lock_flags = ffi::nix_flake_lock_flags_new(self.ctx, self.flake_settings);
-            // `virtual`: compute the lock in memory, never write flake.lock —
-            // read-only eval semantics, matching `nix eval`.
-            ffi::nix_flake_lock_flags_set_mode_virtual(self.ctx, lock_flags);
-            let locked = ffi::nix_flake_lock(
-                self.ctx,
-                self.fetch_settings,
-                self.flake_settings,
-                self.state,
-                lock_flags,
-                flake_ref,
-            );
-            ffi::nix_flake_lock_flags_free(lock_flags);
-            ffi::nix_flake_reference_free(flake_ref);
-            if locked.is_null() {
-                return Err(format!("lock flake: {}", last_error(self.ctx)));
-            }
-
-            let outputs = ffi::nix_locked_flake_get_output_attrs(
-                self.ctx,
-                self.flake_settings,
-                self.state,
-                locked,
-            );
-            ffi::nix_locked_flake_free(locked);
-            if outputs.is_null() {
-                return Err(format!("flake output attrs: {}", last_error(self.ctx)));
-            }
-            Ok(outputs)
-        }
-    }
-
-    /// Force `val` and fetch a named attribute; the caller must know `val` is an
-    /// attrset (force it first). Returns the (unforced) child value.
-    unsafe fn attr(
-        &self,
-        val: *mut ffi::nix_value,
-        name: &str,
-    ) -> Result<*mut ffi::nix_value, EvalError> {
-        let cname = CString::new(name).map_err(|_| format!("bad attr name {name:?}"))?;
-        let child = unsafe { ffi::nix_get_attr_byname(self.ctx, val, self.state, cname.as_ptr()) };
-        if child.is_null() {
-            return Err(format!("attribute '{name}' not found"));
-        }
-        Ok(child)
-    }
-
-    unsafe fn has_attr(&self, val: *mut ffi::nix_value, name: &str) -> bool {
-        match CString::new(name) {
-            Ok(c) => unsafe { ffi::nix_has_attr_byname(self.ctx, val, self.state, c.as_ptr()) },
-            Err(_) => false,
-        }
-    }
-
-    unsafe fn force(&self, val: *mut ffi::nix_value) -> Result<(), EvalError> {
-        if unsafe { ffi::nix_value_force(self.ctx, self.state, val) } != ffi::nix_err_NIX_OK {
-            return Err(format!("force: {}", unsafe { last_error(self.ctx) }));
-        }
+        self.cache.insert(flake.to_string(), locked);
         Ok(())
     }
 
-    unsafe fn read_string(&self, val: *mut ffi::nix_value) -> Result<String, EvalError> {
-        let mut buf: Vec<u8> = Vec::new();
-        let err = unsafe {
-            ffi::nix_get_string(
-                self.ctx,
-                val,
-                Some(collect_cb),
-                (&mut buf as *mut Vec<u8>).cast(),
-            )
-        };
-        if err != ffi::nix_err_NIX_OK {
-            return Err(format!("get_string: {}", unsafe { last_error(self.ctx) }));
-        }
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+    /// The cached flake's output attrset, re-derived against the warm
+    /// `EvalState` (the expensive eval is memoized in the state, so this is
+    /// effectively a re-force of already-evaluated thunks).
+    fn outputs<'s>(&'s self, flake: &str) -> Result<Value<'s>, EvalError> {
+        let locked = self
+            .cache
+            .get(flake)
+            .ok_or_else(|| format!("flake {flake:?} not locked"))?;
+        locked
+            .output_attrs(&self.flake_settings, &self.state)
+            .map_err(e2s)
+    }
+
+    /// The `builtins.unsafeDiscardStringContext` function value, used to read
+    /// context strings without building (see [`read_string_no_context`]).
+    fn discard_fn(&self) -> Result<Value<'_>, EvalError> {
+        self.state
+            .eval_from_string("builtins.unsafeDiscardStringContext", "<eval>")
+            .map_err(e2s)
     }
 
     /// Recursively force `val` and convert to a `serde_json::Value`, exactly the
@@ -281,13 +216,10 @@ impl Evaluator {
     /// node): the aggregate is only a handful of levels deep, so exceeding the
     /// cap is a bug, reported with the attribute breadcrumb rather than a
     /// stack-overflow abort.
-    unsafe fn value_to_json(&self, val: *mut ffi::nix_value) -> Result<Json, EvalError> {
-        unsafe { self.value_to_json_at(val, 0, &mut Vec::new()) }
-    }
-
-    unsafe fn value_to_json_at(
+    fn value_to_json_at(
         &self,
-        val: *mut ffi::nix_value,
+        val: &Value,
+        discard: &Value,
         depth: usize,
         path: &mut Vec<String>,
     ) -> Result<Json, EvalError> {
@@ -298,98 +230,61 @@ impl Evaluator {
                 path.join(".")
             ));
         }
-        unsafe { self.force(val)? };
-        let t = unsafe { ffi::nix_get_type(self.ctx, val) };
-        match t {
-            ffi::ValueType_NIX_TYPE_NULL => Ok(Json::Null),
-            ffi::ValueType_NIX_TYPE_BOOL => {
-                Ok(Json::Bool(unsafe { ffi::nix_get_bool(self.ctx, val) }))
+        force(val)?;
+        match val.value_type() {
+            ValueType::Null => Ok(Json::Null),
+            ValueType::Bool => Ok(Json::Bool(val.as_bool().map_err(e2s)?)),
+            ValueType::Int => Ok(Json::from(val.as_int().map_err(e2s)?)),
+            ValueType::Float => Ok(Json::from(val.as_float().map_err(e2s)?)),
+            ValueType::String => Ok(Json::String(read_string_no_context(val, discard)?)),
+            ValueType::Path => {
+                // `as_path` uses the non-building `nix_get_path_string`.
+                let p = val.as_path().map_err(e2s)?;
+                Ok(Json::String(p.to_string_lossy().into_owned()))
             }
-            ffi::ValueType_NIX_TYPE_INT => {
-                Ok(Json::from(unsafe { ffi::nix_get_int(self.ctx, val) }))
-            }
-            ffi::ValueType_NIX_TYPE_FLOAT => {
-                Ok(Json::from(unsafe { ffi::nix_get_float(self.ctx, val) }))
-            }
-            ffi::ValueType_NIX_TYPE_STRING => Ok(Json::String(unsafe { self.read_string(val)? })),
-            ffi::ValueType_NIX_TYPE_PATH => {
-                let p = unsafe { ffi::nix_get_path_string(self.ctx, val) };
-                if p.is_null() {
-                    return Err(format!("get_path_string: {}", unsafe {
-                        last_error(self.ctx)
-                    }));
-                }
-                Ok(Json::String(
-                    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned(),
-                ))
-            }
-            ffi::ValueType_NIX_TYPE_ATTRS => {
+            ValueType::Attrs => {
                 // Replicate nix's `printValueAsJSON` attrset coercion, so that
                 // derivations and `__toString` sets serialize the way
                 // `nix eval --json` does (their string / store path) rather than
                 // recursing into their frequently self-referential structure — a
                 // derivation's `.all` output list contains the derivation itself,
-                // which is the cycle that overflowed the walk. nix tries
+                // which is the cycle that would overflow the walk. nix tries
                 // `__toString` first, then falls back to `outPath`.
-                if unsafe { self.has_attr(val, "__toString") } {
-                    let f = unsafe { self.attr(val, "__toString")? };
-                    let out = unsafe { ffi::nix_alloc_value(self.ctx, self.state) };
-                    if out.is_null() {
-                        return Err("nix_alloc_value returned null".to_string());
-                    }
-                    if unsafe { ffi::nix_value_call(self.ctx, self.state, f, val, out) }
-                        != ffi::nix_err_NIX_OK
-                    {
-                        return Err(format!("__toString call: {}", unsafe {
-                            last_error(self.ctx)
-                        }));
-                    }
-                    return unsafe { self.value_to_json_at(out, depth + 1, path) };
+                if val.has_attr("__toString").map_err(e2s)? {
+                    let f = val.get_attr("__toString").map_err(e2s)?;
+                    let out = f.call(val).map_err(e2s)?;
+                    return self.value_to_json_at(&out, discard, depth + 1, path);
                 }
-                if unsafe { self.has_attr(val, "outPath") } {
-                    let op = unsafe { self.attr(val, "outPath")? };
-                    return unsafe { self.value_to_json_at(op, depth + 1, path) };
+                if val.has_attr("outPath").map_err(e2s)? {
+                    let op = val.get_attr("outPath").map_err(e2s)?;
+                    return self.value_to_json_at(&op, discard, depth + 1, path);
                 }
-                let n = unsafe { ffi::nix_get_attrs_size(self.ctx, val) };
                 // serde_json's default Map is key-sorted on serialization, and
-                // nix_get_attr_byidx already yields symbol-sorted order — both
-                // agree with `nix eval --json`.
+                // the C API's attr iteration is symbol-sorted — both agree with
+                // `nix eval --json`.
                 let mut map = serde_json::Map::new();
-                for i in 0..n {
-                    let mut name_ptr: *const c_char = ptr::null();
-                    let child = unsafe {
-                        ffi::nix_get_attr_byidx(self.ctx, val, self.state, i, &mut name_ptr)
-                    };
-                    if child.is_null() || name_ptr.is_null() {
-                        return Err(format!("attr #{i} invalid"));
-                    }
-                    let key = unsafe { CStr::from_ptr(name_ptr) }
-                        .to_string_lossy()
-                        .into_owned();
+                for entry in val.attrs().map_err(e2s)? {
+                    let (key, child) = entry.map_err(e2s)?;
                     path.push(key.clone());
-                    let child_json = unsafe { self.value_to_json_at(child, depth + 1, path) };
+                    let child_json = self.value_to_json_at(&child, discard, depth + 1, path);
                     path.pop();
                     map.insert(key, child_json?);
                 }
                 Ok(Json::Object(map))
             }
-            ffi::ValueType_NIX_TYPE_LIST => {
-                let n = unsafe { ffi::nix_get_list_size(self.ctx, val) };
-                let mut arr = Vec::with_capacity(n as usize);
-                for i in 0..n {
-                    let child = unsafe { ffi::nix_get_list_byidx(self.ctx, val, self.state, i) };
-                    if child.is_null() {
-                        return Err(format!("list #{i} invalid"));
-                    }
+            ValueType::List => {
+                let mut arr = Vec::new();
+                for (i, entry) in val.list_iter().map_err(e2s)?.enumerate() {
+                    let child = entry.map_err(e2s)?;
                     path.push(format!("[{i}]"));
-                    let child_json = unsafe { self.value_to_json_at(child, depth + 1, path) };
+                    let child_json = self.value_to_json_at(&child, discard, depth + 1, path);
                     path.pop();
                     arr.push(child_json?);
                 }
                 Ok(Json::Array(arr))
             }
             other => Err(format!(
-                "cannot serialize nix value of type tag {other} to JSON"
+                "cannot serialize nix value of type {other} to JSON"
             )),
         }
     }
@@ -397,11 +292,31 @@ impl Evaluator {
     /// `<flake>#mandala`, deeply forced to JSON — parity with
     /// `nix eval --no-warn-dirty --json <flake>#mandala`.
     pub fn aggregate(&mut self, flake: &str) -> Result<Json, EvalError> {
-        let outputs = self.flake_outputs(flake)?;
-        unsafe {
-            self.force(outputs)?;
-            let m = self.attr(outputs, "mandala")?;
-            self.value_to_json(m)
+        self.ensure_locked(flake)?;
+        let discard = self.discard_fn()?;
+        let outputs = self.outputs(flake)?;
+        force(&outputs)?;
+        let mandala = outputs.get_attr("mandala").map_err(e2s)?;
+        self.value_to_json_at(&mandala, &discard, 0, &mut Vec::new())
+    }
+
+    /// Force `cur`, then walk `keys` one attribute at a time and read the final
+    /// value as a context-free string. Written as a recursion (not a
+    /// reassignment loop) so each intermediate value stays alive on the stack
+    /// while its child borrows it.
+    fn nav_to_string(
+        &self,
+        cur: &Value,
+        keys: &[&str],
+        discard: &Value,
+    ) -> Result<String, EvalError> {
+        force(cur)?;
+        match keys.split_first() {
+            None => read_string_no_context(cur, discard),
+            Some((head, rest)) => {
+                let child = cur.get_attr(head).map_err(e2s)?;
+                self.nav_to_string(&child, rest, discard)
+            }
         }
     }
 
@@ -418,23 +333,23 @@ impl Evaluator {
         {
             return Err(format!("refusing invalid member name {member:?}"));
         }
-        let outputs = self.flake_outputs(flake)?;
-        unsafe {
-            self.force(outputs)?;
-            let cfgs = self.attr(outputs, "nixosConfigurations")?;
-            self.force(cfgs)?;
-            let host = match self.attr(cfgs, member) {
-                Ok(h) => h,
-                Err(_) => return Ok(None),
-            };
-            let mut cur = host;
-            for key in ["config", "system", "build", "toplevel", "outPath"] {
-                self.force(cur)?;
-                cur = self.attr(cur, key)?;
-            }
-            self.force(cur)?;
-            Ok(Some(self.read_string(cur)?))
-        }
+        self.ensure_locked(flake)?;
+        let discard = self.discard_fn()?;
+        let outputs = self.outputs(flake)?;
+        force(&outputs)?;
+        let cfgs = outputs.get_attr("nixosConfigurations").map_err(e2s)?;
+        force(&cfgs)?;
+        // A missing member is `None`; a present one navigates to its outPath.
+        let host = match cfgs.get_attr(member) {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+        let path = self.nav_to_string(
+            &host,
+            &["config", "system", "build", "toplevel", "outPath"],
+            &discard,
+        )?;
+        Ok(Some(path))
     }
 
     /// Expected toplevel out-paths for `members` (parity with
@@ -453,12 +368,10 @@ impl Evaluator {
         Ok(out)
     }
 
-    /// Drop the warm outputs cache so a moved contract is re-locked and
-    /// re-evaluated on the next request (stale-state discipline).
+    /// Drop the warm locked-flake cache so a moved contract is re-locked and
+    /// re-evaluated on the next request (stale-state discipline). Dropping each
+    /// [`LockedFlake`] releases its GC-managed graph.
     pub fn reload(&mut self) {
-        let ctx = self.ctx;
-        for (_, v) in std::mem::take(&mut self.cache) {
-            unsafe { ffi::nix_gc_decref(ctx, v.cast()) };
-        }
+        self.cache.clear();
     }
 }

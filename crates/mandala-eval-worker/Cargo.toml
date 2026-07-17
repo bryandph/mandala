@@ -12,12 +12,15 @@ name = "mandala-eval-worker"
 path = "src/main.rs"
 
 [dependencies]
-# Raw, unsafe FFI to the Nix C API (libnixexpr-c / libnixflake-c). MIT, and its
-# version tracks the Nix release (0.2347.x == Nix 2.34.7 — the pin). We opt into
-# only the stable `-c` libraries we link (no `shim`/`main`: no C++23 wrapper
-# compile, no manual libnixexpr dylib linking — the plain C API covers warm
-# EvalState, flake locking, deep value forcing, and value→JSON walking).
-nix-bindings-sys = { version = "0.2347.8", default-features = false, features = [
+# Safe, high-level bindings to the Nix C API (libnixexpr-c / libnixflake-c),
+# the companion crate to `nix-bindings-sys` (same repo, same version, MIT). Its
+# version tracks the Nix release (0.2347.x == Nix 2.34.7 — the pin). It pulls
+# `-sys` transitively; we opt into only the stable `-c` libraries we link (no
+# `shim`/`main`: no C++23 wrapper compile, no manual libnixexpr dylib linking —
+# the plain C API covers warm EvalState, flake locking, deep value forcing, and
+# value→JSON walking). The `expr` feature already implies `store`, and `flake`
+# implies `expr`, but they are listed for intent.
+nix-bindings = { version = "0.2347.8", default-features = false, features = [
   "store",
   "expr",
   "util",

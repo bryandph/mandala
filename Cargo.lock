@@ -324,7 +324,7 @@ dependencies = [
 name = "mandala-eval-worker"
 version = "0.1.0"
 dependencies = [
- "nix-bindings-sys",
+ "nix-bindings",
  "serde",
  "serde_json",
 ]
@@ -362,6 +362,15 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "nix-bindings"
+version = "0.2347.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b94a1f3782853a75651147aa9c8778a567d61489db5e4cbc1eb69d59a6caeef8"
+dependencies = [
+ "nix-bindings-sys",
 ]
 
 [[package]]
