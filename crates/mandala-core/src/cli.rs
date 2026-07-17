@@ -163,8 +163,24 @@ impl Cli {
                     .arg(json_flag()),
             )
             .subcommand(Command::new("version").about("Print the CLI version"))
+            .subcommand(Command::new("mcp").about("Run the fleet MCP server over stdio (headless)"))
             .subcommand(
-                Command::new("mcp").about("Run the fleet MCP server over stdio (headless)"),
+                // Settled phase-1 design: the Rust binary keeps a `tui`
+                // subcommand that exec's the Python TUI (`mandala-py`) until
+                // phase 2 replaces it natively — muscle memory + docs survive
+                // the swap. Every argument is forwarded verbatim.
+                Command::new("tui")
+                    .about("Textual TUI (execs the Python `mandala-py tui` until phase 2)")
+                    .arg(
+                        Arg::new("args")
+                            .num_args(0..)
+                            .trailing_var_arg(true)
+                            .allow_hyphen_values(true)
+                            .value_name("ARGS")
+                            .help(
+                                "Arguments forwarded to `mandala-py tui` (e.g. --mcp, deploy -l …)",
+                            ),
+                    ),
             );
         for engine in &self.engines {
             cmd = cmd.subcommand(engine.command.clone());
@@ -220,6 +236,7 @@ impl Cli {
                     ExitCode::FAILURE
                 }
             },
+            Some(("tui", m)) => run_tui_shim(&flake, m),
             Some((name, m)) => match self.engines.iter().find(|e| e.name == name) {
                 Some(engine) => with_inventory(&flake, |inv| (engine.run)(inv, m)),
                 // `subcommand_required` guarantees a matched name is one we
@@ -232,6 +249,38 @@ impl Cli {
             None => ExitCode::from(2),
         }
     }
+}
+
+/// The argv the `tui` shim forwards to the Python entry point: the resolved
+/// `--flake` (the Python root callback owns that option) then `tui` and every
+/// trailing argument verbatim. Pure builder, unit-testable.
+fn tui_argv(flake: &str, extra: &[String]) -> Vec<String> {
+    let mut argv = vec!["--flake".to_string(), flake.to_string(), "tui".to_string()];
+    argv.extend(extra.iter().cloned());
+    argv
+}
+
+/// Exec the Python TUI (`mandala-py`, overridable via `MANDALA_PY_TUI`). A true
+/// exec — the TUI takes over the terminal, so the shim process must not linger
+/// between it and the tty. Returns only on launch failure.
+fn run_tui_shim(flake: &str, m: &ArgMatches) -> ExitCode {
+    let extra: Vec<String> = m
+        .get_many::<String>("args")
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+    let program = std::env::var("MANDALA_PY_TUI").unwrap_or_else(|_| "mandala-py".to_string());
+    let err = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new(&program)
+            .args(tui_argv(flake, &extra))
+            .exec()
+    };
+    eprintln!(
+        "mandala: failed to exec the Python TUI ({program}): {err}\n\
+         (the TUI is served by the Python package until phase 2 — ensure \
+         `mandala-py` is on PATH or set MANDALA_PY_TUI)"
+    );
+    ExitCode::FAILURE
 }
 
 /// The shared `--json` boolean flag.
@@ -601,6 +650,30 @@ mod tests {
     // ---- members --json byte-parity -----------------------------------------
 
     #[test]
+    fn tui_argv_forwards_flake_then_verbatim_args() {
+        assert_eq!(
+            tui_argv(
+                "/fleet",
+                &["--mcp".into(), "--mcp-port".into(), "7979".into()]
+            ),
+            vec!["--flake", "/fleet", "tui", "--mcp", "--mcp-port", "7979"]
+        );
+        assert_eq!(tui_argv(".", &[]), vec!["--flake", ".", "tui"]);
+    }
+
+    #[test]
+    fn tui_subcommand_captures_hyphen_args() {
+        let cmd = Cli::new().root_command();
+        let m = cmd
+            .try_get_matches_from(["mandala", "tui", "--mcp", "--mcp-port", "7979"])
+            .expect("tui accepts forwarded hyphen args");
+        let (name, sub) = m.subcommand().expect("subcommand");
+        assert_eq!(name, "tui");
+        let args: Vec<&String> = sub.get_many::<String>("args").unwrap().collect();
+        assert_eq!(args, ["--mcp", "--mcp-port", "7979"]);
+    }
+
+    #[test]
     fn members_json_is_python_byte_parity() {
         // python3 -c 'import json,sys; ...json.dumps(members, indent=2,
         // sort_keys=True)' over the fixture's members dict.
@@ -751,7 +824,7 @@ mod tests {
         // The fleet-cli spec: the public binary stands alone with zero engines.
         let _g = seam();
         let cli = Cli::new();
-        assert_eq!(cli.root_command().get_subcommands().count(), 6); // members/groups/resolve/drift/version/mcp
+        assert_eq!(cli.root_command().get_subcommands().count(), 7); // members/groups/resolve/drift/version/mcp/tui
         assert_eq!(
             Cli::new().run_from(["mandala", "members", "--json"]),
             ExitCode::SUCCESS
