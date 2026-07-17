@@ -1,0 +1,30 @@
+# mandala Rust workspace — OpenSpec change `mandala-rust-rewrite` (phase 1).
+#
+# Additive to the Python porcelain under `cli/`: this workspace grows the
+# `mandala-core` library, the `mandala-mcp` stdio server, and the `mandala`
+# binary that replace the headless Python surfaces. The Python package keeps
+# serving the TUI + HTTP MCP host until later phases.
+[workspace]
+resolver = "3"
+members = [
+  "crates/mandala-core",
+  "crates/mandala-mcp",
+  "crates/mandala",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/bryanhuff/mandala"
+
+[workspace.dependencies]
+mandala-core = { path = "crates/mandala-core" }
+mandala-mcp = { path = "crates/mandala-mcp" }
+
+# A single shared profile knob: the release binary is what ships, so keep it
+# lean. Dev builds stay fast (default opt-level 0).
+[profile.release]
+lto = "thin"
+strip = true

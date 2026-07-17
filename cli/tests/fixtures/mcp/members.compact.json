@@ -1,0 +1,21 @@
+{
+  "cache": {
+    "architecture": "x86_64-linux",
+    "platform": "metal",
+    "surfaces": "---"
+  },
+  "router": {
+    "platform": "opnsense",
+    "surfaces": "---"
+  },
+  "web": {
+    "architecture": "x86_64-linux",
+    "category": "server",
+    "platform": "metal",
+    "role": "web",
+    "surfaces": "---",
+    "tags": [
+      "edge"
+    ]
+  }
+}

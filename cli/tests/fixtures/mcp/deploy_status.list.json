@@ -1,0 +1,122 @@
+{
+  "runs": [
+    {
+      "build": {
+        "built": 0,
+        "done": false,
+        "errors": 0,
+        "fetched": 0,
+        "finished": 0,
+        "rc": null
+      },
+      "hosts": {
+        "cache": {
+          "milestones": [
+            "eval",
+            "build",
+            "copy",
+            "activate",
+            "confirm"
+          ],
+          "rc": null,
+          "state": "confirmed"
+        }
+      },
+      "kind": "deploy",
+      "liveness": "finished",
+      "meta": {
+        "limit": "cache",
+        "pid": null,
+        "run_id": "<run-id>"
+      },
+      "phase": "done",
+      "run_id": "<run-id>"
+    },
+    {
+      "kind": "reboot",
+      "liveness": "failed",
+      "log": "<state-dir>/runs/<run-id>/output.log",
+      "meta": {
+        "kind": "reboot",
+        "limit": "web",
+        "pid": null,
+        "rc": 2,
+        "run_id": "<run-id>"
+      },
+      "output_tail": [
+        "$ ans-reboot -l web",
+        "fatal: boom"
+      ],
+      "phase": "done",
+      "run_id": "<run-id>"
+    },
+    {
+      "kind": "build",
+      "liveness": "finished",
+      "log": "<state-dir>/runs/<run-id>/output.log",
+      "meta": {
+        "kind": "build",
+        "members": [
+          "cache",
+          "web"
+        ],
+        "pid": null,
+        "rc": 0,
+        "run_id": "<run-id>"
+      },
+      "output_tail": [
+        "these derivations will be built:",
+        "  /nix/store/x-toplevel.drv",
+        "/nix/store/aaa-nixos-system-web"
+      ],
+      "phase": "done",
+      "run_id": "<run-id>"
+    },
+    {
+      "kind": "reboot",
+      "liveness": "finished",
+      "log": "<state-dir>/runs/<run-id>/output.log",
+      "meta": {
+        "argv": [
+          "ans-reboot",
+          "-l",
+          "cache,web",
+          "-e",
+          "reboot_serial=2",
+          "-e",
+          "drain=true"
+        ],
+        "drain": true,
+        "finished_at": 1784272214.19373,
+        "kind": "reboot",
+        "limit": "cache,web",
+        "pid": null,
+        "rc": 0,
+        "run_id": "<run-id>",
+        "serial": "2",
+        "started_at": 1784272214.193567
+      },
+      "output_tail": [
+        "$ ans-reboot -l cache,web -e reboot_serial=2 -e drain=true  (cwd=.)"
+      ],
+      "phase": "done",
+      "run_id": "<run-id>"
+    },
+    {
+      "build": {
+        "built": 0,
+        "done": false,
+        "errors": 0,
+        "fetched": 0,
+        "finished": 0,
+        "rc": null
+      },
+      "hosts": {},
+      "kind": "deploy",
+      "liveness": "unknown",
+      "meta": {},
+      "phase": "done",
+      "run_id": "<run-id>"
+    }
+  ]
+}

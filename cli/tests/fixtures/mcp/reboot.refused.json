@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "reason": "reboot requires `confirm` to equal the resolved target",
+  "refused": true,
+  "required_confirm": "cache,web"
+}

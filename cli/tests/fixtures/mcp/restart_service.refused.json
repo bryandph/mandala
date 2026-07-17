@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "reason": "restart_service requires `confirm` to equal the resolved target",
+  "refused": true,
+  "required_confirm": "cache,web",
+  "unit": "k3s"
+}

@@ -1,0 +1,10 @@
+{
+  "diagnostics": "[ERROR]: remote: Counting objects: 100% (14/14)",
+  "exit_code": 4,
+  "limit": "cache,web",
+  "output": "web | SUCCESS => {\"ping\": \"pong\"}\ncache | UNREACHABLE! => {}",
+  "reachable": {
+    "cache": false,
+    "web": true
+  }
+}

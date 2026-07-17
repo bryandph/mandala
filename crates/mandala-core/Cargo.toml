@@ -1,0 +1,10 @@
+[package]
+name = "mandala-core"
+description = "Fleet inventory, selector algebra, drift, and run registry for the mandala porcelain"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]

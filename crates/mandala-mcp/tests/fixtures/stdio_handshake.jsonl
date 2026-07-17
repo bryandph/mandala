@@ -1,0 +1,8 @@
+{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "spike-driver", "version": "0"}}}}
+{"dir": "recv", "msg": {"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-06-18", "serverInfo": {"description": "AI-operator porcelain over the mandala fleet cores", "name": "mandala-fleet", "title": "mandala fleet", "version": "0.1.0"}}}}
+{"dir": "send", "msg": {"jsonrpc": "2.0", "method": "notifications/initialized"}}
+{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}}
+{"dir": "recv", "msg": {"id": 2, "jsonrpc": "2.0", "result": {"tools": [{"description": "Expand a selector (`@group`, a member, `all`, `!` exclusions, `,`/`:` lists) into the sorted `members` plus the comma-joined `limit` string, which is exactly the `confirm` value the gated actions (deploy, reboot, restart_service) require.", "inputSchema": {"properties": {"selector": {"description": "The selector to expand.", "type": "string"}}, "required": ["selector"], "type": "object"}, "name": "resolve"}]}}}
+{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "resolve", "arguments": {"selector": "all,!@gateway"}}}}
+{"dir": "recv", "msg": {"id": 3, "jsonrpc": "2.0", "result": {"content": [{"text": "{\"limit\":\"cache,web\",\"members\":[\"cache\",\"web\"]}", "type": "text"}]}}}
+{"dir": "note", "exit_code": 0}

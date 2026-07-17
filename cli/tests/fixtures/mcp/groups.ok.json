@@ -1,0 +1,9 @@
+{
+  "gateway": [
+    "router"
+  ],
+  "k3s": [
+    "cache",
+    "web"
+  ]
+}

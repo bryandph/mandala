@@ -1,0 +1,7 @@
+{
+  "dry_activate": false,
+  "ok": false,
+  "reason": "real activation requires `confirm` to equal the resolved target",
+  "refused": true,
+  "required_confirm": "cache,web"
+}

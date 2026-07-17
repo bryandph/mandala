@@ -98,6 +98,37 @@
         pythonImportsCheck = ["mandala_fleet"];
       };
       mandala-cli = pkgs.python3Packages.toPythonApplication mandala-fleet-python;
+
+      # The Rust porcelain (OpenSpec change mandala-rust-rewrite, phase 1).
+      # buildRustPackage — NOT crane — because the purity invariant above
+      # (no inputs beyond nixpkgs) rules out crane, which is a flake input;
+      # buildRustPackage ships in nixpkgs. `cargoLock.lockFile` vendors the
+      # LOCAL workspace deterministically from the checked-in Cargo.lock (no
+      # cargoHash, which is for third-party fetches). The source is fileset-
+      # narrowed to the Cargo manifests + crate trees so a Python-only edit
+      # never rebuilds the Rust binary and vice versa.
+      mandala-rs = pkgs.rustPlatform.buildRustPackage {
+        pname = "mandala";
+        version = "0.1.0";
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./crates
+          ];
+        };
+        cargoLock.lockFile = ./Cargo.lock;
+        # cargo test over the workspace runs in the check phase (the unit
+        # tests in each crate) — the Rust half of the package gate, the
+        # mirror of `mandala-cli`'s pytestCheckHook.
+        meta = {
+          description = "mandala fleet porcelain (Rust) — CLI + stdio MCP, single static binary";
+          mainProgram = "mandala";
+          license = lib.licenses.mit;
+        };
+      };
+
       default = mandala-cli;
     });
 

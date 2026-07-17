@@ -1,0 +1,8 @@
+{
+  "drain": true,
+  "limit": "cache,web",
+  "log": "<state-dir>/runs/<run-id>/output.log",
+  "ok": true,
+  "run_id": "<run-id>",
+  "serial": "2"
+}

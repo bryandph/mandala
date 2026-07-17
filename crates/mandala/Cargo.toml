@@ -1,0 +1,21 @@
+[package]
+name = "mandala"
+description = "mandala fleet porcelain — CLI + stdio MCP server (single static binary)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+default-run = "mandala"
+
+[[bin]]
+name = "mandala"
+path = "src/main.rs"
+
+[dependencies]
+mandala-core.workspace = true
+mandala-mcp.workspace = true
+
+[dev-dependencies]
+# The stdio-MCP handshake integration test (spike 1.2) drives JSON-RPC by hand.
+serde_json = "1"

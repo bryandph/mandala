@@ -5,6 +5,12 @@ result-*
 # Cargo build artifacts (mandala-rs workspace)
 target/
 
+# The mandala binary is an application: its Cargo.lock MUST be tracked so the
+# buildRustPackage `cargoLock.lockFile` vendors a reproducible dep set. The
+# operator's global ~/.gitignore ignores Cargo.lock (a library default) —
+# override it here so clones and CI keep the lock.
+!Cargo.lock
+
 # Python bytecode (e.g. ansible action plugins under
 # ansible/collections/.../plugins) — regenerated at runtime, never tracked.
 __pycache__/

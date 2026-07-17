@@ -1,0 +1,7 @@
+{
+  "dry_activate": true,
+  "events_dir": "<run-id>",
+  "limit": "cache,web",
+  "ok": true,
+  "run_id": "<run-id>"
+}
