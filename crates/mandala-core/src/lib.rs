@@ -9,9 +9,11 @@
 
 use std::collections::BTreeMap;
 
+pub mod drift;
 pub mod eval;
 pub mod inventory;
 
+pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
 
 /// The mandala porcelain version, surfaced by the CLI `version` command and

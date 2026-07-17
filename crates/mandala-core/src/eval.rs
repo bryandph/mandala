@@ -268,12 +268,12 @@ fn worker_binary() -> PathBuf {
     if let Ok(p) = std::env::var("MANDALA_EVAL_WORKER") {
         return PathBuf::from(p);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("mandala-eval-worker");
-            if sibling.is_file() {
-                return sibling;
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("mandala-eval-worker");
+        if sibling.is_file() {
+            return sibling;
         }
     }
     PathBuf::from("mandala-eval-worker")
