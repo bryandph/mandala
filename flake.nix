@@ -86,11 +86,11 @@
       };
     });
 
-    # The CLI porcelain, built from nixpkgs only (the purity invariant
-    # holds: no new inputs). Exposed twice: `mandala-fleet-python` is the
-    # composable python MODULE — an operator devshell builds ONE
-    # python3.withPackages env from it plus private plugin packages, so
-    # entry-point discovery sees every engine — and `mandala-cli` is the
+    # The Python porcelain (TUI tiers + cores; the headless CLI/MCP moved
+    # to the Rust binary below), built from nixpkgs only (the purity
+    # invariant holds: no new inputs). Exposed twice: `mandala-fleet-python`
+    # is the composable python MODULE — an operator devshell builds a
+    # python3.withPackages env from it — and `mandala-cli` is the
     # standalone application. Lazy eval: lib-only consumers never
     # instantiate either.
     packages = eachSystem (pkgs: rec {
