@@ -1,11 +1,14 @@
 //! Scripted stdio MCP handshake against the built `mandala mcp` binary
-//! (OpenSpec change `mandala-rust-rewrite`, spike 1.2).
+//! (OpenSpec change `mandala-rust-rewrite`; spike 1.2, extended by section 4).
 //!
 //! Drives the full initialize → notifications/initialized → tools/list →
 //! tools/call → clean-exit sequence over newline-delimited JSON-RPC, exactly
 //! as a headless MCP client (Claude Code's stdio transport) does. Proves the
-//! rust-mcp-sdk 0.10 stdio server negotiates, advertises the `resolve` tool,
-//! answers a call with structured JSON, and exits 0 when stdin closes.
+//! rust-mcp-sdk 0.10 stdio server negotiates, advertises the full 12-tool
+//! surface, answers a call with structured JSON, and exits 0 when stdin
+//! closes. The fleet is injected via the `MANDALA_AGGREGATE_FILE` seam (the
+//! same aggregate the parity fixtures use), so no flake eval runs; state is
+//! isolated via `MANDALA_FLEET_STATE`.
 //!
 //! Interactive validation from a real Claude Code session is an OPERATOR
 //! CHECKPOINT (it needs a live agent); this test is the automatable half.
@@ -35,8 +38,27 @@ fn read_response(reader: &mut impl BufRead, id: i64) -> serde_json::Value {
 
 #[test]
 fn stdio_handshake_lists_and_calls_resolve() {
+    // A throwaway state dir + the injected aggregate (no flake eval, no
+    // registry writes outside the sandbox).
+    let scratch = std::env::temp_dir().join(format!("mandala-mcp-stdio-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let aggregate = scratch.join("aggregate.json");
+    std::fs::write(
+        &aggregate,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "members": {"web": {}, "cache": {}, "router": {}},
+            "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
+            "projections": {"deploy": {"nodes": ["cache", "web"]}},
+        })
+        .to_string(),
+    )
+    .unwrap();
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_mandala"))
         .arg("mcp")
+        .env("MANDALA_AGGREGATE_FILE", &aggregate)
+        .env("MANDALA_FLEET_STATE", &scratch)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -78,17 +100,39 @@ fn stdio_handshake_lists_and_calls_resolve() {
         &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // 3. tools/list — the resolve tool is advertised with its schema.
+    // 3. tools/list — the full 12-tool surface, in the Python server's
+    // registration order (the fleet-mcp parity contract).
     send(
         &mut stdin,
         &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     let tools = read_response(&mut stdout, 2);
     let list = tools["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(list.len(), 1, "tools/list: {tools}");
-    assert_eq!(list[0]["name"], "resolve");
+    let names: Vec<&str> = list
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "members",
+            "groups",
+            "resolve",
+            "ping",
+            "host_eval",
+            "drift",
+            "reload",
+            "deploy_status",
+            "build",
+            "deploy",
+            "restart_service",
+            "reboot",
+        ],
+        "tools/list: {tools}"
+    );
 
-    // 4. tools/call resolve — structured JSON round-trips back as text content.
+    // 4. tools/call resolve — structured JSON round-trips back as text content
+    // (and as structuredContent), resolved from the injected aggregate.
     send(
         &mut stdin,
         &serde_json::json!({
@@ -105,8 +149,28 @@ fn stdio_handshake_lists_and_calls_resolve() {
     let body: serde_json::Value = serde_json::from_str(text).expect("tool body is JSON");
     assert_eq!(body["members"], serde_json::json!(["cache", "web"]));
     assert_eq!(body["limit"], "cache,web");
+    assert_eq!(
+        call["result"]["structuredContent"]["limit"], "cache,web",
+        "structuredContent mirrors the text body: {call}"
+    );
 
-    // 5. clean exit: closing stdin (EOF) must let the server shut down 0.
+    // 5. a gated action refuses without confirm — through the real transport.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "deploy",
+                       "arguments": {"selector": "@k3s", "dry_activate": false}}
+        }),
+    );
+    let refusal = read_response(&mut stdout, 4);
+    let body = &refusal["result"]["structuredContent"];
+    assert_eq!(body["refused"], true, "deploy refusal: {refusal}");
+    assert_eq!(body["required_confirm"], "cache,web");
+
+    // 6. clean exit: closing stdin (EOF) must let the server shut down 0.
     drop(stdin);
     let status = wait_with_timeout(&mut child, Duration::from_secs(10));
     assert!(

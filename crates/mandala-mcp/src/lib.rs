@@ -1,90 +1,34 @@
 //! mandala-mcp — the stdio MCP server over the fleet cores.
 //!
-//! Phase-1 stdio spike (OpenSpec change `mandala-rust-rewrite`, section 1.2):
-//! ONE read tool (`resolve`) served over stdio via rust-mcp-sdk 0.10, to
-//! prove the initialize → list_tools → call → clean-exit handshake against a
-//! real client before porting the other eleven tools (section 4).
+//! The full 12-tool surface (OpenSpec change `mandala-rust-rewrite`, section
+//! 4), at result-shape parity with the Python FastMCP server (golden fixtures
+//! under `cli/tests/fixtures/mcp/` are the oracle — see
+//! `tests/parity.rs`). Reads: `members`, `groups`, `resolve`, `ping`,
+//! `host_eval`, `drift`, `reload`. Actions: `deploy_status`, `build`,
+//! `deploy`, `restart_service`, `reboot` — the gated three refuse without a
+//! `confirm` equal to the resolved `--limit`.
+//!
+//! rust-mcp-sdk has no middleware, so the Python `ActivityMiddleware` is a
+//! dispatch wrapper around `handle_call_tool_request`
+//! ([`MandalaHandler::call_tool`]): start/settle events with a shared `seq`,
+//! `elapsed`, and a result summary; mutating settles always append to
+//! `state_dir()/mcp/audit.jsonl` — the audit trail exists even headless.
 
-use std::sync::Arc;
+pub mod activity;
+pub mod effects;
+pub mod server;
+pub mod tools;
 
-use async_trait::async_trait;
-use mandala_core::VERSION;
-use rust_mcp_sdk::{
-    McpServer, StdioTransport, TransportOptions,
-    error::SdkResult,
-    macros::{JsonSchema, mcp_tool},
-    mcp_server::{McpServerOptions, ServerHandler, ToMcpServerHandler, server_runtime},
-    schema::{
-        CallToolRequestParams, CallToolResult, Implementation, InitializeResult, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, RpcError, ServerCapabilities,
-        ServerCapabilitiesTools, schema_utils::CallToolError,
-    },
+use rust_mcp_sdk::error::SdkResult;
+use rust_mcp_sdk::mcp_server::{McpServerOptions, ToMcpServerHandler, server_runtime};
+use rust_mcp_sdk::schema::{
+    Implementation, InitializeResult, ProtocolVersion, ServerCapabilities, ServerCapabilitiesTools,
 };
+use rust_mcp_sdk::{McpServer as _, StdioTransport, TransportOptions};
 
-/// The MCP server identity reported in the `initialize` handshake.
-#[must_use]
-pub fn server_name() -> String {
-    format!("mandala-fleet {VERSION}")
-}
+pub use server::{MandalaHandler, server_name};
 
-/// The `resolve` tool: expand a selector (`@group`, a member, `all`, `!`
-/// exclusions) to the sorted member set plus the `limit` confirm string —
-/// identical to `mandala resolve` and the `--limit` a deploy fans out to.
-#[mcp_tool(
-    name = "resolve",
-    description = "Expand a selector (`@group`, a member, `all`, `!` exclusions, `,`/`:` lists) \
-into the sorted `members` plus the comma-joined `limit` string, which is exactly the \
-`confirm` value the gated actions (deploy, reboot, restart_service) require."
-)]
-#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
-pub struct ResolveTool {
-    /// The selector to expand.
-    pub selector: String,
-}
-
-/// The server handler — the single dispatch point every tool call funnels
-/// through (section 4 wraps this for the activity sink + audit trail).
-pub struct MandalaHandler;
-
-#[async_trait]
-impl ServerHandler for MandalaHandler {
-    async fn handle_list_tools_request(
-        &self,
-        _params: Option<PaginatedRequestParams>,
-        _runtime: Arc<dyn McpServer>,
-    ) -> Result<ListToolsResult, RpcError> {
-        Ok(ListToolsResult {
-            tools: vec![ResolveTool::tool()],
-            meta: None,
-            next_cursor: None,
-        })
-    }
-
-    async fn handle_call_tool_request(
-        &self,
-        params: CallToolRequestParams,
-        _runtime: Arc<dyn McpServer>,
-    ) -> Result<CallToolResult, CallToolError> {
-        if params.name != ResolveTool::tool_name() {
-            return Err(CallToolError::unknown_tool(params.name));
-        }
-        let args = serde_json::Value::Object(params.arguments.unwrap_or_default());
-        let tool: ResolveTool = serde_json::from_value(args).map_err(CallToolError::new)?;
-        match mandala_core::resolve(&tool.selector) {
-            Ok(resolved) => {
-                let body = serde_json::json!({
-                    "members": resolved.members,
-                    "limit": resolved.limit,
-                });
-                Ok(CallToolResult::text_content(vec![body.to_string().into()]))
-            }
-            Err(msg) => Err(CallToolError::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                msg,
-            ))),
-        }
-    }
-}
+use mandala_core::VERSION;
 
 /// Build the `InitializeResult` (server identity + capabilities) advertised
 /// in the handshake.
@@ -108,16 +52,18 @@ fn server_info() -> InitializeResult {
     }
 }
 
-/// Serve the stdio MCP transport until the client disconnects.
+/// Serve the stdio MCP transport over `flake`'s inventory until the client
+/// disconnects. Building the server never evaluates the fleet — the first
+/// read does.
 ///
 /// # Errors
 /// Propagates transport/runtime errors from the SDK.
-pub async fn run_stdio() -> SdkResult<()> {
+pub async fn run_stdio(flake: &str) -> SdkResult<()> {
     let transport = StdioTransport::new(TransportOptions::default())?;
     let server = server_runtime::create_server(McpServerOptions {
         server_details: server_info(),
         transport,
-        handler: MandalaHandler.to_mcp_server_handler(),
+        handler: MandalaHandler::new(flake).to_mcp_server_handler(),
         task_store: None,
         client_task_store: None,
         message_observer: None,
@@ -130,11 +76,11 @@ pub async fn run_stdio() -> SdkResult<()> {
 ///
 /// # Errors
 /// Propagates any runtime-build or transport error.
-pub fn serve_stdio_blocking() -> Result<(), Box<dyn std::error::Error>> {
+pub fn serve_stdio_blocking(flake: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async { run_stdio().await })?;
+    rt.block_on(async { run_stdio(flake).await })?;
     Ok(())
 }
 
@@ -148,9 +94,9 @@ mod tests {
     }
 
     #[test]
-    fn init_result_advertises_the_resolve_tool() {
-        // The list handler advertises exactly the one spike tool.
-        let tool = ResolveTool::tool();
-        assert_eq!(tool.name, "resolve");
+    fn init_result_advertises_tool_capability() {
+        let info = server_info();
+        assert!(info.capabilities.tools.is_some());
+        assert_eq!(info.server_info.name, "mandala-fleet");
     }
 }

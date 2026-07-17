@@ -74,12 +74,15 @@ impl Engine {
     }
 }
 
+/// The stdio-MCP launcher closure: takes the resolved `--flake` value.
+type McpLauncher = Box<dyn Fn(&str) -> ExitCode>;
+
 /// The CLI: the built-in root views plus the registered engines and the stdio
 /// MCP launcher. Assembled by the binary, then [`Cli::run`].
 #[derive(Default)]
 pub struct Cli {
     engines: Vec<Engine>,
-    mcp: Option<Box<dyn Fn() -> ExitCode>>,
+    mcp: Option<McpLauncher>,
 }
 
 impl Cli {
@@ -98,11 +101,12 @@ impl Cli {
         self
     }
 
-    /// Set the launcher the `mcp` subcommand invokes (the bin wires this to the
-    /// `mandala-mcp` stdio server — kept as a closure so `mandala-core` never
-    /// depends on `mandala-mcp`, which would be a dependency cycle).
+    /// Set the launcher the `mcp` subcommand invokes with the resolved
+    /// `--flake` value (the bin wires this to the `mandala-mcp` stdio server —
+    /// kept as a closure so `mandala-core` never depends on `mandala-mcp`,
+    /// which would be a dependency cycle).
     #[must_use]
-    pub fn mcp_launcher(mut self, launch: impl Fn() -> ExitCode + 'static) -> Self {
+    pub fn mcp_launcher(mut self, launch: impl Fn(&str) -> ExitCode + 'static) -> Self {
         self.mcp = Some(Box::new(launch));
         self
     }
@@ -210,7 +214,7 @@ impl Cli {
                 ExitCode::SUCCESS
             }
             Some(("mcp", _)) => match &self.mcp {
-                Some(launch) => launch(),
+                Some(launch) => launch(&flake),
                 None => {
                     eprintln!("mandala: the MCP server is not available in this build");
                     ExitCode::FAILURE

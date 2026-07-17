@@ -391,6 +391,7 @@ name = "mandala-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "mandala-core",
  "rust-mcp-sdk",
  "serde",

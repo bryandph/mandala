@@ -19,4 +19,17 @@ rust-mcp-sdk = { version = "0.10", default-features = false, features = [
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "sync", "time"] }
+# `process` powers the ad-hoc ansible runs (ping / restart_service); the rest
+# is the stdio server runtime + the blocking-eval `spawn_blocking` seam.
+tokio = { version = "1", features = [
+  "rt",
+  "macros",
+  "io-std",
+  "io-util",
+  "sync",
+  "time",
+  "process",
+] }
+# Same minimal chrono as mandala-core: the `drift` tool passes `Utc::now()` +
+# `default_max_age()` into `drift::compare`.
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }

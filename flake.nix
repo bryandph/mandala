@@ -125,6 +125,10 @@
             ./Cargo.toml
             ./Cargo.lock
             ./crates
+            # The MCP golden fixtures are the parity oracle the Rust server's
+            # check-phase test (`crates/mandala-mcp/tests/parity.rs`) replays —
+            # one copy, shared with the Python capture script, never duplicated.
+            ./cli/tests/fixtures/mcp
           ];
         };
         cargoLock.lockFile = ./Cargo.lock;

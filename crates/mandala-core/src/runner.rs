@@ -252,8 +252,10 @@ pub struct EventTailer {
     pub hosts: BTreeMap<String, HostRun>,
     pub build: BuildModel,
     /// A callback receiving every raw `nixlog` line live (nom food). Attach it
-    /// BEFORE polling starts; `None` drops nixlog records.
-    pub nixlog_sink: Option<Box<dyn FnMut(String)>>,
+    /// BEFORE polling starts; `None` drops nixlog records. `Send` so an
+    /// [`ObservedRun`](crate::registry::ObservedRun) / [`DeployRun`] can be
+    /// held across await points (the MCP server's blocking waits).
+    pub nixlog_sink: Option<Box<dyn FnMut(String) + Send>>,
 }
 
 impl std::fmt::Debug for EventTailer {
@@ -908,8 +910,7 @@ impl CommandRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Mutex as StdMutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
@@ -1050,12 +1051,12 @@ mod tests {
             writeln!(fh, "{ev}").unwrap();
         }
         let mut tailer = EventTailer::new(&dir);
-        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let sink = Rc::clone(&seen);
-        tailer.nixlog_sink = Some(Box::new(move |s| sink.borrow_mut().push(s)));
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        tailer.nixlog_sink = Some(Box::new(move |s| sink.lock().unwrap().push(s)));
         tailer.poll();
         assert_eq!(
-            *seen.borrow(),
+            *seen.lock().unwrap(),
             vec![r#"@nix {"action":"start","type":105}"#.to_string()]
         );
         assert!(tailer.build.lines.is_empty()); // nixlog never pollutes the line views

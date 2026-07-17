@@ -17,7 +17,7 @@ use mandala_core::engines::{ansible, deploy};
 
 fn main() -> ExitCode {
     Cli::new()
-        .mcp_launcher(|| match mandala_mcp::serve_stdio_blocking() {
+        .mcp_launcher(|flake| match mandala_mcp::serve_stdio_blocking(flake) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("mandala mcp: {err}");
