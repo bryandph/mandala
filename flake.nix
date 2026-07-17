@@ -129,6 +129,10 @@
             # check-phase test (`crates/mandala-mcp/tests/parity.rs`) replays —
             # one copy, shared with the Python capture script, never duplicated.
             ./cli/tests/fixtures/mcp
+            # The interop golden fixtures (fleet-state-formats): a state dir
+            # written by the Python implementation, read by the direction-A
+            # cargo tests (`crates/mandala-core/src/interop_tests.rs`).
+            ./cli/tests/fixtures/interop
           ];
         };
         cargoLock.lockFile = ./Cargo.lock;
@@ -142,6 +146,14 @@
         # crate itself is a vendored cargo dep in Cargo.lock.
         nativeBuildInputs = [pkgs.pkg-config pkgs.rustPlatform.bindgenHook];
         buildInputs = [pkgs.nix];
+
+        # The interop helper is test tooling (the `mandala-interop` check's
+        # direction-B driver), not operator surface: keep it out of bin/ so
+        # the package exposes only the porcelain + its eval worker.
+        postInstall = ''
+          mkdir -p $out/libexec/mandala
+          mv $out/bin/mandala-interop-helper $out/libexec/mandala/
+        '';
 
         # cargo test over the workspace runs in the check phase (the unit
         # tests in each crate) — the Rust half of the package gate, the
@@ -160,6 +172,30 @@
     # validates and the derived fields compute correctly without any
     # operator-specific value entering this repo.
     checks = eachSystem (pkgs: {
+      # Cross-implementation interop gate (fleet-state-formats spec, OpenSpec
+      # change mandala-rust-rewrite task 2.5): the two toolchains meet HERE.
+      # Direction A (Python-written fixtures read by Rust) already runs in
+      # `mandala-rs`'s cargo-test check phase — its fixture tree is checked
+      # in — so this check drives the OTHER half: pytest attaches the Python
+      # `registry.open_run`/`DeployRun.attach` to runs produced by the REAL
+      # Rust runners (the `mandala-interop-helper` under libexec/, payloads
+      # all trivial `sh -c` — no ansible/nix/network). Purity invariant
+      # holds: python env + runCommand are nixpkgs-only.
+      mandala-interop = let
+        p = self.packages.${pkgs.stdenv.hostPlatform.system};
+        pyEnv = pkgs.python3.withPackages (ps: [p.mandala-fleet-python ps.pytest]);
+      in
+        pkgs.runCommand "mandala-interop" {
+          nativeBuildInputs = [pyEnv];
+          MANDALA_RS_INTEROP_BIN = "${p.mandala-rs}/libexec/mandala/mandala-interop-helper";
+        } ''
+          export HOME=$TMPDIR
+          pytest -p no:cacheprovider -v \
+            ${./cli/tests}/test_interop_rs.py \
+            ${./cli/tests}/test_interop_fixtures.py
+          touch $out
+        '';
+
       fake-fleet = let
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);

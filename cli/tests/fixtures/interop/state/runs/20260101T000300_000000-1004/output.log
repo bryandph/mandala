@@ -1,0 +1,3 @@
+$ ansible-playbook playbooks/reboot.yaml -l alpha -e reboot_serial=1 -e drain=true  (cwd=ansible)
+PLAY [reboot] *****
+fatal: [alpha]: FAILED!

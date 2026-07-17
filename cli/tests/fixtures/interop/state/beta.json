@@ -1,0 +1,19 @@
+{
+    "host": "beta",
+    "unreachable": false,
+    "current": "/nix/store/ffffffffffffffffffffffffffffffff-nixos-system-beta-26.04",
+    "booted": "/nix/store/ffffffffffffffffffffffffffffffff-nixos-system-beta-26.04",
+    "current_boot": {
+        "kernel": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.30",
+        "kernel_modules": "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-kernel-modules",
+        "initrd": "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-initrd-linux-6.12.30",
+        "kernel_params": "console=tty0 loglevel=4"
+    },
+    "booted_boot": {
+        "kernel": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.30",
+        "kernel_modules": "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-kernel-modules",
+        "initrd": "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-initrd-linux-6.12.30",
+        "kernel_params": "console=tty0 loglevel=4"
+    },
+    "captured_at": "2026-01-01T12:00:00+00:00"
+}

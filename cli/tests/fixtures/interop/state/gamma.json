@@ -1,0 +1,19 @@
+{
+    "host": "gamma",
+    "unreachable": false,
+    "current": "/nix/store/cccccccccccccccccccccccccccccccc-nixos-system-gamma-26.05",
+    "booted": "/nix/store/99999999999999999999999999999999-nixos-system-gamma-26.04",
+    "current_boot": {
+        "kernel": "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-linux-6.12.31",
+        "kernel_modules": "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-kernel-modules",
+        "initrd": "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-initrd-linux-6.12.30",
+        "kernel_params": "console=tty0 loglevel=4"
+    },
+    "booted_boot": {
+        "kernel": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.30",
+        "kernel_modules": "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-kernel-modules",
+        "initrd": "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-initrd-linux-6.12.30",
+        "kernel_params": "console=tty0 loglevel=4"
+    },
+    "captured_at": "2026-01-01T12:00:00+00:00"
+}

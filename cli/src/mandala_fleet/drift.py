@@ -106,6 +106,14 @@ def read_snapshots(directory: Path | None = None) -> dict[str, dict]:
     if not directory.is_dir():
         return snapshots
     for path in sorted(directory.glob("*.json")):
+        # pathlib.glob matches dot-files (unlike the glob module), so the
+        # `.expected.json` cache — dot-prefixed precisely to keep it out of
+        # the snapshot namespace — must be skipped explicitly. Found by the
+        # cross-implementation interop suite (fleet-state-formats): the
+        # Rust reader excludes hidden files, and one file impersonating a
+        # host named ".expected" is exactly what filename-keying forbids.
+        if path.name.startswith("."):
+            continue
         try:
             snapshots[path.stem] = json.loads(path.read_text())
         except (OSError, ValueError):

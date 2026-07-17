@@ -11,6 +11,11 @@ target/
 # override it here so clones and CI keep the lock.
 !Cargo.lock
 
+# The interop golden fixtures include command-run `output.log` files (the
+# fleet-state-formats teed-log contract); the operator's global ~/.gitignore
+# ignores *.log — override it for the checked-in fixture tree only.
+!cli/tests/fixtures/**/*.log
+
 # Python bytecode (e.g. ansible action plugins under
 # ansible/collections/.../plugins) — regenerated at runtime, never tracked.
 __pycache__/
