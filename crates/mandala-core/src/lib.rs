@@ -10,6 +10,9 @@
 use std::collections::BTreeMap;
 
 pub mod eval;
+pub mod inventory;
+
+pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
 
 /// The mandala porcelain version, surfaced by the CLI `version` command and
 /// the MCP server banner.
@@ -35,6 +38,32 @@ fn demo_members() -> Vec<&'static str> {
     all
 }
 
+/// The demo fleet as a validated [`Inventory`] — a real aggregate value fed
+/// through the same schemaVersion gate and selector algebra the fleet uses, so
+/// the spike's `resolve` tool exercises the production code path (section 2.1)
+/// rather than a parallel sketch.
+fn demo_inventory() -> Inventory {
+    let members: serde_json::Map<String, serde_json::Value> = demo_members()
+        .into_iter()
+        .map(|m| {
+            (
+                m.to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            )
+        })
+        .collect();
+    let groups: serde_json::Map<String, serde_json::Value> = demo_groups()
+        .into_iter()
+        .map(|(g, names)| (g.to_string(), serde_json::Value::from(names)))
+        .collect();
+    let aggregate = serde_json::json!({
+        "schemaVersion": SUPPORTED_SCHEMA_VERSION,
+        "members": members,
+        "groups": groups,
+    });
+    Inventory::from_value(aggregate).expect("demo aggregate is valid")
+}
+
 /// The structured result of a selector expansion — the sorted member set plus
 /// the canonical comma-joined `limit` string (the confirm token the gated
 /// actions require). Mirrors the Python `resolve` tool's `{members, limit}`.
@@ -44,64 +73,19 @@ pub struct Resolved {
     pub limit: String,
 }
 
-/// Expand a selector against the demo fleet: `all`, `@group`, bare members,
-/// `!` exclusions, and `,`/`:` separators — the subset of the Python
-/// `to_limit` algebra the spike needs (a bare exclusion implies `all`).
-/// Unknown members/groups are an error, as in the Python core.
+/// Expand a selector against the demo fleet, delegating to the production
+/// [`Inventory`] selector algebra (`all`, `@group`, bare members, `!`
+/// exclusions, `,`/`:` separators; a bare exclusion implies `all`; unknown
+/// atoms are errors). Kept as a thin, string-erroring wrapper for the
+/// section-1.2 stdio-MCP spike; section 4 serves the real inventory instead.
 ///
 /// # Errors
-/// Returns a human-readable message if a token names no member or group.
+/// Returns the [`InventoryError`] message if the selector is empty, resolves to
+/// nothing, or names an unknown member/group.
 pub fn resolve(selector: &str) -> Result<Resolved, String> {
-    let groups = demo_groups();
-    let universe = demo_members();
-
-    let expand = |token: &str| -> Result<Vec<&'static str>, String> {
-        if token == "all" {
-            Ok(universe.clone())
-        } else if let Some(name) = token.strip_prefix('@') {
-            groups
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("no such group: @{name}"))
-        } else {
-            universe
-                .iter()
-                .find(|m| **m == token)
-                .map(|m| vec![*m])
-                .ok_or_else(|| format!("no such member: {token}"))
-        }
-    };
-
-    let tokens: Vec<&str> = selector
-        .split([',', ':'])
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    let mut include: Vec<&'static str> = Vec::new();
-    let mut exclude: Vec<&'static str> = Vec::new();
-    let mut saw_inclusion = false;
-    for token in &tokens {
-        if let Some(rest) = token.strip_prefix('!') {
-            exclude.extend(expand(rest)?);
-        } else {
-            saw_inclusion = true;
-            include.extend(expand(token)?);
-        }
-    }
-    // A bare exclusion (`!vishnu`) implies `all`, matching the Python taxonomy.
-    if !saw_inclusion && !exclude.is_empty() {
-        include.extend(universe.clone());
-    }
-
-    let mut members: Vec<String> = include
-        .into_iter()
-        .filter(|m| !exclude.contains(m))
-        .map(String::from)
-        .collect();
-    members.sort();
-    members.dedup();
-
+    let members = demo_inventory()
+        .resolve(selector)
+        .map_err(|e| e.to_string())?;
     let limit = members.join(",");
     Ok(Resolved { members, limit })
 }
