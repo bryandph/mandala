@@ -13,3 +13,7 @@ serde_json = "1"
 # Timestamp math for drift staleness (`_too_old`). Minimal features: `now`
 # gives `Utc::now()` without pulling `iana-time-zone` (no local-tz needed).
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+# Safe `kill(pid, 0)` liveness probe for the run registry (no raw unsafe):
+# `nix::sys::signal::kill(pid, None)` sends signal 0, mapping ESRCH→gone,
+# EPERM→exists. Minimal features — only the signal API.
+nix = { version = "0.30", default-features = false, features = ["signal"] }

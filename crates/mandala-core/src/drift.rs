@@ -448,8 +448,11 @@ pub fn save_expected(
     std::fs::write(directory.join(EXPECTED_CACHE), bytes)
 }
 
-/// Serialize with a one-space pretty formatter (Python `indent=1`).
-fn to_pretty_1space<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
+/// Serialize with a one-space pretty formatter (Python `indent=1`). Shared
+/// with [`crate::registry`] so `meta.json` is written byte-identically to the
+/// `.expected.json` cache (both are the Python `json.dumps(indent=1,
+/// sort_keys=True)` format — see the module docstring's byte-format contract).
+pub(crate) fn to_pretty_1space<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);

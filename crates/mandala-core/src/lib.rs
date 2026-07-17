@@ -12,9 +12,13 @@ use std::collections::BTreeMap;
 pub mod drift;
 pub mod eval;
 pub mod inventory;
+pub mod registry;
+pub mod runner;
 
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
+pub use registry::{ObservedRun, RunInfo, RunLiveness, list_runs, new_run_dir, open_run};
+pub use runner::{BuildModel, EventTailer, HostRun, HostState};
 
 /// The mandala porcelain version, surfaced by the CLI `version` command and
 /// the MCP server banner.
