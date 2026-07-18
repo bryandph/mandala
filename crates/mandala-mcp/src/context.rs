@@ -87,15 +87,33 @@ pub fn handler_dispatch(handler: Arc<MandalaHandler>) -> Dispatch {
 /// subscribers see every call this leader executes, origin-labeled.
 #[must_use]
 pub fn host_config_factory(flake: &str) -> HostConfigFactory {
+    factory_with_effects(flake, crate::effects::RealEffects::new)
+}
+
+/// [`host_config_factory`] over QUIET production effects: the eval worker's
+/// stderr nulled and the survey's output captured — the TUI-as-leader shape,
+/// where any child writing through would shred the alternate screen (the
+/// section-4 quiet rule now covers the hosted leader's children too).
+#[must_use]
+pub fn quiet_host_config_factory(flake: &str) -> HostConfigFactory {
+    factory_with_effects(flake, crate::effects::RealEffects::quiet)
+}
+
+fn factory_with_effects(
+    flake: &str,
+    effects: fn() -> crate::effects::RealEffects,
+) -> HostConfigFactory {
     let flake = flake.to_string();
     Arc::new(move || {
         let (events, _) = broadcast::channel::<Value>(256);
         let sink_events = events.clone();
-        let handler = Arc::new(MandalaHandler::new(&flake).with_sink(Arc::new(
-            move |event: &Value| {
-                let _ = sink_events.send(event.clone());
-            },
-        )));
+        let handler = Arc::new(
+            MandalaHandler::with_effects(&flake, Arc::new(effects())).with_sink(Arc::new(
+                move |event: &Value| {
+                    let _ = sink_events.send(event.clone());
+                },
+            )),
+        );
         HostConfig::new(handler_dispatch(handler), events)
     })
 }

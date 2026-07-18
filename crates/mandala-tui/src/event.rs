@@ -54,6 +54,15 @@ pub enum AppEvent {
     /// A task screen's subprocess settled (rc with Python `-signum`
     /// semantics when signalled).
     TaskExited { task_id: u64, rc: i64 },
+    /// One activity event from the fleet context's subscription (a start or
+    /// a settle, exactly the dispatch wrapper's `{tool, args, status, seq,
+    /// …}` shape, `origin`-labeled for wire calls). Flag-independent: settle
+    /// events drive run auto-attach / drift refresh / reload swaps even
+    /// without `--debug-mcp`.
+    McpActivity { event: serde_json::Value },
+    /// The context session's role CHANGED (an observer promoted to leader
+    /// after winning a re-race; sent only on change by the role watcher).
+    McpRoleChanged { leader: bool },
 }
 
 /// Identity of an armed timer. One id = one logical timer; re-arming an id

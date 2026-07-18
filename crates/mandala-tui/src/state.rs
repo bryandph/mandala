@@ -10,14 +10,74 @@
 //! the status machinery — sticky errors, queued reloads, concurrent
 //! eval+survey — drivable from tests without a runtime, terminal, or fleet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use mandala_core::drift::{self, DriftStatus, Snapshot};
 use mandala_core::inventory::Inventory;
+use serde_json::Value;
 
 use crate::screen::ScreenState;
 use crate::select::SelectTable;
+
+/// Retained settled-call lines in the mcp activity log (the Python RichLog
+/// `max_lines=2000`).
+pub const MCP_LOG_MAX: usize = 2000;
+
+/// The session's role in the fleet context, for the subtle status indicator
+/// and the self-call filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextRole {
+    /// This process hosts the context endpoint.
+    Leader,
+    /// Attached to another process's leader.
+    Observer,
+}
+
+/// One in-flight context call (start seen, settle pending) — the
+/// `_mcp_pending` analog: it rides the status-bar spinner as `mcp <tool>`
+/// and one line of the panel's pending strip until its settle pops it.
+#[derive(Debug, Clone)]
+pub struct McpPending {
+    pub tool: String,
+    /// The originating client (absent for the serving leader's own calls).
+    pub origin: Option<String>,
+    /// Pre-formatted `k=v` argument pairs (the Python `f"{k}={v!r}"` join).
+    pub args: String,
+}
+
+/// One settled call in the activity log — rendered as
+/// `▸ tool  ⟨origin⟩  args  [ok · 3.2s]` (+ red detail on error).
+#[derive(Debug, Clone)]
+pub struct McpLogEntry {
+    pub tool: String,
+    pub origin: Option<String>,
+    pub args: String,
+    /// `ok`/`error`, `· <elapsed>s`-suffixed when the settle carried one.
+    pub label: String,
+    pub ok: bool,
+    pub detail: Option<String>,
+}
+
+/// What the runtime must do after an activity settle (the imperative tail
+/// of the Python `_on_mcp_activity`, returned as data so the transition
+/// stays pure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpFollowUp {
+    /// A client's deploy/reboot launched: attach its run — exact `run_id`
+    /// from the settle's result summary, or (older events) the newest live
+    /// run of `kind`.
+    Attach {
+        kind: String,
+        run_id: Option<String>,
+    },
+    /// A client's `drift(refresh/do_eval)` landed: re-read the shared
+    /// snapshots/expected cache exactly like an operator S-refresh landing.
+    DriftLanded,
+    /// A client's `reload` swapped the leader's inventory: re-read the
+    /// contract through the context (the eval already happened — cheap).
+    ReloadLanded,
+}
 
 /// Braille spinner frames advanced by the tick timer while any job runs.
 /// One shared frame animates every running job at once (the Python
@@ -116,10 +176,14 @@ pub struct LoadedInventory {
 /// A load the runtime should start. Carries the inventory GENERATION the
 /// result must match — the stale-aggregate guard (`_fill`'s `inv is not
 /// self.inventory` identity check): a fill for a superseded inventory must
-/// not paint.
+/// not paint — and whether the CONTRACT must be refreshed first (`r`):
+/// locally a load always evaluates fresh, but a context-routed load serves
+/// the leader's cached inventory unless it runs the `reload` tool first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadRequest {
     pub generation: u64,
+    /// This load must re-evaluate the contract (a reload, not a first read).
+    pub fresh: bool,
 }
 
 /// The whole render-visible state. Pure data; `Clone` on purpose so tests
@@ -171,10 +235,36 @@ pub struct AppState {
     /// Current spinner frame index (mod [`SPINNER_FRAMES`]).
     pub spin: usize,
 
-    /// Whether this session renders MCP call monitoring (`--debug-mcp`,
-    /// section 6). Only the footer-hint plumbing reads it here — the
-    /// `check_action`-style conditional-visibility mechanism.
+    /// Whether this session renders MCP call monitoring (`--debug-mcp`).
+    /// Gates the activity panel, the pending strip, the status-bar
+    /// `mcp <tool>` jobs, and the `m` hint/binding — the `check_action`
+    /// conditional-visibility mechanism. The activity SUBSCRIPTION itself is
+    /// flag-independent (settle events drive normal operation).
     pub debug_mcp: bool,
+    /// The activity panel's visibility (the `m` toggle; meaningful only
+    /// under `debug_mcp`). Defaults shown, like the Python panel.
+    pub mcp_panel: bool,
+    /// In-flight context calls by `seq` (the `_mcp_pending` dict).
+    pub mcp_pending: BTreeMap<u64, McpPending>,
+    /// Settled-call lines for the activity panel, capped at
+    /// [`MCP_LOG_MAX`]. Recorded flag-independently (cheap), rendered only
+    /// under `debug_mcp`.
+    pub mcp_log: VecDeque<McpLogEntry>,
+    /// This session's role in the fleet context (`None` = no context — the
+    /// local-eval fallback shape).
+    pub context_role: Option<ContextRole>,
+    /// Our hello identity in the context (`tui-<pid>`) — the self-filter
+    /// key: our own calls are already represented by the explorer's job
+    /// flags and never double-render as activity.
+    pub mcp_client: Option<String>,
+    /// Runs already auto-attached this session (`_attached_runs`): a settle
+    /// naming an already-attached run attaches nothing.
+    pub attached_runs: BTreeSet<String>,
+    /// A contract refresh is owed to the next load (see
+    /// [`LoadRequest::fresh`]); set by [`AppState::request_reload`] and
+    /// consumed by [`AppState::request_load`], so a reload queued behind a
+    /// busy worker still refreshes when it finally runs.
+    pub fresh_wanted: bool,
 
     /// The action tier's ONE screen/overlay slot (section-5 decision of
     /// record: the Python explorer never stacks two screens — every modal
@@ -216,6 +306,13 @@ impl AppState {
             status_sticky: false,
             spin: 0,
             debug_mcp: false,
+            mcp_panel: true,
+            mcp_pending: BTreeMap::new(),
+            mcp_log: VecDeque::new(),
+            context_role: None,
+            mcp_client: None,
+            attached_runs: BTreeSet::new(),
+            fresh_wanted: false,
             screen: None,
         }
     }
@@ -270,8 +367,11 @@ impl AppState {
         }
     }
 
-    /// The jobs currently running, as spinner-line labels. MCP pending
-    /// calls join this list in section 6 (the `_mcp_pending` analog).
+    /// The jobs currently running, as spinner-line labels. Under
+    /// `--debug-mcp`, in-flight context calls join the list as `mcp <tool>`
+    /// (the `_mcp_pending` analog: a client-launched drift eval spins in the
+    /// bar exactly as if the operator had pressed S); without the flag no
+    /// monitoring surface exists — not even here.
     #[must_use]
     pub fn jobs(&self) -> Vec<String> {
         let mut jobs = Vec::new();
@@ -285,13 +385,18 @@ impl AppState {
                 "survey".to_string()
             });
         }
+        if self.debug_mcp {
+            for pending in self.mcp_pending.values() {
+                jobs.push(format!("mcp {}", pending.tool));
+            }
+        }
         jobs
     }
 
     /// Whether any background job is running (keeps the spinner timer armed).
     #[must_use]
     pub fn any_job_running(&self) -> bool {
-        self.busy || self.surveying
+        self.busy || self.surveying || (self.debug_mcp && !self.mcp_pending.is_empty())
     }
 
     /// The status line (the Python `sub_title`): the running-jobs spinner
@@ -320,17 +425,21 @@ impl AppState {
         self.busy = true;
         Some(LoadRequest {
             generation: self.generation,
+            fresh: std::mem::take(&mut self.fresh_wanted),
         })
     }
 
     /// `r`: rebind a fresh (unevaluated) inventory, drop the expected set,
     /// and load — the returned request (if any) evaluates the NEW contract;
-    /// an in-flight eval keeps its old generation and will not paint.
+    /// an in-flight eval keeps its old generation and will not paint. The
+    /// `fresh` mark survives queueing, so a reload consumed later still
+    /// refreshes the contract (context loads run the `reload` tool first).
     #[must_use]
     pub fn request_reload(&mut self) -> Option<LoadRequest> {
         self.generation += 1;
         self.inventory = None;
         self.expected = None;
+        self.fresh_wanted = true;
         self.request_load()
     }
 
@@ -617,6 +726,184 @@ impl AppState {
             false
         }
     }
+
+    // -- context activity ------------------------------------------------
+    //
+    // The `_on_mcp_activity` port, adapted to the context model: events
+    // arrive from the context subscription (whoever serves the call), not an
+    // in-process middleware. One deliberate adaptation: the TUI's OWN calls
+    // (its context-routed loads and evals) are skipped entirely — they are
+    // already represented by the explorer's job flags, and rendering them as
+    // activity would double every spinner and re-fire the drift-landed
+    // refresh after the TUI's own S handling.
+
+    /// Whether an activity event describes one of OUR calls: as leader our
+    /// own dispatches carry no origin (every wire call does); as observer
+    /// ours carry our hello identity (the leader's own carry none and must
+    /// render).
+    #[must_use]
+    fn is_own_call(&self, origin: Option<&str>) -> bool {
+        match self.context_role {
+            Some(ContextRole::Leader) => origin.is_none(),
+            Some(ContextRole::Observer) => origin.is_some() && origin == self.mcp_client.as_deref(),
+            None => false,
+        }
+    }
+
+    /// One activity event from the context subscription. Pure bookkeeping —
+    /// pending strip in/out, the settled log line — plus the follow-up the
+    /// runtime must run (auto-attach / drift-landed / reload swap), returned
+    /// as data.
+    pub fn on_mcp_activity(&mut self, event: &Value) -> Option<McpFollowUp> {
+        let origin = event.get("origin").and_then(Value::as_str);
+        if self.is_own_call(origin) {
+            return None;
+        }
+        let tool = event
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let status = event.get("status").and_then(Value::as_str).unwrap_or("?");
+        let seq = event.get("seq").and_then(Value::as_u64);
+        let args = event.get("args").cloned().unwrap_or(Value::Null);
+        let arg_str = format_mcp_args(&args);
+        if status == "start" {
+            // The call is now PENDING: it spins in the status bar (like an
+            // operator-launched eval/survey) and in the panel's pending
+            // strip until its ok/error event pops it.
+            if let Some(seq) = seq {
+                self.mcp_pending.insert(
+                    seq,
+                    McpPending {
+                        tool,
+                        origin: origin.map(str::to_string),
+                        args: arg_str,
+                    },
+                );
+            }
+            return None;
+        }
+        if let Some(seq) = seq {
+            self.mcp_pending.remove(&seq);
+        }
+        let ok = status == "ok";
+        let mut label = status.to_string();
+        if let Some(elapsed) = event.get("elapsed").and_then(Value::as_f64) {
+            label.push_str(&format!(" · {elapsed:.1}s"));
+        }
+        let detail = event
+            .get("detail")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        self.mcp_log.push_back(McpLogEntry {
+            tool: tool.clone(),
+            origin: origin.map(str::to_string),
+            args: arg_str,
+            label,
+            ok,
+            detail,
+        });
+        while self.mcp_log.len() > MCP_LOG_MAX {
+            self.mcp_log.pop_front();
+        }
+        if !ok {
+            return None;
+        }
+        // A client-launched run renders like a human one: attach the exact
+        // run the settle's result summary names (a refused call launches
+        // nothing but still settles ok — result carries refused, no attach);
+        // without a summary (older events) fall back to the newest live run
+        // of that kind.
+        if tool == "deploy" || tool == "reboot" {
+            return match event.get("result") {
+                None | Some(Value::Null) => Some(McpFollowUp::Attach {
+                    kind: tool,
+                    run_id: None,
+                }),
+                Some(res) => {
+                    if res.get("ok").and_then(Value::as_bool) == Some(true)
+                        && let Some(run_id) = res
+                            .get("run_id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                    {
+                        Some(McpFollowUp::Attach {
+                            kind: tool,
+                            run_id: Some(run_id.to_string()),
+                        })
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+        if tool == "drift" && (truthy(args.get("refresh")) || truthy(args.get("do_eval"))) {
+            return Some(McpFollowUp::DriftLanded);
+        }
+        if tool == "reload" {
+            return Some(McpFollowUp::ReloadLanded);
+        }
+        None
+    }
+
+    /// A client's `drift(refresh/do_eval)` call wrote fresh snapshots and/or
+    /// the expected cache into the SHARED state dir — adopt them exactly as
+    /// if the operator's own S-refresh had landed (`_mcp_drift_landed`). The
+    /// inputs (repo rev, cache, snapshots) are read at the runtime edge.
+    pub fn on_mcp_drift_landed(
+        &mut self,
+        rev: Option<String>,
+        cached_rev: Option<String>,
+        cached: BTreeMap<String, String>,
+        snapshots: &BTreeMap<String, Snapshot>,
+        now: DateTime<Utc>,
+    ) {
+        self.rev = rev;
+        self.cached_rev = cached_rev;
+        if drift::cache_fresh(self.cached_rev.as_deref(), self.rev.as_deref()) {
+            self.expected = Some(cached);
+        }
+        self.fill_drift(snapshots, now);
+        self.set_status("drift refreshed (mcp)", false);
+    }
+}
+
+/// Python truthiness over a JSON value (the `args.get("refresh")` check).
+fn truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|x| x != 0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+    }
+}
+
+/// The activity line's argument string: `k=v` pairs joined by spaces — the
+/// Python `" ".join(f"{k}={v!r}")`, with repr approximated for JSON values
+/// (strings single-quoted, booleans/None Python-spelled, the rest as JSON).
+#[must_use]
+pub fn format_mcp_args(args: &Value) -> String {
+    let Some(obj) = args.as_object() else {
+        return String::new();
+    };
+    obj.iter()
+        .map(|(k, v)| format!("{k}={}", py_repr(v)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn py_repr(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{s}'"),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Null => "None".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// The drift tab's hint line — keys plus the exact three expected-cache
@@ -724,5 +1011,255 @@ mod tests {
         s.status_sticky = false;
         s.set_status("ok now", false);
         assert_eq!(s.status, "ok now");
+    }
+
+    // ---- context activity (the `_on_mcp_activity` port) ---------------------
+
+    use serde_json::json;
+
+    fn observer(debug: bool) -> AppState {
+        let mut s = AppState::new();
+        s.context_role = Some(ContextRole::Observer);
+        s.mcp_client = Some("tui-1".to_string());
+        s.debug_mcp = debug;
+        s
+    }
+
+    fn start_event(tool: &str, seq: u64, origin: Option<&str>) -> Value {
+        let mut e =
+            json!({"tool": tool, "args": {}, "status": "start", "detail": null, "seq": seq});
+        if let Some(o) = origin {
+            e["origin"] = Value::from(o);
+        }
+        e
+    }
+
+    fn settle_event(tool: &str, seq: u64, origin: Option<&str>, extra: Value) -> Value {
+        let mut e = json!({
+            "tool": tool, "args": {}, "status": "ok", "detail": null,
+            "seq": seq, "elapsed": 3.24,
+        });
+        if let Some(o) = origin {
+            e["origin"] = Value::from(o);
+        }
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            e[k] = v.clone();
+        }
+        e
+    }
+
+    #[test]
+    fn pending_calls_ride_the_status_bar_only_under_debug_mcp() {
+        let mut s = observer(true);
+        assert!(
+            s.on_mcp_activity(&start_event("drift", 7, Some("mcp-9")))
+                .is_none()
+        );
+        assert!(s.jobs().contains(&"mcp drift".to_string()));
+        assert!(
+            s.any_job_running(),
+            "a pending call keeps the spinner armed"
+        );
+        // Without the flag: no monitoring surface — not even the bar.
+        let mut quiet = observer(false);
+        assert!(
+            quiet
+                .on_mcp_activity(&start_event("drift", 7, Some("mcp-9")))
+                .is_none()
+        );
+        assert!(quiet.jobs().is_empty());
+        assert!(!quiet.any_job_running());
+        // The settle pops the pending strip either way.
+        assert!(
+            s.on_mcp_activity(&settle_event("drift", 7, Some("mcp-9"), json!({})))
+                .is_none()
+        );
+        assert!(s.mcp_pending.is_empty());
+        assert!(!s.any_job_running());
+    }
+
+    #[test]
+    fn settle_line_carries_the_python_label_format() {
+        let mut s = observer(true);
+        let event = settle_event(
+            "resolve",
+            1,
+            Some("mcp-9"),
+            json!({"args": {"selector": "@k3s", "full": true}}),
+        );
+        let _ = s.on_mcp_activity(&event);
+        let entry = s.mcp_log.back().expect("logged");
+        assert_eq!(entry.tool, "resolve");
+        assert_eq!(entry.origin.as_deref(), Some("mcp-9"));
+        assert_eq!(entry.label, "ok · 3.2s");
+        assert!(entry.ok);
+        assert_eq!(entry.args, "full=True selector='@k3s'");
+        // An error settle: bold-red label + red detail.
+        let mut err = settle_event("deploy", 2, Some("mcp-9"), json!({}));
+        err["status"] = Value::from("error");
+        err["detail"] = Value::from("no such member: db");
+        let _ = s.on_mcp_activity(&err);
+        let entry = s.mcp_log.back().expect("logged");
+        assert!(!entry.ok);
+        assert_eq!(entry.label, "error · 3.2s");
+        assert_eq!(entry.detail.as_deref(), Some("no such member: db"));
+    }
+
+    #[test]
+    fn own_calls_are_skipped_role_dependently() {
+        // Observer: our own origin is skipped; the leader's no-origin calls
+        // and other clients' calls render.
+        let mut s = observer(true);
+        assert!(
+            s.on_mcp_activity(&start_event("members", 1, Some("tui-1")))
+                .is_none()
+        );
+        assert!(s.mcp_pending.is_empty(), "own call must not double-render");
+        let _ = s.on_mcp_activity(&start_event("members", 2, None));
+        let _ = s.on_mcp_activity(&start_event("members", 3, Some("mcp-4")));
+        assert_eq!(
+            s.mcp_pending.len(),
+            2,
+            "leader-local + other clients render"
+        );
+        // Leader: OUR calls are the no-origin ones.
+        let mut l = observer(true);
+        l.context_role = Some(ContextRole::Leader);
+        assert!(
+            l.on_mcp_activity(&start_event("members", 1, None))
+                .is_none()
+        );
+        assert!(l.mcp_pending.is_empty());
+        let _ = l.on_mcp_activity(&start_event("members", 2, Some("mcp-4")));
+        assert_eq!(l.mcp_pending.len(), 1);
+    }
+
+    #[test]
+    fn settle_follow_ups_match_the_python_dispatch() {
+        let mut s = observer(false);
+        // deploy ok + run_id: exact attach.
+        let f = s.on_mcp_activity(&settle_event(
+            "deploy",
+            1,
+            Some("mcp-9"),
+            json!({"result": {"ok": true, "run_id": "r-1"}}),
+        ));
+        assert_eq!(
+            f,
+            Some(McpFollowUp::Attach {
+                kind: "deploy".into(),
+                run_id: Some("r-1".into())
+            })
+        );
+        // No result summary (older events): fall back to the newest of kind.
+        let f = s.on_mcp_activity(&settle_event("reboot", 2, Some("mcp-9"), json!({})));
+        assert_eq!(
+            f,
+            Some(McpFollowUp::Attach {
+                kind: "reboot".into(),
+                run_id: None
+            })
+        );
+        // A refused call launches nothing.
+        let f = s.on_mcp_activity(&settle_event(
+            "deploy",
+            3,
+            Some("mcp-9"),
+            json!({"result": {"ok": false, "refused": true}}),
+        ));
+        assert_eq!(f, None);
+        // drift with refresh/do_eval lands the shared state.
+        let f = s.on_mcp_activity(&settle_event(
+            "drift",
+            4,
+            Some("mcp-9"),
+            json!({"args": {"do_eval": true}}),
+        ));
+        assert_eq!(f, Some(McpFollowUp::DriftLanded));
+        let f = s.on_mcp_activity(&settle_event(
+            "drift",
+            5,
+            Some("mcp-9"),
+            json!({"args": {"statuses": ["drift"]}}),
+        ));
+        assert_eq!(f, None, "a plain drift read lands nothing");
+        // reload swaps the inventory.
+        let f = s.on_mcp_activity(&settle_event("reload", 6, Some("mcp-9"), json!({})));
+        assert_eq!(f, Some(McpFollowUp::ReloadLanded));
+        // An error settle never fires a follow-up.
+        let mut err = settle_event(
+            "deploy",
+            7,
+            Some("mcp-9"),
+            json!({"result": {"ok": true, "run_id": "r-2"}}),
+        );
+        err["status"] = Value::from("error");
+        assert_eq!(s.on_mcp_activity(&err), None);
+    }
+
+    #[test]
+    fn mcp_drift_landed_adopts_a_fresh_cache_only() {
+        let mut s = observer(false);
+        let mut cached = BTreeMap::new();
+        cached.insert("web".to_string(), "/nix/store/aaa".to_string());
+        s.on_mcp_drift_landed(
+            Some("r1".into()),
+            Some("r1".into()),
+            cached.clone(),
+            &BTreeMap::new(),
+            Utc::now(),
+        );
+        assert_eq!(s.expected.as_ref(), Some(&cached));
+        assert_eq!(s.status, "drift refreshed (mcp)");
+        // A moved contract does not adopt the stale cache.
+        let mut s = observer(false);
+        s.on_mcp_drift_landed(
+            Some("r2".into()),
+            Some("r1".into()),
+            cached,
+            &BTreeMap::new(),
+            Utc::now(),
+        );
+        assert!(s.expected.is_none());
+    }
+
+    #[test]
+    fn reload_request_marks_fresh_and_the_mark_survives_queueing() {
+        let mut s = AppState::new();
+        let req = s.request_load().expect("initial load");
+        assert!(!req.fresh, "a first read serves the cached contract");
+        // Reload while busy: queued, and still fresh when consumed.
+        let mut s = AppState::new();
+        let _ = s.request_load();
+        assert!(
+            s.request_reload().is_none(),
+            "queued behind the busy worker"
+        );
+        assert!(s.reload_pending && s.fresh_wanted);
+        s.busy = false;
+        s.reload_pending = false; // consume path runs request_load directly
+        let req = s.request_load().expect("consumed reload");
+        assert!(req.fresh, "the queued reload still refreshes the contract");
+    }
+
+    #[test]
+    fn mcp_log_is_capped() {
+        let mut s = observer(false);
+        for seq in 0..(MCP_LOG_MAX as u64 + 5) {
+            let _ = s.on_mcp_activity(&settle_event("ping", seq, Some("mcp-9"), json!({})));
+        }
+        assert_eq!(s.mcp_log.len(), MCP_LOG_MAX);
+    }
+
+    #[test]
+    fn format_mcp_args_approximates_python_repr() {
+        assert_eq!(
+            format_mcp_args(
+                &json!({"selector": "@k3s", "dry_activate": false, "forks": 3, "x": null})
+            ),
+            "dry_activate=False forks=3 selector='@k3s' x=None"
+        );
+        assert_eq!(format_mcp_args(&json!({})), "");
+        assert_eq!(format_mcp_args(&Value::Null), "");
     }
 }

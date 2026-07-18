@@ -37,7 +37,10 @@ use rust_mcp_sdk::schema::{
 };
 use rust_mcp_sdk::{McpServer as _, StdioTransport, TransportOptions};
 
-pub use context::{ContextHandler, handler_dispatch, host_config_factory, tool_is_idempotent};
+pub use context::{
+    ContextHandler, handler_dispatch, host_config_factory, quiet_host_config_factory,
+    tool_is_idempotent,
+};
 pub use server::{MandalaHandler, server_name};
 
 use mandala_core::VERSION;

@@ -24,13 +24,19 @@ use chrono::Utc;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use mandala_core::drift;
+use mandala_core::registry;
 use mandala_core::runner::{DeployRun, ansible_dir};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::context::{
+    TuiContext, spawn_activity_pump, spawn_context_eval_expected, spawn_context_load,
+    spawn_role_watch,
+};
 use crate::deploy::DeployJob;
 use crate::event::{AppEvent, Deadlines, LoopEvent, TimerId};
 use crate::explorer::{ExplorerConfig, pump_lines, spawn_eval_expected, spawn_load, spawn_survey};
@@ -39,7 +45,7 @@ use crate::screen::{
     self, AttachedLogState, ConfirmAction, ConfirmState, DeployTab, RebootState, ScreenState,
     TaskState,
 };
-use crate::state::{AppState, LoadRequest, Tab};
+use crate::state::{AppState, ContextRole, LoadRequest, McpFollowUp, Tab};
 use crate::term::TerminalGuard;
 
 /// How many already-queued INTERNAL events one wake may consume before the
@@ -106,6 +112,10 @@ pub struct App {
     task: Option<TaskJob>,
     deploy: Option<DeployJob>,
     next_task_id: u64,
+    /// The joined fleet context (section 6): `Some` routes every eval-class
+    /// explorer read through the leader's warm evaluator; `None` is the
+    /// local-eval fallback shape.
+    context: Option<TuiContext>,
 }
 
 impl App {
@@ -124,12 +134,40 @@ impl App {
             task: None,
             deploy: None,
             next_task_id: 0,
+            context: None,
         }
     }
 
     /// Sender for background tasks feeding the internal channel.
     pub fn sender(&self) -> mpsc::Sender<AppEvent> {
         self.tx.clone()
+    }
+
+    /// Adopt a joined fleet context: record the role + self-filter identity
+    /// in state, start the activity pump (ONE pipeline whether leader or
+    /// observer) and the role watcher, and route eval-class reads through
+    /// the session from here on.
+    pub fn adopt_context(&mut self, ctx: TuiContext) {
+        self.state.mcp_client = Some(ctx.client_name.clone());
+        self.state.context_role = Some(if ctx.leader {
+            ContextRole::Leader
+        } else {
+            ContextRole::Observer
+        });
+        spawn_activity_pump(ctx.session.clone(), self.tx.clone());
+        spawn_role_watch(ctx.session.clone(), self.tx.clone(), ctx.leader);
+        self.context = Some(ctx);
+    }
+
+    /// Orderly context exit, run AFTER the loop returns and BEFORE the
+    /// terminal restores (the Python `action_quit` await-the-host-first
+    /// ordering): a leader stops accepting, drains in-flight forwarded
+    /// calls within `grace`, closes, and releases discovery — followers
+    /// detect and re-race; an observer just detaches cleanly.
+    pub async fn shutdown_context(&mut self, grace: Duration) {
+        if let Some(ctx) = self.context.take() {
+            ctx.session.shutdown(grace).await;
+        }
     }
 
     /// Kick the initial aggregate load (the `on_mount` `_load`). Call once
@@ -277,15 +315,23 @@ impl App {
                         .arm(TimerId::AttachedLogPoll, Instant::now() + ATTACHED_POLL);
                 }
             }
-            LoopEvent::App(ev) => self.on_app_event(ev),
+            LoopEvent::App(ev) => {
+                if let Some(follow) = self.on_app_event(ev) {
+                    let size = terminal.size().map_err(io::Error::other)?;
+                    self.apply_mcp_follow_up(follow, (size.width, size.height))
+                        .await;
+                }
+            }
         }
         Ok(())
     }
 
     /// A background job settled or progressed. The drift inputs (snapshot
     /// dir + clock) are read HERE, at the runtime edge, so the state
-    /// transitions stay pure.
-    fn on_app_event(&mut self, ev: AppEvent) {
+    /// transitions stay pure. Returns a context follow-up for the caller to
+    /// apply (attaching a screen needs the terminal size).
+    fn on_app_event(&mut self, ev: AppEvent) -> Option<McpFollowUp> {
+        let mut mcp_follow = None;
         let follow_up = match ev {
             AppEvent::LoadFinished { generation, result } => {
                 let snapshots = drift::read_snapshots(&drift::state_dir());
@@ -328,12 +374,94 @@ impl App {
                 }
                 None
             }
+            AppEvent::McpActivity { event } => {
+                mcp_follow = self.state.on_mcp_activity(&event);
+                None
+            }
+            AppEvent::McpRoleChanged { leader } => {
+                self.state.context_role = Some(if leader {
+                    ContextRole::Leader
+                } else {
+                    ContextRole::Observer
+                });
+                None
+            }
         };
         if let Some(req) = follow_up {
             self.start_load(req);
         }
         self.sync_spinner();
         self.dirty = true;
+        mcp_follow
+    }
+
+    /// Apply a context-activity follow-up (the imperative tail of the
+    /// Python `_on_mcp_activity`, run at the runtime edge).
+    async fn apply_mcp_follow_up(&mut self, follow: McpFollowUp, size: (u16, u16)) {
+        match follow {
+            McpFollowUp::Attach { kind, run_id } => {
+                self.attach_run(&kind, run_id.as_deref(), size).await;
+            }
+            McpFollowUp::DriftLanded => {
+                let rev = drift::repo_rev(&self.cfg.flake);
+                let state_dir = drift::state_dir();
+                let (cached_rev, cached) = drift::load_expected(&state_dir);
+                let snapshots = drift::read_snapshots(&state_dir);
+                self.state
+                    .on_mcp_drift_landed(rev, cached_rev, cached, &snapshots, Utc::now());
+            }
+            McpFollowUp::ReloadLanded => {
+                // The eval already happened at the leader — the queued load
+                // re-reads the swapped contract through the context (or
+                // re-evaluates locally in the fallback shape), exactly the
+                // Python `McpInventorySwap` minus the eval.
+                if let Some(req) = self.state.request_reload() {
+                    self.start_load(req);
+                }
+                self.state.set_status("inventory reloaded (mcp)", false);
+                self.sync_spinner();
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Attach the matching observer screen to a registry run (`_attach_run`):
+    /// with a `run_id` (from the settle's result summary) it's exact; without
+    /// one, the newest run of this kind. Only a run whose recorded pid is
+    /// alive attaches (a refused call launches nothing but still settles ok);
+    /// a run never attaches twice; and — a single-screen-slot adaptation —
+    /// an already-open screen is never clobbered.
+    async fn attach_run(&mut self, kind: &str, run_id: Option<&str>, size: (u16, u16)) {
+        if self.state.screen.is_some() {
+            return;
+        }
+        let info = match run_id {
+            Some(id) => registry::open_run(id).map(|obs| obs.info),
+            None => registry::list_runs()
+                .into_iter()
+                .find(|info| info.kind() == kind),
+        };
+        let Some(info) = info else {
+            return;
+        };
+        if !registry::pid_alive(info.pid()) {
+            return;
+        }
+        if self.state.attached_runs.contains(&info.run_id) {
+            return;
+        }
+        self.state.attached_runs.insert(info.run_id.clone());
+        if kind == "deploy" {
+            if let Some(run) = DeployRun::attach(&info.run_id) {
+                // Same continuation as an operator deploy: refresh drift
+                // once the run completes and its screen closes.
+                self.start_deploy(run, false, true, true, size).await;
+            }
+            return;
+        }
+        let limit = info.meta.get("limit").and_then(Value::as_str).unwrap_or("");
+        let title = format!("{kind} {limit}").trim().to_string();
+        self.push_attached_log(title, info.run_id.clone(), true);
     }
 
     async fn on_key<B: Backend>(
@@ -452,6 +580,14 @@ impl App {
             KeyCode::Char('p') => self.dispatch(Action::Ping),
             KeyCode::Char('R') => self.dispatch(Action::Reboot),
             KeyCode::Char('D') => self.dispatch(Action::Deploy),
+
+            // -- mcp activity panel (`--debug-mcp` only: without the flag
+            // the binding does not exist — the key is inert and the footer
+            // never hints it, the `check_action` mechanism) ----------------
+            KeyCode::Char('m') if self.state.debug_mcp => {
+                self.state.mcp_panel = !self.state.mcp_panel;
+                self.dirty = true;
+            }
             _ => {}
         }
         Ok(())
@@ -804,16 +940,32 @@ impl App {
         }
     }
 
+    /// Start an aggregate load: through the context's warm evaluator when
+    /// one is joined (with local-eval fallback inside the job), else the
+    /// local blocking-pool job.
     fn start_load(&mut self, req: LoadRequest) {
-        spawn_load(self.tx.clone(), self.cfg.clone(), req);
+        if let Some(ctx) = &self.context {
+            spawn_context_load(self.tx.clone(), ctx.session.clone(), self.cfg.clone(), req);
+        } else {
+            spawn_load(self.tx.clone(), self.cfg.clone(), req);
+        }
     }
 
     fn start_eval_expected(&mut self) {
-        spawn_eval_expected(
-            self.tx.clone(),
-            self.cfg.clone(),
-            self.state.inventory.clone(),
-        );
+        if let Some(ctx) = &self.context {
+            spawn_context_eval_expected(
+                self.tx.clone(),
+                ctx.session.clone(),
+                self.cfg.clone(),
+                self.state.inventory.clone(),
+            );
+        } else {
+            spawn_eval_expected(
+                self.tx.clone(),
+                self.cfg.clone(),
+                self.state.inventory.clone(),
+            );
+        }
     }
 
     fn start_survey(&mut self) {

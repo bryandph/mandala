@@ -1,10 +1,12 @@
 //! mandala-tui — the native fleet TUI (OpenSpec change `mandala-native-tui`).
 //!
-//! Section 5 state: the explorer tier (section 4) plus the ACTION TIER and
-//! DEPLOY RUNNER at parity with the Python `tui/tasks.py` + `tui/deploy.py`
-//! — confirm/reboot modals, task/attached-log screens, the deploy screen
-//! with the pty-hosted nom pane, and the standalone `tui deploy` entry.
-//! Context/MCP integration is section 6.
+//! Section 6 state: the explorer + action tier + deploy runner (sections
+//! 4–5) now PARTICIPATE in the per-checkout fleet execution context —
+//! leader (hosting the endpoint every later `mandala mcp` proxies through)
+//! or observer (activity subscription), one [`context`] pipeline either
+//! way. Settle events auto-attach client-launched deploy/reboot runs, land
+//! remote drift refreshes, and swap remotely reloaded inventories;
+//! `--debug-mcp` opts into the call-monitoring surface.
 //!
 //! - [`state`] — the strict pure-data [`state::AppState`]: everything the
 //!   render fns may see, and nothing they may touch (no handles, no
@@ -38,6 +40,7 @@
 
 pub mod ansi;
 pub mod app;
+pub mod context;
 pub mod deploy;
 pub mod event;
 pub mod explorer;

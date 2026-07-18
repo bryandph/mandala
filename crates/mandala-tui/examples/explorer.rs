@@ -20,15 +20,21 @@ use mandala_tui::explorer::{ExplorerConfig, run_explorer};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     let mut flake = ".".to_string();
+    let mut debug_mcp = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--flake" => flake = args.next().unwrap_or_else(|| ".".to_string()),
+            "--debug-mcp" => debug_mcp = true,
             other => {
-                eprintln!("unknown argument: {other} (usage: explorer [--flake <ref>])");
+                eprintln!(
+                    "unknown argument: {other} (usage: explorer [--flake <ref>] [--debug-mcp])"
+                );
                 std::process::exit(2);
             }
         }
     }
-    run_explorer(ExplorerConfig::for_flake(flake)).await
+    let mut cfg = ExplorerConfig::for_flake(flake);
+    cfg.debug_mcp = debug_mcp;
+    run_explorer(cfg).await
 }

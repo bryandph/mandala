@@ -20,11 +20,14 @@ use mandala_core::drift::DriftStatus;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Row, Table};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::select::{SelectTable, view_offset};
-use crate::state::{AppState, Tab};
+use crate::state::{AppState, ContextRole, McpLogEntry, McpPending, SPINNER_FRAMES, Tab};
+
+/// The docked activity panel's width (the Python `#mcp-panel { width: 52 }`).
+pub const MCP_PANEL_WIDTH: u16 = 52;
 
 /// Map ONE rich-style spec from the core's styling vocabulary
 /// ([`DriftStatus::style`]) onto a ratatui [`Style`]. This is the single
@@ -103,17 +106,34 @@ pub fn footer_hints(state: &AppState) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Top-level render: the active screen when one is pushed (modals overlay
-/// the explorer; task/deploy screens replace it), else the explorer.
+/// the explorer; task/deploy screens replace it), else the explorer. Under
+/// `--debug-mcp` (with the panel toggled on) the explorer view — and the
+/// modals over it — dock the activity panel on the right; the full screens
+/// (task/attached/deploy) replace the whole frame, exactly like the Python
+/// pushed screens covered the dock.
 pub fn render(state: &AppState, frame: &mut Frame) {
     use crate::screen::{self, ScreenState};
+    let explorer_tier = matches!(
+        state.screen,
+        None | Some(ScreenState::Confirm(_)) | Some(ScreenState::Reboot(_))
+    );
+    let area = if state.debug_mcp && state.mcp_panel && explorer_tier {
+        let [main, panel] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(MCP_PANEL_WIDTH)])
+                .areas(frame.area());
+        render_mcp_panel(state, frame, panel);
+        main
+    } else {
+        frame.area()
+    };
     match &state.screen {
-        None => render_explorer(state, frame),
+        None => render_explorer(state, frame, area),
         Some(ScreenState::Confirm(confirm)) => {
-            render_explorer(state, frame);
+            render_explorer(state, frame, area);
             screen::render_confirm(confirm, frame);
         }
         Some(ScreenState::Reboot(reboot)) => {
-            render_explorer(state, frame);
+            render_explorer(state, frame, area);
             screen::render_reboot(reboot, frame);
         }
         Some(ScreenState::Task(task)) => screen::render_task(task, frame),
@@ -122,8 +142,19 @@ pub fn render(state: &AppState, frame: &mut Frame) {
     }
 }
 
+/// The subtle role indicator (section-6 decision of record): `ctx leader` /
+/// `ctx observer`, dim, right-aligned on the header line; absent entirely
+/// with no context. Flips live when a re-race promotes the session.
+#[must_use]
+pub fn role_indicator(state: &AppState) -> Option<&'static str> {
+    match state.context_role? {
+        ContextRole::Leader => Some("ctx leader"),
+        ContextRole::Observer => Some("ctx observer"),
+    }
+}
+
 /// The explorer view: header, tab bar, active view, status line, footer.
-fn render_explorer(state: &AppState, frame: &mut Frame) {
+fn render_explorer(state: &AppState, frame: &mut Frame, area: Rect) {
     let [header, tabs, view, status, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -131,7 +162,7 @@ fn render_explorer(state: &AppState, frame: &mut Frame) {
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     frame.render_widget(
         Line::from(Span::styled(
@@ -140,6 +171,13 @@ fn render_explorer(state: &AppState, frame: &mut Frame) {
         )),
         header,
     );
+    if let Some(role) = role_indicator(state) {
+        frame.render_widget(
+            Line::from(Span::styled(role, Style::new().add_modifier(Modifier::DIM)))
+                .right_aligned(),
+            header,
+        );
+    }
     render_tab_bar(state, frame, tabs);
     match state.tab {
         Tab::Members => render_members(state, frame, view),
@@ -185,6 +223,113 @@ fn render_footer(state: &AppState, frame: &mut Frame, area: Rect) {
         ));
     }
     frame.render_widget(Line::from(spans), area);
+}
+
+/// One settled activity line — the exact Python format:
+/// `▸ tool  args  [ok · 3.2s]` (+ red detail on error), with the context
+/// model's addition of the origin label (`⟨client⟩`) after the tool.
+#[must_use]
+pub fn mcp_log_line(entry: &McpLogEntry) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("▸ {}", entry.tool),
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
+    if let Some(origin) = &entry.origin {
+        spans.push(Span::styled(
+            format!("  ⟨{origin}⟩"),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    if !entry.args.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", entry.args),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    let label_style = if entry.ok {
+        Style::new().fg(Color::Green)
+    } else {
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled(format!("  [{}]", entry.label), label_style));
+    if let Some(detail) = &entry.detail {
+        spans.push(Span::styled(
+            format!("  {detail}"),
+            Style::new().fg(Color::Red),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// One pending-strip line: the shared spinner frame + the tool, bold
+/// yellow, args dim (the `_render_mcp_pending` line).
+#[must_use]
+pub fn mcp_pending_line(pending: &McpPending, frame_char: char) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{frame_char} {}", pending.tool),
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(origin) = &pending.origin {
+        spans.push(Span::styled(
+            format!("  ⟨{origin}⟩"),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    if !pending.args.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", pending.args),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The `--debug-mcp` activity panel (docked right): the settled-call log
+/// with the pending strip at the bottom — one spinner line per in-flight
+/// call, collapsing entirely when nothing is running.
+fn render_mcp_panel(state: &AppState, frame: &mut Frame, area: Rect) {
+    let block = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(Style::new().add_modifier(Modifier::DIM));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let strip_h = if state.mcp_pending.is_empty() {
+        0
+    } else {
+        u16::try_from(state.mcp_pending.len()).unwrap_or(u16::MAX - 1) + 1
+    };
+    let [log_area, strip_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(strip_h)]).areas(inner);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "mcp activity",
+        Style::new().add_modifier(Modifier::BOLD),
+    ))];
+    if state.mcp_log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "watching for tool calls…",
+            Style::new().add_modifier(Modifier::DIM),
+        )));
+    }
+    let avail = (log_area.height as usize).saturating_sub(lines.len());
+    let start = state.mcp_log.len().saturating_sub(avail);
+    for entry in state.mcp_log.iter().skip(start) {
+        lines.push(mcp_log_line(entry));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), log_area);
+
+    if strip_h > 0 {
+        let frame_char = SPINNER_FRAMES[state.spin % SPINNER_FRAMES.len()];
+        let mut strip = vec![Line::from(Span::styled(
+            "─".repeat(strip_area.width as usize),
+            Style::new().add_modifier(Modifier::DIM),
+        ))];
+        for pending in state.mcp_pending.values() {
+            strip.push(mcp_pending_line(pending, frame_char));
+        }
+        frame.render_widget(Paragraph::new(Text::from(strip)), strip_area);
+    }
 }
 
 /// Render one select-table view: bold header row, marker column from the

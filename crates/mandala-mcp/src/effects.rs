@@ -122,6 +122,12 @@ pub trait Effects: Send + Sync {
 /// blocking pool so a slow eval never wedges the server's message loop.
 pub struct RealEffects {
     evaluator: Arc<Mutex<Evaluator>>,
+    /// Quiet mode (the TUI-as-leader shape): every child's output is
+    /// captured/nulled — the eval worker's stderr (dirty-tree warnings, copy
+    /// progress) and the survey playbook's inherited output would otherwise
+    /// scribble over the alternate screen (the section-4 quiet rule, extended
+    /// to the leader the TUI hosts).
+    quiet: bool,
 }
 
 impl RealEffects {
@@ -129,6 +135,19 @@ impl RealEffects {
     pub fn new() -> Self {
         Self {
             evaluator: Arc::new(Mutex::new(Evaluator::from_env())),
+            quiet: false,
+        }
+    }
+
+    /// Production effects whose children never write through to the
+    /// terminal: a quiet evaluator worker and an output-nulled survey. The
+    /// TUI's context factory uses this; the stdio server keeps [`Self::new`]
+    /// (its stderr is free, and errors travel in-band either way).
+    #[must_use]
+    pub fn quiet() -> Self {
+        Self {
+            evaluator: Arc::new(Mutex::new(Evaluator::from_env().quiet())),
+            quiet: true,
         }
     }
 }
@@ -217,6 +236,21 @@ impl Effects for RealEffects {
     }
 
     async fn refresh_snapshots(&self) -> io::Result<i32> {
+        if self.quiet {
+            // The TUI-as-leader shape: the survey's output must never write
+            // through the alternate screen (the Python survey lesson) — run
+            // the same playbook line with every stream nulled.
+            let status = tokio::process::Command::new("ansible-playbook")
+                .arg("mandala.fleet.state")
+                .current_dir(ansible_dir())
+                .env("MANDALA_FLEET_STATE", drift::state_dir())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?;
+            return Ok(status.code().unwrap_or(-1));
+        }
         tokio::task::spawn_blocking(|| drift::refresh_snapshots(&ansible_dir(), None, None))
             .await
             .map_err(io::Error::other)?

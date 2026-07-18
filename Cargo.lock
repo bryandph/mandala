@@ -944,11 +944,14 @@ name = "mandala-tui"
 version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
+ "async-trait",
  "chrono",
  "crossterm",
  "futures-util",
  "insta",
+ "mandala-context",
  "mandala-core",
+ "mandala-mcp",
  "nix 0.30.1",
  "ratatui",
  "serde_json",

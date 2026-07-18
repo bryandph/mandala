@@ -60,6 +60,11 @@ pub struct ExplorerConfig {
     /// Test seam: override the deploy screen's launched argv verbatim
     /// (`DeployRun::program`); `None` builds the real playbook line.
     pub deploy_program: Option<Vec<String>>,
+    /// `--debug-mcp`: render the context call-monitoring surface (activity
+    /// panel, pending strip, status-bar `mcp <tool>` jobs, `m` toggle).
+    /// The activity SUBSCRIPTION is flag-independent — settle events drive
+    /// run auto-attach, drift refresh, and reload swaps regardless.
+    pub debug_mcp: bool,
 }
 
 /// The default `p` argv (see [`ExplorerConfig::ping_argv`]).
@@ -83,6 +88,7 @@ impl Default for ExplorerConfig {
             ping_argv: default_ping_argv,
             reboot_argv: mandala_core::runner::reboot_argv,
             deploy_program: None,
+            debug_mcp: false,
         }
     }
 }
@@ -100,17 +106,33 @@ impl ExplorerConfig {
 
 /// Run the explorer on the real terminal until quit.
 ///
+/// The TUI participates in the checkout's fleet execution context
+/// symmetrically (section 6): it joins BEFORE the terminal enters raw mode
+/// (degradation notices print normally), claims leadership when no context
+/// exists (later `mandala mcp` instances proxy through this process), and
+/// otherwise attaches as an observer. On quit the context is shut down
+/// FIRST — orderly stop-accept → drain → close → discovery release for a
+/// leader, a clean detach for an observer — and only then does the terminal
+/// restore (the Python `action_quit` ordering).
+///
 /// # Errors
 /// Terminal setup/IO failures.
 pub async fn run_explorer(cfg: ExplorerConfig) -> io::Result<()> {
     install_panic_hook();
+    let context = crate::context::join_context(&cfg.flake).await;
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut app = App::new(AppState::new(), cfg);
+    let mut state = AppState::new();
+    state.debug_mcp = cfg.debug_mcp;
+    let mut app = App::new(state, cfg);
     app.guard = Some(guard);
+    if let Some(ctx) = context {
+        app.adopt_context(ctx);
+    }
     app.start_initial_load();
     let mut events = EventStream::new();
     let result = app.run(&mut terminal, &mut events).await;
+    app.shutdown_context(crate::context::SHUTDOWN_GRACE).await;
     drop(app); // restores the terminal via the guard
     result
 }
