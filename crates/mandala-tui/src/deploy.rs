@@ -163,3 +163,17 @@ pub async fn run_deploy(cfg: DeployConfig) -> io::Result<i64> {
     drop(app); // restores the terminal via the guard
     result.map(|()| code)
 }
+
+/// As [`run_deploy`], hosting its own current-thread runtime — the
+/// `mandala tui deploy` bin entry (the [`mandala_mcp::serve_stdio_blocking`]
+/// pattern: the crate that owns the async entry owns the runtime, so the
+/// bin stays runtime-free).
+///
+/// # Errors
+/// Runtime construction and [`run_deploy`] failures.
+pub fn run_deploy_blocking(cfg: DeployConfig) -> io::Result<i64> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run_deploy(cfg))
+}

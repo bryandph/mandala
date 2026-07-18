@@ -14,7 +14,7 @@ pub mod runner;
 #[cfg(test)]
 mod interop_tests;
 
-pub use cli::{Cli, Engine};
+pub use cli::{Cli, Engine, TuiRequest};
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
 pub use registry::{ObservedRun, RunInfo, RunLiveness, list_runs, new_run_dir, open_run};

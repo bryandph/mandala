@@ -26,6 +26,7 @@ repository = "https://github.com/bryanhuff/mandala"
 mandala-core = { path = "crates/mandala-core" }
 mandala-context = { path = "crates/mandala-context" }
 mandala-mcp = { path = "crates/mandala-mcp" }
+mandala-tui = { path = "crates/mandala-tui" }
 
 # A single shared profile knob: the release binary is what ships, so keep it
 # lean. Dev builds stay fast (default opt-level 0).

@@ -889,6 +889,7 @@ version = "0.1.0"
 dependencies = [
  "mandala-core",
  "mandala-mcp",
+ "mandala-tui",
  "serde_json",
 ]
 

@@ -149,6 +149,67 @@ fn members_table_carries_caption_and_rows() {
     let _ = std::fs::remove_file(&fx);
 }
 
+// ---- native tui surface (mandala-native-tui task 7.1) -----------------------
+// A full TUI launch needs a raw terminal, so the harness asserts only the
+// flag surface; the mandala-tui suites cover the app itself.
+
+#[test]
+fn tui_help_shows_the_native_surface() {
+    let fx = fixture_file();
+    let (stdout, _e, code) = run(&fx, &["tui", "--help"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("--debug-mcp"),
+        "native flag missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("deploy"),
+        "deploy subcommand missing: {stdout}"
+    );
+    // The Python shim vocabulary is gone.
+    assert!(!stdout.contains("mandala-py"), "shim residue: {stdout}");
+    assert!(
+        !stdout.contains("--mcp-port"),
+        "retired flag shown: {stdout}"
+    );
+    let _ = std::fs::remove_file(&fx);
+}
+
+#[test]
+fn tui_deploy_help_shows_the_runner_flags() {
+    let fx = fixture_file();
+    let (stdout, _e, code) = run(&fx, &["tui", "deploy", "--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("--limit"), "{stdout}");
+    assert!(stdout.contains("--dry-activate"), "{stdout}");
+    assert!(stdout.contains("--throttle"), "{stdout}");
+    assert!(
+        stdout.contains("[default: 4]"),
+        "throttle default: {stdout}"
+    );
+    let _ = std::fs::remove_file(&fx);
+}
+
+#[test]
+fn tui_retired_mcp_flag_is_a_usage_error() {
+    // The retired Python flags must FAIL loudly, not be accepted-and-ignored
+    // (the context makes hosting automatic; the HTTP endpoint is gone).
+    let fx = fixture_file();
+    let (_o, stderr, code) = run(&fx, &["tui", "--mcp"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("--mcp"), "stderr: {stderr}");
+    let _ = std::fs::remove_file(&fx);
+}
+
+#[test]
+fn tui_deploy_requires_a_selector() {
+    let fx = fixture_file();
+    let (_o, stderr, code) = run(&fx, &["tui", "deploy"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("--limit"), "stderr: {stderr}");
+    let _ = std::fs::remove_file(&fx);
+}
+
 /// The fleet-context "no context, no failure" scenario (mandala-native-tui
 /// task 3.3): a CLI read with NO live context for the checkout evaluates
 /// locally and succeeds exactly as the standalone binary always has — and it

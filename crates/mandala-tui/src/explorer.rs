@@ -137,6 +137,20 @@ pub async fn run_explorer(cfg: ExplorerConfig) -> io::Result<()> {
     result
 }
 
+/// As [`run_explorer`], hosting its own current-thread runtime — the
+/// `mandala tui` bin entry (the [`mandala_mcp::serve_stdio_blocking`]
+/// pattern: the crate that owns the async entry owns the runtime, so the
+/// bin stays runtime-free).
+///
+/// # Errors
+/// Runtime construction and [`run_explorer`] failures.
+pub fn run_explorer_blocking(cfg: ExplorerConfig) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run_explorer(cfg))
+}
+
 // ---- aggregate load ---------------------------------------------------------
 
 /// Load the inventory (seam-aware) and inspect the drift cache beside it —

@@ -277,10 +277,21 @@ pub fn new_run_dir() -> io::Result<(String, PathBuf)> {
 fn new_run_dir_in(base: &Path) -> io::Result<(String, PathBuf)> {
     prune_in(base, None);
     std::fs::create_dir_all(base)?;
-    let run_id = now_id();
-    let path = base.join(&run_id);
-    std::fs::create_dir_all(&path)?;
-    Ok((run_id, path))
+    // Timestamp run-ids can COLLIDE when two threads of one process allocate
+    // within the same microsecond (the pid suffix disambiguates processes,
+    // not threads): both would then share — and meta-clobber / tmp-rename-
+    // race — a single run dir. Claim with the exclusive `create_dir` and
+    // retry until the clock advances; the id format stays byte-identical
+    // (fleet-state-formats), only uniqueness is enforced.
+    loop {
+        let run_id = now_id();
+        let path = base.join(&run_id);
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok((run_id, path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Read-only attachment to an existing run dir: tail its events and judge
@@ -475,6 +486,31 @@ mod tests {
     }
 
     // ---- meta round-trip + list ordering ------------------------------------
+
+    /// Parallel same-process allocations must never share a run dir: the
+    /// timestamp id's pid suffix disambiguates processes, not threads, so a
+    /// same-microsecond tie would meta-clobber — the exclusive-create claim
+    /// loop in `new_run_dir_in` is the guard (the flake that failed the 7.1
+    /// packaging gate: two TUI tests raced `write_meta` in one shared dir).
+    #[test]
+    fn parallel_new_run_dirs_are_unique() {
+        let base = std::sync::Arc::new(tmp().join("runs"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let base = std::sync::Arc::clone(&base);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait(); // maximize same-instant contention
+                    new_run_dir_in(&base).unwrap().0
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 8, "every allocation must claim a unique dir");
+    }
 
     #[test]
     fn new_run_dir_and_meta_roundtrip() {

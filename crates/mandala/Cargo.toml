@@ -1,6 +1,6 @@
 [package]
 name = "mandala"
-description = "mandala fleet porcelain — CLI + stdio MCP server (single static binary)"
+description = "mandala fleet porcelain — CLI + stdio MCP server + TUI (single static binary)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -15,6 +15,11 @@ path = "src/main.rs"
 [dependencies]
 mandala-core.workspace = true
 mandala-mcp.workspace = true
+# The native TUI (mandala-native-tui section 7 flip). Legal at the top of
+# the dependency graph: nothing depends on the bin crate, so the
+# mandala-tui edge lives here (the launcher-closure seam keeps it out of
+# mandala-core).
+mandala-tui.workspace = true
 
 [dev-dependencies]
 # The stdio-MCP handshake integration test (spike 1.2) drives JSON-RPC by hand.

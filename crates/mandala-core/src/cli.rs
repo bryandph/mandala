@@ -2,7 +2,10 @@
 //!
 //! A parity port of `cli/src/mandala_fleet/cli.py`. The root command owns the
 //! fleet-generic views that come straight off the inventory core — `members`,
-//! `groups`, `resolve`, `drift`, `version`, `mcp` — and every effect engine
+//! `groups`, `resolve`, `drift`, `version` — plus the `mcp` stdio server and
+//! the native `tui` (both launched through closures the binary wires in, so
+//! `mandala-core` never depends on `mandala-mcp` or `mandala-tui` — see
+//! [`Cli::mcp_launcher`] / [`Cli::tui_launcher`]), and every effect engine
 //! plugs in as a subcommand. Python discovered engines through the
 //! `mandala.engines` entry-point group at runtime; the Rust design replaces
 //! that with **compile-time registration** ([`Cli::register`]): an engine is a
@@ -77,12 +80,44 @@ impl Engine {
 /// The stdio-MCP launcher closure: takes the resolved `--flake` value.
 type McpLauncher = Box<dyn Fn(&str) -> ExitCode>;
 
-/// The CLI: the built-in root views plus the registered engines and the stdio
-/// MCP launcher. Assembled by the binary, then [`Cli::run`].
+/// A parsed `mandala tui …` invocation, handed to the [`Cli::tui_launcher`]
+/// closure together with the resolved `--flake` value. The flag plumbing is
+/// asserted at this seam ([`tui_request`] is pure); the launch itself lives
+/// only in the binary — a real TUI needs a real terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiRequest {
+    /// `mandala tui` — the fleet explorer. `debug_mcp` opts into the
+    /// context call-monitoring surface (`--debug-mcp`).
+    Explorer {
+        /// The `--debug-mcp` flag.
+        debug_mcp: bool,
+    },
+    /// `mandala tui deploy` — the standalone deploy runner. The launcher's
+    /// exit code is the run's rc (0 on operator cancel).
+    Deploy {
+        /// The required `-l/--limit` selector (resolved through
+        /// `Inventory::to_limit` inside the runner, before the terminal
+        /// opens).
+        limit: String,
+        /// `--dry-activate`: build + copy but do not activate.
+        dry_activate: bool,
+        /// `--throttle`: per-host deploy parallelism (default 4).
+        throttle: i64,
+    },
+}
+
+/// The native-TUI launcher closure: the resolved `--flake` value plus the
+/// parsed [`TuiRequest`].
+type TuiLauncher = Box<dyn Fn(&str, TuiRequest) -> ExitCode>;
+
+/// The CLI: the built-in root views plus the registered engines and the
+/// stdio-MCP / native-TUI launchers. Assembled by the binary, then
+/// [`Cli::run`].
 #[derive(Default)]
 pub struct Cli {
     engines: Vec<Engine>,
     mcp: Option<McpLauncher>,
+    tui: Option<TuiLauncher>,
 }
 
 impl Cli {
@@ -108,6 +143,17 @@ impl Cli {
     #[must_use]
     pub fn mcp_launcher(mut self, launch: impl Fn(&str) -> ExitCode + 'static) -> Self {
         self.mcp = Some(Box::new(launch));
+        self
+    }
+
+    /// Set the launcher the `tui` subcommand invokes with the resolved
+    /// `--flake` value and the parsed [`TuiRequest`] (the bin wires this to
+    /// `mandala-tui`'s explorer/deploy entries — the same closure seam as
+    /// [`Cli::mcp_launcher`], keeping the `mandala-tui` edge out of the
+    /// library).
+    #[must_use]
+    pub fn tui_launcher(mut self, launch: impl Fn(&str, TuiRequest) -> ExitCode + 'static) -> Self {
+        self.tui = Some(Box::new(launch));
         self
     }
 
@@ -165,20 +211,43 @@ impl Cli {
             .subcommand(Command::new("version").about("Print the CLI version"))
             .subcommand(Command::new("mcp").about("Run the fleet MCP server over stdio (headless)"))
             .subcommand(
-                // Settled phase-1 design: the Rust binary keeps a `tui`
-                // subcommand that exec's the Python TUI (`mandala-py`) until
-                // phase 2 replaces it natively — muscle memory + docs survive
-                // the swap. Every argument is forwarded verbatim.
+                // The native ratatui TUI (mandala-native-tui section 7 flip —
+                // the phase-1 Python exec-shim is gone). The retired Python
+                // flags `--mcp`/`--mcp-port`/`--mcp-rotate-token` are NOT
+                // accepted: the fleet context makes hosting automatic and the
+                // HTTP MCP endpoint no longer exists, so a stale invocation
+                // fails loudly with clap's unknown-flag error.
                 Command::new("tui")
-                    .about("Textual TUI (execs the Python `mandala-py tui` until phase 2)")
+                    .about("Fleet TUI — the explorer; `tui deploy` runs the standalone deploy screen")
                     .arg(
-                        Arg::new("args")
-                            .num_args(0..)
-                            .trailing_var_arg(true)
-                            .allow_hyphen_values(true)
-                            .value_name("ARGS")
-                            .help(
-                                "Arguments forwarded to `mandala-py tui` (e.g. --mcp, deploy -l …)",
+                        Arg::new("debug-mcp")
+                            .long("debug-mcp")
+                            .action(ArgAction::SetTrue)
+                            .help("Show the fleet-context call-monitoring pane (origin-labeled activity, `m` toggle)"),
+                    )
+                    .subcommand(
+                        Command::new("deploy")
+                            .about("Standalone deploy runner (exit code = the run's rc)")
+                            .arg(
+                                Arg::new("limit")
+                                    .short('l')
+                                    .long("limit")
+                                    .required(true)
+                                    .value_name("SELECTOR")
+                                    .help("Selector: @group, member, or comma-list"),
+                            )
+                            .arg(
+                                Arg::new("dry-activate")
+                                    .long("dry-activate")
+                                    .action(ArgAction::SetTrue)
+                                    .help("Build + copy but do not activate"),
+                            )
+                            .arg(
+                                Arg::new("throttle")
+                                    .long("throttle")
+                                    .value_parser(clap::value_parser!(i64))
+                                    .default_value("4")
+                                    .help("Per-host deploy parallelism"),
                             ),
                     ),
             );
@@ -236,7 +305,13 @@ impl Cli {
                     ExitCode::FAILURE
                 }
             },
-            Some(("tui", m)) => run_tui_shim(&flake, m),
+            Some(("tui", m)) => match &self.tui {
+                Some(launch) => launch(&flake, tui_request(m)),
+                None => {
+                    eprintln!("mandala: the TUI is not available in this build");
+                    ExitCode::FAILURE
+                }
+            },
             Some((name, m)) => match self.engines.iter().find(|e| e.name == name) {
                 Some(engine) => with_inventory(&flake, |inv| (engine.run)(inv, m)),
                 // `subcommand_required` guarantees a matched name is one we
@@ -251,36 +326,21 @@ impl Cli {
     }
 }
 
-/// The argv the `tui` shim forwards to the Python entry point: the resolved
-/// `--flake` (the Python root callback owns that option) then `tui` and every
-/// trailing argument verbatim. Pure builder, unit-testable.
-fn tui_argv(flake: &str, extra: &[String]) -> Vec<String> {
-    let mut argv = vec!["--flake".to_string(), flake.to_string(), "tui".to_string()];
-    argv.extend(extra.iter().cloned());
-    argv
-}
-
-/// Exec the Python TUI (`mandala-py`, overridable via `MANDALA_PY_TUI`). A true
-/// exec — the TUI takes over the terminal, so the shim process must not linger
-/// between it and the tty. Returns only on launch failure.
-fn run_tui_shim(flake: &str, m: &ArgMatches) -> ExitCode {
-    let extra: Vec<String> = m
-        .get_many::<String>("args")
-        .map(|v| v.cloned().collect())
-        .unwrap_or_default();
-    let program = std::env::var("MANDALA_PY_TUI").unwrap_or_else(|_| "mandala-py".to_string());
-    let err = {
-        use std::os::unix::process::CommandExt;
-        std::process::Command::new(&program)
-            .args(tui_argv(flake, &extra))
-            .exec()
-    };
-    eprintln!(
-        "mandala: failed to exec the Python TUI ({program}): {err}\n\
-         (the TUI is served by the Python package until phase 2 — ensure \
-         `mandala-py` is on PATH or set MANDALA_PY_TUI)"
-    );
-    ExitCode::FAILURE
+/// Parse the `tui` subcommand's matches into a [`TuiRequest`] — the pure,
+/// unit-testable half of the launcher seam (the flag/argv plumbing is
+/// asserted here and at the CLI harness; a full TUI launch needs a raw
+/// terminal, so the `mandala-tui` suites cover the app itself).
+fn tui_request(m: &ArgMatches) -> TuiRequest {
+    match m.subcommand() {
+        Some(("deploy", d)) => TuiRequest::Deploy {
+            limit: d.get_one::<String>("limit").cloned().unwrap_or_default(),
+            dry_activate: d.get_flag("dry-activate"),
+            throttle: d.get_one::<i64>("throttle").copied().unwrap_or(4),
+        },
+        _ => TuiRequest::Explorer {
+            debug_mcp: m.get_flag("debug-mcp"),
+        },
+    }
 }
 
 /// The shared `--json` boolean flag.
@@ -660,28 +720,132 @@ mod tests {
 
     // ---- members --json byte-parity -----------------------------------------
 
-    #[test]
-    fn tui_argv_forwards_flake_then_verbatim_args() {
-        assert_eq!(
-            tui_argv(
-                "/fleet",
-                &["--mcp".into(), "--mcp-port".into(), "7979".into()]
-            ),
-            vec!["--flake", "/fleet", "tui", "--mcp", "--mcp-port", "7979"]
-        );
-        assert_eq!(tui_argv(".", &[]), vec!["--flake", ".", "tui"]);
+    // ---- native tui surface (the launcher seam) -----------------------------
+
+    /// Parse a full argv through the root command and hand the `tui`
+    /// matches to [`tui_request`].
+    fn parse_tui(argv: &[&str]) -> TuiRequest {
+        let m = Cli::new()
+            .root_command()
+            .try_get_matches_from(argv)
+            .expect("argv parses");
+        let (name, sub) = m.subcommand().expect("subcommand");
+        assert_eq!(name, "tui");
+        tui_request(sub)
     }
 
     #[test]
-    fn tui_subcommand_captures_hyphen_args() {
-        let cmd = Cli::new().root_command();
-        let m = cmd
-            .try_get_matches_from(["mandala", "tui", "--mcp", "--mcp-port", "7979"])
-            .expect("tui accepts forwarded hyphen args");
-        let (name, sub) = m.subcommand().expect("subcommand");
-        assert_eq!(name, "tui");
-        let args: Vec<&String> = sub.get_many::<String>("args").unwrap().collect();
-        assert_eq!(args, ["--mcp", "--mcp-port", "7979"]);
+    fn tui_parses_the_explorer_surface() {
+        assert_eq!(
+            parse_tui(&["mandala", "tui"]),
+            TuiRequest::Explorer { debug_mcp: false }
+        );
+        assert_eq!(
+            parse_tui(&["mandala", "tui", "--debug-mcp"]),
+            TuiRequest::Explorer { debug_mcp: true }
+        );
+    }
+
+    #[test]
+    fn tui_deploy_parses_limit_dry_activate_throttle() {
+        assert_eq!(
+            parse_tui(&["mandala", "tui", "deploy", "-l", "@k3s", "--dry-activate"]),
+            TuiRequest::Deploy {
+                limit: "@k3s".into(),
+                dry_activate: true,
+                throttle: 4, // the Python default
+            }
+        );
+        assert_eq!(
+            parse_tui(&[
+                "mandala",
+                "tui",
+                "deploy",
+                "--limit",
+                "web",
+                "--throttle",
+                "8"
+            ]),
+            TuiRequest::Deploy {
+                limit: "web".into(),
+                dry_activate: false,
+                throttle: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn tui_retired_python_flags_are_usage_errors() {
+        // The context makes hosting automatic and the HTTP MCP endpoint is
+        // gone — a stale invocation must FAIL, not be silently ignored.
+        for argv in [
+            vec!["mandala", "tui", "--mcp"],
+            vec!["mandala", "tui", "--mcp-port", "7979"],
+            vec!["mandala", "tui", "--mcp-rotate-token"],
+        ] {
+            let err = Cli::new()
+                .root_command()
+                .try_get_matches_from(&argv)
+                .expect_err("retired flag must error");
+            assert!(err.use_stderr(), "usage error expected for {argv:?}");
+        }
+    }
+
+    #[test]
+    fn tui_deploy_requires_a_limit() {
+        Cli::new()
+            .root_command()
+            .try_get_matches_from(["mandala", "tui", "deploy"])
+            .expect_err("-l/--limit is required");
+    }
+
+    #[test]
+    fn tui_launcher_receives_flake_and_request() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let seen: Rc<RefCell<Vec<(String, TuiRequest)>>> = Rc::default();
+
+        let record = Rc::clone(&seen);
+        let rc = Cli::new()
+            .tui_launcher(move |flake, req| {
+                record.borrow_mut().push((flake.to_string(), req));
+                ExitCode::SUCCESS
+            })
+            .run_from(["mandala", "-f", "/fleet", "tui", "--debug-mcp"]);
+        assert_eq!(rc, ExitCode::SUCCESS);
+
+        // The launcher's exit code IS the command's (deploy: run rc).
+        let record = Rc::clone(&seen);
+        let rc = Cli::new()
+            .tui_launcher(move |flake, req| {
+                record.borrow_mut().push((flake.to_string(), req));
+                ExitCode::from(3)
+            })
+            .run_from(["mandala", "tui", "deploy", "-l", "@k3s"]);
+        assert_eq!(rc, ExitCode::from(3));
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (
+                    "/fleet".to_string(),
+                    TuiRequest::Explorer { debug_mcp: true }
+                ),
+                (
+                    ".".to_string(),
+                    TuiRequest::Deploy {
+                        limit: "@k3s".into(),
+                        dry_activate: false,
+                        throttle: 4,
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tui_without_a_launcher_fails_cleanly() {
+        assert_eq!(Cli::new().run_from(["mandala", "tui"]), ExitCode::FAILURE);
     }
 
     #[test]
