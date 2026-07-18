@@ -153,13 +153,24 @@ async fn join_context(flake: &str) -> Option<ContextSession> {
 /// Blocking entry point for the `mandala mcp` subcommand: owns the tokio
 /// runtime so the binary's `main` stays synchronous.
 ///
+/// Bounded teardown (the TUI 7.4 quit-hang finding, same class here): after
+/// the conversation ends — the orderly context shutdown included — any eval
+/// still blocked in the worker roundtrip's synchronous stdout read on the
+/// blocking pool would hold `Runtime` drop (and process exit) hostage until
+/// the eval completed. Kill the worker child(ren) and latch respawns off,
+/// then hard-bound the runtime shutdown. Deploy/ansible children are never
+/// touched (orphan-run semantics stay load-bearing).
+///
 /// # Errors
 /// Propagates any runtime-build or transport error.
 pub fn serve_stdio_blocking(flake: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async { run_stdio(flake).await })?;
+    let result = rt.block_on(async { run_stdio(flake).await });
+    mandala_core::eval::shutdown_workers();
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    result?;
     Ok(())
 }
 

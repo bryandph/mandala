@@ -175,5 +175,9 @@ pub fn run_deploy_blocking(cfg: DeployConfig) -> io::Result<i64> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_deploy(cfg))
+    let result = rt.block_on(run_deploy(cfg));
+    // Same bounded teardown as the explorer entry (the 7.4 quit-hang
+    // finding): never let a lingering blocking-pool task hold process exit.
+    rt.shutdown_timeout(crate::explorer::RUNTIME_TEARDOWN_BOUND);
+    result
 }

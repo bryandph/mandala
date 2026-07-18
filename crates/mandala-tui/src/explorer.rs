@@ -133,9 +133,27 @@ pub async fn run_explorer(cfg: ExplorerConfig) -> io::Result<()> {
     let mut events = EventStream::new();
     let result = app.run(&mut terminal, &mut events).await;
     app.shutdown_context(crate::context::SHUTDOWN_GRACE).await;
+    // Unblock any in-flight eval BEFORE the runtime tears down (the 7.4
+    // quit-hang live finding): a worker roundtrip blocked in its synchronous
+    // stdout read on the blocking pool would otherwise hold `Runtime` drop —
+    // and with it process exit — hostage until the eval completed. Killing
+    // the worker child(ren) EOFs the read and latches respawns off; the
+    // stuck job settles with an eval error nobody is left to read. Runs
+    // launched for deploy/ansible children are NOT touched — their
+    // orphan-run semantics stay load-bearing.
+    mandala_core::eval::shutdown_workers();
     drop(app); // restores the terminal via the guard
     result
 }
+
+/// Hard bound on runtime teardown after the loop returns: `Runtime` drop
+/// waits for running blocking-pool tasks, and quit must complete in bounded
+/// time from ANY state. [`run_explorer`]'s worker kill settles the known
+/// blocker (the eval read) in milliseconds; this bound is the backstop for
+/// anything else on the pool (a wedged `git rev-parse`, a slow snapshot
+/// read) — after it, remaining blocking threads are abandoned and the
+/// process exits.
+pub(crate) const RUNTIME_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
 
 /// As [`run_explorer`], hosting its own current-thread runtime — the
 /// `mandala tui` bin entry (the [`mandala_mcp::serve_stdio_blocking`]
@@ -148,7 +166,9 @@ pub fn run_explorer_blocking(cfg: ExplorerConfig) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_explorer(cfg))
+    let result = rt.block_on(run_explorer(cfg));
+    rt.shutdown_timeout(RUNTIME_TEARDOWN_BOUND);
+    result
 }
 
 // ---- aggregate load ---------------------------------------------------------

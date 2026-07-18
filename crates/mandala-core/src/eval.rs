@@ -19,8 +19,44 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value as Json;
+
+/// Process-wide teardown latch: once set, no evaluator in this process will
+/// ever spawn another worker (see [`shutdown_workers`]).
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Pids of live (spawned, not yet reaped) worker children. A pid is inserted
+/// under this lock at spawn and removed under it BEFORE the owning
+/// [`Worker`]'s drop reaps — so a pid seen here by [`shutdown_workers`] can
+/// never be a recycled pid of some unrelated process.
+static LIVE_WORKERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Terminal, process-wide eval teardown: latch respawns off, then kill every
+/// live worker child.
+///
+/// The quit-hang fix (OpenSpec `mandala-native-tui`, 7.4 live finding): a
+/// caller blocked in the worker roundtrip's synchronous stdout read — on the
+/// tokio blocking pool, holding `Runtime` drop and with it process exit
+/// hostage until the eval completes — unblocks at the killed child's EOF;
+/// the respawn retry then fails fast on the latch instead of starting a
+/// fresh eval. Call only on the way OUT of the process (the TUI's and the
+/// stdio server's quit paths): after this, every eval in this process fails.
+///
+/// # Panics
+/// The worker registry lock is poisoned.
+pub fn shutdown_workers() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    let live = LIVE_WORKERS.lock().expect("worker registry poisoned");
+    for &pid in live.iter() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
 
 /// A human-readable evaluation error.
 pub type EvalError = String;
@@ -235,14 +271,36 @@ impl Worker {
         } else {
             Stdio::inherit()
         };
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("evaluator shut down".to_string());
+        }
         let mut child = Command::new(&bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
-        let stdin = child.stdin.take().ok_or("worker stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("worker stdout unavailable")?;
+        let reject = |mut child: Child, why: &str| {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(why.to_string())
+        };
+        let Some(stdin) = child.stdin.take() else {
+            return reject(child, "worker stdin unavailable");
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return reject(child, "worker stdout unavailable");
+        };
+        // Register under the lock, re-checking the latch: a kill sweep
+        // racing this spawn must never miss the child.
+        {
+            let mut live = LIVE_WORKERS.lock().expect("worker registry poisoned");
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                drop(live);
+                return reject(child, "evaluator shut down");
+            }
+            live.push(child.id());
+        }
         Ok(Self {
             child,
             stdin,
@@ -276,8 +334,15 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Closing stdin makes the worker exit on EOF; reap it so it never
-        // lingers as a zombie.
+        // Deregister BEFORE reaping: a pid still in the registry is
+        // guaranteed unreaped, so `shutdown_workers`' kill can never hit a
+        // recycled pid.
+        {
+            let mut live = LIVE_WORKERS.lock().expect("worker registry poisoned");
+            let pid = self.child.id();
+            live.retain(|&p| p != pid);
+        }
+        // Reap it so it never lingers as a zombie.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -367,6 +432,10 @@ fn subprocess_expected_toplevels(
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate `MANDALA_EVAL_WORKER` (tests in one
+    /// binary run concurrently; process env is shared).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn backend_from_env_defaults_to_worker() {
         // We can't safely mutate process env in parallel tests; assert the
@@ -384,9 +453,56 @@ mod tests {
 
     #[test]
     fn worker_binary_honours_override() {
-        // Set + read within one test; no other test touches this var.
+        let _env = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe { std::env::set_var("MANDALA_EVAL_WORKER", "/opt/custom/worker") };
         assert_eq!(worker_binary(), PathBuf::from("/opt/custom/worker"));
         unsafe { std::env::remove_var("MANDALA_EVAL_WORKER") };
+    }
+
+    /// The quit-hang regression (7.4 live finding): a call blocked in the
+    /// worker roundtrip's synchronous stdout read must settle promptly once
+    /// [`shutdown_workers`] kills the child and latches respawns off —
+    /// otherwise the read holds the tokio blocking pool (and `Runtime`
+    /// drop, and process exit) hostage until the eval completes.
+    ///
+    /// NOTE: the latch is terminal for the whole test process — this must
+    /// stay the only test in this binary that spawns a real worker.
+    #[test]
+    fn shutdown_workers_unblocks_a_stuck_roundtrip() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let _env = ENV_LOCK.lock().expect("env lock poisoned");
+        let dir =
+            std::env::temp_dir().join(format!("mandala-eval-shutdown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("stuck-worker.sh");
+        // A worker that never answers: the roundtrip blocks in read_line.
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").expect("write stub");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        unsafe { std::env::set_var("MANDALA_EVAL_WORKER", &script) };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut evaluator = Evaluator::new(Backend::Worker).quiet();
+            let _ = tx.send(evaluator.aggregate("/nonexistent-flake"));
+        });
+        // Let the call reach the blocking read on the stub's stdout.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        shutdown_workers();
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stuck eval settles after shutdown_workers");
+        assert!(result.is_err(), "the aborted eval surfaces an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown-to-settle stayed bounded ({:?})",
+            started.elapsed()
+        );
+
+        unsafe { std::env::remove_var("MANDALA_EVAL_WORKER") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
