@@ -1,6 +1,6 @@
 //! Built-in, fleet-generic effect engines (`deploy`, `ansible`).
 //!
-//! Parity ports of `cli/src/mandala_fleet/engines/{deploy,ansible}.py`. Both are
+//! Parity ports of the retired Python `mandala_fleet.engines.{deploy,ansible}`. Both are
 //! thin dispatch shells: they resolve selectors / read projections off the
 //! in-process [`crate::inventory::Inventory`] and shell out to the real
 //! machinery (`ansible-playbook mandala.fleet.deploy`, `nix build

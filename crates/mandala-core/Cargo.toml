@@ -7,14 +7,6 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
-# The direction-B interop driver (fleet-state-formats spec): drives the
-# real `CommandRun`/`DeployRun` writers so the Python pytest suite can
-# attach to Rust-produced runs. NOT part of the user-facing CLI surface —
-# the nix package relocates it to `libexec/` and only the `mandala-interop`
-# flake check invokes it (via `MANDALA_RS_INTEROP_BIN`).
-[[bin]]
-name = "mandala-interop-helper"
-path = "src/bin/interop_helper.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

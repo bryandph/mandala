@@ -1,6 +1,6 @@
 //! The clap CLI: the root fleet views plus compile-time engine composition.
 //!
-//! A parity port of `cli/src/mandala_fleet/cli.py`. The root command owns the
+//! A parity port of the retired Python `mandala_fleet.cli`. The root command owns the
 //! fleet-generic views that come straight off the inventory core — `members`,
 //! `groups`, `resolve`, `drift`, `version` — plus the `mcp` stdio server and
 //! the native `tui` (both launched through closures the binary wires in, so

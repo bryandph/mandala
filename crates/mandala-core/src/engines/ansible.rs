@@ -1,6 +1,6 @@
 //! Built-in `ansible` engine: views over the inventory projection.
 //!
-//! Parity port of `cli/src/mandala_fleet/engines/ansible.py`. One subcommand,
+//! Parity port of the retired Python `mandala_fleet.engines.ansible`. One subcommand,
 //! `inventory`, prints the projected ansible dynamic-inventory data as
 //! `json.dumps(..., indent=2, sort_keys=True)` — or errors to stderr and exits
 //! 1 when the aggregate carries no `ansibleInventory` projection.

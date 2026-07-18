@@ -1,6 +1,6 @@
 //! Inventory: the one typed read path onto a fleet.
 //!
-//! A parity port of `cli/src/mandala_fleet/inventory.py`. Everything the CLI
+//! A parity port of the retired Python `mandala_fleet.inventory`. Everything the CLI
 //! (and every engine) knows about a fleet comes from the versioned aggregate
 //! the fleet flakeModule emits — `<flake>#mandala`, produced here by
 //! [`crate::eval::Evaluator`]. One eval, pure data, gated by `schemaVersion`.
@@ -29,8 +29,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The aggregate schema version this build understands (mirrors the Python
-/// `SUPPORTED_SCHEMA_VERSION` in `cli/src/mandala_fleet/__init__.py`). Anything
+/// The aggregate schema version this build understands (the retired Python
+/// package's `SUPPORTED_SCHEMA_VERSION`, carried forward). Anything
 /// else is rejected at [`Inventory`] construction rather than misread.
 pub const SUPPORTED_SCHEMA_VERSION: u64 = 1;
 
@@ -383,7 +383,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The injected aggregate from `cli/tests/test_inventory.py` (`_inv`):
+    /// The injected aggregate from the retired Python `test_inventory.py` (`_inv`):
     /// members web/cache/router, groups k3s=[cache,web], gateway=[router].
     fn test_inv() -> Inventory {
         Inventory::from_value(json!({

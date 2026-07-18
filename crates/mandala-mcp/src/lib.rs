@@ -1,9 +1,10 @@
 //! mandala-mcp — the stdio MCP server over the fleet cores.
 //!
 //! The full 12-tool surface (OpenSpec change `mandala-rust-rewrite`, section
-//! 4), at result-shape parity with the Python FastMCP server (golden fixtures
-//! under `cli/tests/fixtures/mcp/` are the oracle — see
-//! `tests/parity.rs`). Reads: `members`, `groups`, `resolve`, `ping`,
+//! 4), originally ported at result-shape parity with the retired Python
+//! FastMCP server; the surviving parity gate is leader-served vs
+//! follower-proxied byte-identity (`tests/parity_proxy.rs`). Reads:
+//! `members`, `groups`, `resolve`, `ping`,
 //! `host_eval`, `drift`, `reload`. Actions: `deploy_status`, `build`,
 //! `deploy`, `restart_service`, `reboot` — the gated three refuse without a
 //! `confirm` equal to the resolved `--limit`.

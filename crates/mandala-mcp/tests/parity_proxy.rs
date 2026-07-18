@@ -1,26 +1,29 @@
-//! Golden-fixture parity OVER THE PROXY HOP (OpenSpec change
-//! `mandala-native-tui`, task 3.2 — the fleet-mcp "Tool-surface parity"
-//! requirement now covering the follower path).
+//! Leader-vs-follower parity OVER THE PROXY HOP (OpenSpec change
+//! `mandala-native-tui`, task 3.2; reworked in task 7.5 — the fleet-mcp
+//! "Tool-surface parity" gate, now SELF-GATING: the retired Python package's
+//! captured fixture oracle went with it (operator decision), so parity means
+//! the proxy hop is invisible — a follower-forwarded call returns
+//! byte-identical results to the same call served leader-locally).
 //!
-//! The same 22 fixture scenarios `tests/parity.rs` replays against the
-//! directly-served handler are replayed here through a REAL context endpoint:
-//! a leader hosts the scenario handler behind the coordination endpoint, and
-//! a `ContextSession` follower (a second `mandala mcp` instance in miniature)
-//! forwards every call. Each scenario is gated against the golden fixture
-//! with the shared normalization (`tests/common/`), and every READ fixture is
-//! additionally issued through the leader-local seam (`LocalContext` over the
-//! same dispatch) and compared BYTE-identically with the forwarded result —
-//! the proxy hop must be invisible. Mutations execute exactly once (through
-//! the follower; double-execution would corrupt the registry sequence the
-//! `deploy_status.list` fixture encodes) — their leader-local gate is
-//! `parity.rs` itself.
+//! The full 12-tool surface runs through a REAL context endpoint: a leader
+//! hosts the scenario handler behind the coordination endpoint, and a
+//! `ContextSession` follower (a second `mandala mcp` instance in miniature)
+//! forwards every call. Every READ is issued through BOTH seams
+//! (`ContextSession` and `LocalContext` over the same dispatch) and the two
+//! full serialized `CallToolResult`s must be byte-identical. Mutations cover
+//! the hop two ways: their effect-free refusal/error paths run through both
+//! seams (byte-identical — they touch no registry state), while the
+//! effectful ok paths execute exactly ONCE, through the follower
+//! (double-execution would corrupt the registry sequence the later
+//! `deploy_status` reads observe).
 //!
-//! Also asserted, because only the proxy hop produces them: every mutating
-//! settle in the leader's audit trail carries the follower's hello identity
-//! as `origin` (fleet-context: "labeled with their originating client"), and
-//! the follower-initiated `reload` swaps the LEADER's inventory so every
-//! subsequent call — all executed at the leader — sees the fresh contract
-//! (task 3.1's reload semantics).
+//! Also asserted, because only the proxy hop produces them: every forwarded
+//! mutating settle in the leader's audit trail carries the follower's hello
+//! identity as `origin` (fleet-context: "labeled with their originating
+//! client") while seam-local settles carry none, and the follower-initiated
+//! `reload` swaps the LEADER's inventory so every subsequent call — all
+//! executed at the leader — sees the fresh contract (task 3.1's reload
+//! semantics).
 //!
 //! One test fn: the process-global `MANDALA_FLEET_STATE` seam cannot race.
 
@@ -38,7 +41,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 mod common;
-use common::{CommandFake, EventLog, FakeEffects, check, handler, load_fixture, spacer};
+use common::{CommandFake, EventLog, FakeEffects, handler, spacer};
 
 /// The swappable per-scenario handler the leader's one dispatch delegates to.
 type Slot = Arc<RwLock<Option<Arc<MandalaHandler>>>>;
@@ -66,8 +69,7 @@ fn slot_dispatch(slot: Slot) -> mandala_context::Dispatch {
 }
 
 /// One call through a seam: the full serialized `CallToolResult` on success,
-/// the tool-error message on failure (the same surface `common::call` reads
-/// off the direct handler).
+/// the tool-error message on failure.
 async fn fcall(ctx: &dyn FleetContext, tool: &str, args: &Value) -> Result<Value, String> {
     let map = args.as_object().cloned().unwrap_or_default();
     match ctx.call(tool, map, tool_is_idempotent(tool)).await {
@@ -84,9 +86,22 @@ fn structured(v: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// The result is a non-empty JSON object — the shape floor for every tool's
+/// structured content (finer shape gates live in the server's unit tests and
+/// `mcp_stdio.rs`).
+fn assert_shaped(tool: &str, v: &Value) {
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("{tool}: structured result must be an object: {v}"));
+    assert!(
+        !obj.is_empty(),
+        "{tool}: structured result must be non-empty"
+    );
+}
+
 /// A READ through BOTH seams: forwarded first, then leader-local; the two
 /// full results must be byte-identical (the proxy hop is invisible). Returns
-/// the structured content for the fixture check.
+/// the structured content.
 async fn read_both(
     follower: &dyn FleetContext,
     local: &dyn FleetContext,
@@ -101,14 +116,44 @@ async fn read_both(
         serde_json::to_string(&loc).unwrap(),
         "{tool}: forwarded and leader-served results must be byte-identical"
     );
-    structured(&fwd)
+    let s = structured(&fwd);
+    assert_shaped(tool, &s);
+    s
+}
+
+/// An effect-free MUTATION path (refusal / unavailability error) through
+/// BOTH seams: forwarded first, then leader-local; the outcomes must be
+/// identical. Only refusal/error paths qualify — they touch no registry
+/// state, so running them twice is safe (each lands its own audit line at
+/// the leader, accounted for below).
+async fn refuse_both(
+    follower: &dyn FleetContext,
+    local: &dyn FleetContext,
+    tool: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let fwd = fcall(follower, tool, args).await;
+    let loc = fcall(local, tool, args).await;
+    match (&fwd, &loc) {
+        (Ok(f), Ok(l)) => assert_eq!(
+            serde_json::to_string(f).unwrap(),
+            serde_json::to_string(l).unwrap(),
+            "{tool}: forwarded and leader-served refusals must be byte-identical"
+        ),
+        (Err(f), Err(l)) => assert_eq!(
+            f, l,
+            "{tool}: forwarded and leader-served errors must be identical"
+        ),
+        _ => panic!("{tool}: seams disagree — forwarded {fwd:?} vs leader-local {loc:?}"),
+    }
+    fwd
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn golden_fixture_parity_through_the_proxy_hop() {
+async fn leader_and_follower_paths_are_byte_identical() {
     // Isolated state (registry, audit, drift, context discovery) — its own
-    // dir so the registry sequence matches the list fixture exactly, same as
-    // parity.rs.
+    // dir so the registry sequence the deploy_status reads observe is exactly
+    // what this test produced.
     let scratch = std::env::temp_dir().join(format!(
         "mandala-mcp-parity-proxy-{}-{:?}",
         std::process::id(),
@@ -150,23 +195,25 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
     let local: &dyn FleetContext = &local_seam;
 
     let events: EventLog = Arc::new(Mutex::new(Vec::new()));
-    let mut failures: Vec<String> = Vec::new();
 
     // ---- reads --------------------------------------------------------------
     install(&slot, handler(FakeEffects::default(), &events));
-    for (fixture, tool, args) in [
-        ("members.compact", "members", json!({})),
-        ("members.full", "members", json!({"full": true})),
-        ("groups.ok", "groups", json!({})),
-        (
-            "resolve.ok",
-            "resolve",
-            json!({"selector": "all,!@gateway"}),
-        ),
-    ] {
-        let actual = read_both(follower, local, tool, &args).await;
-        check(&mut failures, fixture, &actual);
-    }
+    let members = read_both(follower, local, "members", &json!({})).await;
+    assert_eq!(
+        members.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["cache", "router", "web"]
+    );
+    read_both(follower, local, "members", &json!({"full": true})).await;
+    let groups = read_both(follower, local, "groups", &json!({})).await;
+    assert!(groups.get("k3s").is_some(), "groups: {groups}");
+    let resolved = read_both(
+        follower,
+        local,
+        "resolve",
+        &json!({"selector": "all,!@gateway"}),
+    )
+    .await;
+    assert_eq!(resolved["members"], json!(["cache", "web"]));
 
     // ---- ping ---------------------------------------------------------------
     install(
@@ -184,13 +231,11 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &events,
         ),
     );
-    let actual = read_both(follower, local, "ping", &json!({"selector": "@k3s"})).await;
-    check(&mut failures, "ping.mixed", &actual);
+    read_both(follower, local, "ping", &json!({"selector": "@k3s"})).await;
 
     // ---- host_eval ----------------------------------------------------------
     install(&slot, handler(FakeEffects::default(), &events));
-    let actual = read_both(follower, local, "host_eval", &json!({"member": "web"})).await;
-    check(&mut failures, "host_eval.ok", &actual);
+    read_both(follower, local, "host_eval", &json!({"member": "web"})).await;
 
     install(
         &slot,
@@ -210,14 +255,13 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &events,
         ),
     );
-    let actual = read_both(
+    read_both(
         follower,
         local,
         "host_eval",
         &json!({"member": "web", "toplevel": true}),
     )
     .await;
-    check(&mut failures, "host_eval.eval_error", &actual);
 
     // ---- drift --------------------------------------------------------------
     install(
@@ -230,10 +274,8 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &events,
         ),
     );
-    let actual = read_both(follower, local, "drift", &json!({})).await;
-    check(&mut failures, "drift.ok", &actual);
-    let actual = read_both(follower, local, "drift", &json!({"statuses": ["drift"]})).await;
-    check(&mut failures, "drift.filtered", &actual);
+    read_both(follower, local, "drift", &json!({})).await;
+    read_both(follower, local, "drift", &json!({"statuses": ["drift"]})).await;
 
     install(
         &slot,
@@ -250,8 +292,7 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &events,
         ),
     );
-    let actual = read_both(follower, local, "drift", &json!({"do_eval": true})).await;
-    check(&mut failures, "drift.eval_error", &actual);
+    read_both(follower, local, "drift", &json!({"do_eval": true})).await;
 
     // ---- reload (executes AT the leader; forwarded like any mutation) -------
     install(
@@ -269,12 +310,12 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &events,
         ),
     );
-    let actual = structured(
+    let reloaded = structured(
         &fcall(follower, "reload", &json!({}))
             .await
-            .expect("reload.ok"),
+            .expect("reload ok"),
     );
-    check(&mut failures, "reload.ok", &actual);
+    assert_shaped("reload", &reloaded);
     // The LEADER's inventory swapped: every instance's subsequent calls see
     // the fresh contract — the follower's next read AND the leader-local seam
     // (byte-identically), since they all execute at the leader.
@@ -289,29 +330,53 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
         &slot,
         handler(FakeEffects::default(), &events).reloadable(false),
     );
-    let err = fcall(follower, "reload", &json!({}))
+    let err = refuse_both(follower, local, "reload", &json!({}))
         .await
         .expect_err("reload must refuse on a non-reloadable host");
-    let fixture = load_fixture("reload.unavailable_error");
-    if json!({"tool_error": err}) != fixture {
-        failures.push(format!(
-            "reload.unavailable_error: MISMATCH\n  actual:  {err}\n  fixture: {fixture}"
-        ));
-    }
+    assert!(
+        !err.is_empty(),
+        "reload unavailability must carry a message"
+    );
 
-    // ---- actions (through the follower — executed once, at the leader) ------
+    // ---- actions: refusal paths through BOTH seams (effect-free) ------------
     install(&slot, handler(FakeEffects::default(), &events));
-    let actual = structured(
-        &fcall(
+    let refused = structured(
+        &refuse_both(
             follower,
+            local,
             "deploy",
             &json!({"selector": "@k3s", "dry_activate": false}),
         )
         .await
-        .expect("deploy.refused"),
+        .expect("deploy refusal is a structured result"),
     );
-    check(&mut failures, "deploy.refused", &actual);
+    assert_shaped("deploy", &refused);
 
+    let refused = structured(
+        &refuse_both(
+            follower,
+            local,
+            "restart_service",
+            &json!({"selector": "@k3s", "unit": "k3s"}),
+        )
+        .await
+        .expect("restart_service refusal is a structured result"),
+    );
+    assert_shaped("restart_service", &refused);
+
+    let refused = structured(
+        &refuse_both(
+            follower,
+            local,
+            "reboot",
+            &json!({"selector": "@k3s", "confirm": "web"}),
+        )
+        .await
+        .expect("reboot refusal is a structured result"),
+    );
+    assert_shaped("reboot", &refused);
+
+    // ---- actions: ok paths through the follower — executed exactly once -----
     install(
         &slot,
         handler(
@@ -325,22 +390,10 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
     let actual = structured(
         &fcall(follower, "deploy", &json!({"selector": "@k3s"}))
             .await
-            .expect("deploy.dry_ok"),
+            .expect("dry deploy ok"),
     );
-    check(&mut failures, "deploy.dry_ok", &actual);
+    assert_shaped("deploy", &actual);
     spacer().await;
-
-    install(&slot, handler(FakeEffects::default(), &events));
-    let actual = structured(
-        &fcall(
-            follower,
-            "restart_service",
-            &json!({"selector": "@k3s", "unit": "k3s"}),
-        )
-        .await
-        .expect("restart_service.refused"),
-    );
-    check(&mut failures, "restart_service.refused", &actual);
 
     install(
         &slot,
@@ -363,21 +416,9 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &json!({"selector": "@k3s", "unit": "k3s", "confirm": "cache,web"}),
         )
         .await
-        .expect("restart_service.partial"),
+        .expect("restart_service partial ok"),
     );
-    check(&mut failures, "restart_service.partial", &actual);
-
-    install(&slot, handler(FakeEffects::default(), &events));
-    let actual = structured(
-        &fcall(
-            follower,
-            "reboot",
-            &json!({"selector": "@k3s", "confirm": "web"}),
-        )
-        .await
-        .expect("reboot.refused"),
-    );
-    check(&mut failures, "reboot.refused", &actual);
+    assert_shaped("restart_service", &actual);
 
     install(
         &slot,
@@ -397,9 +438,9 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             &json!({"selector": "@k3s", "serial": "2", "confirm": "cache,web"}),
         )
         .await
-        .expect("reboot.ok"),
+        .expect("reboot ok"),
     );
-    check(&mut failures, "reboot.ok", &actual);
+    assert_shaped("reboot", &actual);
     spacer().await;
 
     install(
@@ -415,9 +456,9 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
     let actual = structured(
         &fcall(follower, "build", &json!({"selector": "@k3s"}))
             .await
-            .expect("build.ok"),
+            .expect("build ok"),
     );
-    check(&mut failures, "build.ok", &actual);
+    assert_shaped("build", &actual);
     spacer().await;
 
     // ---- deploy_status ------------------------------------------------------
@@ -436,14 +477,13 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
     .unwrap();
 
     install(&slot, handler(FakeEffects::default(), &events));
-    let actual = read_both(
+    read_both(
         follower,
         local,
         "deploy_status",
         &json!({"run_id": cmd_run_id}),
     )
     .await;
-    check(&mut failures, "deploy_status.command", &actual);
     spacer().await;
 
     let (dep_run_id, dep_path) = registry::new_run_dir().unwrap();
@@ -467,23 +507,18 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
             .unwrap();
         }
     }
-    let actual = read_both(
+    read_both(
         follower,
         local,
         "deploy_status",
         &json!({"run_id": dep_run_id}),
     )
     .await;
-    check(&mut failures, "deploy_status.deploy", &actual);
 
-    let actual = read_both(follower, local, "deploy_status", &json!({"limit": 5})).await;
-    check(&mut failures, "deploy_status.list", &actual);
-
+    let listing = read_both(follower, local, "deploy_status", &json!({"limit": 5})).await;
     assert!(
-        failures.is_empty(),
-        "{} fixture mismatches through the proxy hop:\n\n{}",
-        failures.len(),
-        failures.join("\n\n")
+        listing["runs"].as_array().is_some_and(|r| !r.is_empty()),
+        "the accumulated registry sequence must list: {listing}"
     );
 
     // ---- origin labeling ----------------------------------------------------
@@ -514,10 +549,14 @@ async fn golden_fixture_parity_through_the_proxy_hop() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
         .collect();
-    // deploy ×2 (refused + dry), restart_service ×2, reboot ×2, reload ×2
-    // (ok + unavailable error) — all forwarded, all origin-labeled.
-    assert_eq!(audit.len(), 8, "audit lines: {audit_text}");
-    for line in &audit {
+    // Forwarded (origin-labeled): deploy ×2 (refused + dry), restart_service
+    // ×2 (refused + partial), reboot ×2 (refused + ok), reload ×2 (ok +
+    // unavailable). Leader-local (no origin): the 4 seam-side refusal/error
+    // replays (deploy, restart_service, reboot, reload-unavailable).
+    let (forwarded, seam): (Vec<_>, Vec<_>) = audit.iter().partition(|l| l.get("origin").is_some());
+    assert_eq!(forwarded.len(), 8, "audit lines: {audit_text}");
+    assert_eq!(seam.len(), 4, "audit lines: {audit_text}");
+    for line in &forwarded {
         assert_eq!(
             line["origin"], "parity-follower",
             "a forwarded mutating settle must record its originating client: {line}"

@@ -9,11 +9,6 @@ pub mod inventory;
 pub mod registry;
 pub mod runner;
 
-// Direction-A interop golden tests over the Python-written fixture tree
-// (fleet-state-formats spec) — test-only, kept in its own file.
-#[cfg(test)]
-mod interop_tests;
-
 pub use cli::{Cli, Engine, TuiRequest};
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};

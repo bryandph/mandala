@@ -1,3 +1,0 @@
-{"v":2,"ts":1767225615.5,"host":"controller","plugin":"build","event":"status","cmd":["nix","build","--no-link"],"state":"start"}
-{"v":2,"ts":1767225615.75,"host":"controller","plugin":"build","event":"line","line":"error: builder for '/nix/store/zz-oops.drv' failed","stream":"nix"}
-{"v":2,"ts":1767225616.0,"host":"controller","plugin":"build","event":"status","rc":2,"state":"done"}

@@ -1,10 +1,9 @@
-//! Shared golden-fixture parity harness: the fixture loader, the volatile-
-//! field normalization, the injected fleet, and the fake effects — extracted
-//! from `tests/parity.rs` so `tests/parity_proxy.rs` replays the SAME
-//! scenarios through the context proxy hop (OpenSpec change
-//! `mandala-native-tui`, task 3.2). The fakes mirror exactly what the Python
-//! capture (`capture_fixtures.py`) monkeypatched; see `parity.rs` for the
-//! full provenance notes.
+//! Shared parity harness: the injected fleet and the fake effects driving
+//! the leader-vs-follower parity suite (`tests/parity_proxy.rs`) and the
+//! failover drills (`tests/mcp_failover.rs`). The fakes mirror what the
+//! retired Python capture script monkeypatched (subprocess/eval/launch
+//! seams) — provenance in git history (the pre-removal Python tree at rev
+//! `ab5bba36e1a1ac6fc13f336c06c6f9e485720252`).
 
 #![allow(dead_code)] // each test binary uses its own subset
 
@@ -24,45 +23,7 @@ use mandala_mcp::effects::{
 };
 use serde_json::{Value, json};
 
-// ---- fixtures + normalization ----------------------------------------------
-
-pub fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cli/tests/fixtures/mcp")
-}
-
-pub fn load_fixture(name: &str) -> Value {
-    let path = fixtures_dir().join(format!("{name}.json"));
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing fixture {name}: {e}"))
-}
-
-/// Blank out volatile identifiers on BOTH sides the way
-/// `capture_fixtures.py`'s `_norm` does (plus `started_at`/`finished_at`,
-/// which the capture left as real floats — the README lists them volatile).
-pub fn normalize(v: &Value) -> Value {
-    match v {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, val)| {
-                    let nv = match k.as_str() {
-                        "run_id" | "events_dir" => json!("<run-id>"),
-                        "log" => json!("<state-dir>/runs/<run-id>/output.log"),
-                        "elapsed" | "started_at" | "finished_at" => json!(0.0),
-                        "ts" => json!(0),
-                        "pid" => Value::Null,
-                        _ => normalize(val),
-                    };
-                    (k.clone(), nv)
-                })
-                .collect(),
-        ),
-        Value::Array(arr) => Value::Array(arr.iter().map(normalize).collect()),
-        other => other.clone(),
-    }
-}
-
-// ---- the injected fleet (capture_fixtures.py `_inv`) ------------------------
+// ---- the injected fleet -----------------------------------------------------
 
 pub fn base_aggregate() -> Value {
     json!({
@@ -257,29 +218,9 @@ pub fn handler(effects: FakeEffects, events: &EventLog) -> MandalaHandler {
         }))
 }
 
-pub async fn call(h: &MandalaHandler, name: &str, args: Value) -> Result<Value, String> {
-    let map = args.as_object().cloned().unwrap_or_default();
-    match h.call_tool(name, map).await {
-        Ok(res) => Ok(Value::Object(res.structured_content.unwrap_or_default())),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-pub fn check(failures: &mut Vec<String>, name: &str, actual: &Value) {
-    let fixture = load_fixture(name);
-    let (a, f) = (normalize(actual), normalize(&fixture));
-    if a != f {
-        failures.push(format!(
-            "{name}: MISMATCH\n  actual:  {}\n  fixture: {}",
-            serde_json::to_string_pretty(&a).unwrap_or_default(),
-            serde_json::to_string_pretty(&f).unwrap_or_default(),
-        ));
-    }
-}
-
 /// Run-ids carry microsecond timestamps; space out run allocations so the
-/// registry's most-recent-first ordering (which the list fixture encodes) is
-/// deterministic.
+/// registry's most-recent-first ordering (which the `deploy_status` listing
+/// reads observe) is deterministic.
 pub async fn spacer() {
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 }

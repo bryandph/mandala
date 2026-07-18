@@ -1,1 +1,0 @@
-$ nix build --no-link --print-out-paths .#deployBatch.all  (cwd=.)

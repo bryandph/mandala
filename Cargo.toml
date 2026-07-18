@@ -1,9 +1,8 @@
-# mandala Rust workspace — OpenSpec change `mandala-rust-rewrite` (phase 1).
-#
-# Additive to the Python porcelain under `cli/`: this workspace grows the
-# `mandala-core` library, the `mandala-mcp` stdio server, and the `mandala`
-# binary that replace the headless Python surfaces. The Python package keeps
-# serving the TUI + HTTP MCP host until later phases.
+# mandala Rust workspace — OpenSpec changes `mandala-rust-rewrite` (phase 1)
+# and `mandala-native-tui` (phase 2, which retired the Python porcelain
+# entirely): the `mandala-core` library, the fleet-context layer, the
+# `mandala-mcp` stdio server, the ratatui TUI, and the single `mandala`
+# binary that is now the whole porcelain surface.
 [workspace]
 resolver = "3"
 members = [

@@ -1,9 +1,0 @@
-{
- "dry_activate": false,
- "limit": "alpha,beta",
- "pid": 111111,
- "playbook": "mandala.fleet.deploy",
- "run_id": "20260101T000000_000000-1001",
- "started_at": 1767225600.0,
- "throttle": 4
-}

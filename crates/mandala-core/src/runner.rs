@@ -3,7 +3,7 @@
 //! into its registry dir, tailing them incrementally into host state machines
 //! and a build-progress model.
 //!
-//! A parity port of `cli/src/mandala_fleet/runner.py`. The READ half
+//! A parity port of the retired Python `mandala_fleet.runner`. The READ half
 //! (`HostState`/`HostRun`, `BuildModel`, `EventTailer`) is what any frontend —
 //! a second TUI, the CLI, the fleet MCP server — uses to render an in-flight or
 //! finished run from the shared event files, without owning the subprocess that

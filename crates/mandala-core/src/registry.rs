@@ -2,7 +2,7 @@
 //! frontend — a second TUI, the CLI, the fleet MCP server — can find an
 //! in-flight or recent run and tail its event streams.
 //!
-//! A parity port of `cli/src/mandala_fleet/registry.py`. Each run owns a
+//! A parity port of the retired Python `mandala_fleet.registry`. Each run owns a
 //! directory under `state_dir()/runs/<run-id>/` holding its per-host event
 //! JSONLs (what [`EventTailer`] globs) plus a small `meta.json` (limit, pid,
 //! kind, started_at, rc, …). Reusing [`crate::drift::state_dir`] keeps one

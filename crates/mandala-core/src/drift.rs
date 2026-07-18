@@ -1,6 +1,6 @@
 //! Deployed-generation drift: contract vs reported fleet state.
 //!
-//! A parity port of `cli/src/mandala_fleet/drift.py`. The data path mirrors the
+//! A parity port of the retired Python `mandala_fleet.drift`. The data path mirrors the
 //! survey pattern: the read-only state playbook (`mandala.fleet.state`) fans
 //! out, reads each member's `/run/current-system` and `/run/booted-system`
 //! links plus each system's boot-critical facts, and writes one JSON snapshot

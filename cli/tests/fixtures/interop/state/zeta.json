@@ -1,9 +1,0 @@
-{
-    "host": "zeta",
-    "unreachable": false,
-    "current": null,
-    "booted": null,
-    "current_boot": null,
-    "booted_boot": null,
-    "captured_at": "2026-01-01T12:00:00+00:00"
-}

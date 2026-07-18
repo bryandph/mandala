@@ -1,6 +1,6 @@
 //! Built-in `deploy` engine: dispatch onto the `mandala.fleet` fan-out.
 //!
-//! Parity port of `cli/src/mandala_fleet/engines/deploy.py`. `run` shells out to
+//! Parity port of the retired Python `mandala_fleet.engines.deploy`. `run` shells out to
 //! the fan-out playbook (eval-once batch build + per-host deploy-rs); `batch`
 //! builds a `deployBatch` group artifact for cache warming; `nodes` lists the
 //! deploy-rs node names off the aggregate. Dispatch + present only — deploy-rs

@@ -1,4 +1,0 @@
-{"v":2,"ts":1767225607.25,"host":"controller","plugin":"build","event":"status","cmd":["nix","build","--no-link"],"state":"start"}
-{"v":2,"ts":1767225607.5,"host":"controller","plugin":"build","event":"progress","built":3,"finished":2,"fetched":5,"fetched_done":5,"errors":0,"current":"nixos-system-alpha"}
-{"v":2,"ts":1767225607.75,"host":"controller","plugin":"build","event":"line","line":"these 2 derivations will be built:","stream":"nix"}
-{"v":2,"ts":1767225608.0,"host":"controller","plugin":"build","event":"status","rc":0,"state":"done"}

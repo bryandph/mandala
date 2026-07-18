@@ -86,36 +86,17 @@
       };
     });
 
-    # The Python porcelain (TUI tiers + cores; the headless CLI/MCP moved
-    # to the Rust binary below), built from nixpkgs only (the purity
-    # invariant holds: no new inputs). Exposed twice: `mandala-fleet-python`
-    # is the composable python MODULE — an operator devshell builds a
-    # python3.withPackages env from it — and `mandala-cli` is the
-    # standalone application. Lazy eval: lib-only consumers never
-    # instantiate either.
+    # The Rust porcelain (OpenSpec changes mandala-rust-rewrite +
+    # mandala-native-tui — the Python package is fully retired).
+    # buildRustPackage — NOT crane — because the purity invariant above
+    # (no inputs beyond nixpkgs) rules out crane, which is a flake input;
+    # buildRustPackage ships in nixpkgs. `cargoLock.lockFile` vendors the
+    # LOCAL workspace deterministically from the checked-in Cargo.lock (no
+    # cargoHash, which is for third-party fetches). The source is fileset-
+    # narrowed to the Cargo manifests + crate trees so an engine-side edit
+    # never rebuilds the Rust binary. Lazy eval: lib-only consumers never
+    # instantiate it.
     packages = eachSystem (pkgs: rec {
-      mandala-fleet-python = pkgs.python3Packages.buildPythonPackage {
-        pname = "mandala-fleet";
-        version = "0.1.0";
-        pyproject = true;
-        src = ./cli;
-        build-system = [pkgs.python3Packages.setuptools];
-        dependencies = with pkgs.python3Packages; [typer textual pyte fastmcp];
-        # The runner demux / selector-resolution tests are the headless
-        # half of the TUI verification — they gate the package build.
-        nativeCheckInputs = [pkgs.python3Packages.pytestCheckHook];
-        pythonImportsCheck = ["mandala_fleet"];
-      };
-      mandala-cli = pkgs.python3Packages.toPythonApplication mandala-fleet-python;
-
-      # The Rust porcelain (OpenSpec change mandala-rust-rewrite, phase 1).
-      # buildRustPackage — NOT crane — because the purity invariant above
-      # (no inputs beyond nixpkgs) rules out crane, which is a flake input;
-      # buildRustPackage ships in nixpkgs. `cargoLock.lockFile` vendors the
-      # LOCAL workspace deterministically from the checked-in Cargo.lock (no
-      # cargoHash, which is for third-party fetches). The source is fileset-
-      # narrowed to the Cargo manifests + crate trees so a Python-only edit
-      # never rebuilds the Rust binary and vice versa.
       mandala-rs = pkgs.rustPlatform.buildRustPackage {
         pname = "mandala";
         version = "0.1.0";
@@ -125,14 +106,6 @@
             ./Cargo.toml
             ./Cargo.lock
             ./crates
-            # The MCP golden fixtures are the parity oracle the Rust server's
-            # check-phase test (`crates/mandala-mcp/tests/parity.rs`) replays —
-            # one copy, shared with the Python capture script, never duplicated.
-            ./cli/tests/fixtures/mcp
-            # The interop golden fixtures (fleet-state-formats): a state dir
-            # written by the Python implementation, read by the direction-A
-            # cargo tests (`crates/mandala-core/src/interop_tests.rs`).
-            ./cli/tests/fixtures/interop
           ];
         };
         cargoLock.lockFile = ./Cargo.lock;
@@ -147,17 +120,9 @@
         nativeBuildInputs = [pkgs.pkg-config pkgs.rustPlatform.bindgenHook];
         buildInputs = [pkgs.nix];
 
-        # The interop helper is test tooling (the `mandala-interop` check's
-        # direction-B driver), not operator surface: keep it out of bin/ so
-        # the package exposes only the porcelain + its eval worker.
-        postInstall = ''
-          mkdir -p $out/libexec/mandala
-          mv $out/bin/mandala-interop-helper $out/libexec/mandala/
-        '';
-
         # cargo test over the workspace runs in the check phase (the unit
-        # tests in each crate) — the Rust half of the package gate, the
-        # mirror of `mandala-cli`'s pytestCheckHook.
+        # tests in each crate, the inline golden-byte format gates, and the
+        # leader-vs-follower parity suite) — the package gate.
         meta = {
           description = "mandala fleet porcelain (Rust) — CLI + stdio MCP, single static binary";
           mainProgram = "mandala";
@@ -165,37 +130,13 @@
         };
       };
 
-      default = mandala-cli;
+      default = mandala-rs;
     });
 
     # Evaluate the engine against the bundled fake fleet: proves the schema
     # validates and the derived fields compute correctly without any
     # operator-specific value entering this repo.
     checks = eachSystem (pkgs: {
-      # Cross-implementation interop gate (fleet-state-formats spec, OpenSpec
-      # change mandala-rust-rewrite task 2.5): the two toolchains meet HERE.
-      # Direction A (Python-written fixtures read by Rust) already runs in
-      # `mandala-rs`'s cargo-test check phase — its fixture tree is checked
-      # in — so this check drives the OTHER half: pytest attaches the Python
-      # `registry.open_run`/`DeployRun.attach` to runs produced by the REAL
-      # Rust runners (the `mandala-interop-helper` under libexec/, payloads
-      # all trivial `sh -c` — no ansible/nix/network). Purity invariant
-      # holds: python env + runCommand are nixpkgs-only.
-      mandala-interop = let
-        p = self.packages.${pkgs.stdenv.hostPlatform.system};
-        pyEnv = pkgs.python3.withPackages (ps: [p.mandala-fleet-python ps.pytest]);
-      in
-        pkgs.runCommand "mandala-interop" {
-          nativeBuildInputs = [pyEnv];
-          MANDALA_RS_INTEROP_BIN = "${p.mandala-rs}/libexec/mandala/mandala-interop-helper";
-        } ''
-          export HOME=$TMPDIR
-          pytest -p no:cacheprovider -v \
-            ${./cli/tests}/test_interop_rs.py \
-            ${./cli/tests}/test_interop_fixtures.py
-          touch $out
-        '';
-
       fake-fleet = let
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);
