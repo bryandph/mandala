@@ -125,13 +125,18 @@ impl Evaluator {
         ctx.set_setting("experimental-features", &features)
             .map_err(e2s)?;
 
-        // Parity with the CLI's documented `nix eval --no-warn-dirty` argv
-        // (this worker's contract — see `aggregate`): a fleet checkout is
-        // dirty for the whole life of any change, so warning on every lock
-        // is pure noise — and libnix writes it to stderr, which under the
-        // TUI would land on the alternate screen.
-        ctx.set_setting("warn-dirty", "false").map_err(e2s)?;
-
+        // NOTE deliberately NOT set: `warn-dirty = false`. The dirty-tree
+        // warning is a libfetchers setting that `nix_setting_set` does not
+        // reach (it lives on the C API's own `FetchersSettings` object, which
+        // exposes no setter) — attempting `ctx.set_setting("warn-dirty", …)`
+        // at ANY point raises an unknown-setting C++ exception that unwinds
+        // through the Rust frame and ABORTS the worker on startup ("Rust
+        // cannot catch foreign exceptions"), invisibly under the TUI's nulled
+        // stderr (live 7.4 finding, mandala-native-tui). The warning is
+        // stderr-only and stdout parity with `nix eval --json` is unaffected;
+        // TUI-hosted workers null stderr (`Evaluator::quiet`), so the noise
+        // never reaches the alternate screen. The spawn regression test
+        // (`tests/spawn.rs`) guards the never-abort invariant.
         let store = Arc::new(Store::open(&ctx, None).map_err(e2s)?);
         let flake_settings = Arc::new(FlakeSettings::new(&ctx).map_err(e2s)?);
         let fetch_settings = FetchersSettings::new(&ctx).map_err(e2s)?;
