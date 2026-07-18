@@ -27,14 +27,19 @@ const FIXTURE: &str = r#"{
 }"#;
 
 /// Write the fixture to a unique temp file; the caller keeps it alive.
+/// (pid, nanos, counter): under a coarse clock two parallel tests can share
+/// a nanos stamp — one would then delete the other's fixture mid-read (the
+/// registry `tmp()` lesson from section 2), hence the process-wide counter.
 fn fixture_file() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "mandala-cli-e2e-{}-{:?}.json",
+        "mandala-cli-e2e-{}-{:?}-{}.json",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(FIXTURE.as_bytes()).unwrap();
@@ -140,6 +145,39 @@ fn members_table_carries_caption_and_rows() {
     assert!(
         stdout.contains("3 members — ads = ansible/deploy-rs/sops"),
         "caption missing: {stdout}"
+    );
+    let _ = std::fs::remove_file(&fx);
+}
+
+/// The fleet-context "no context, no failure" scenario (mandala-native-tui
+/// task 3.3): a CLI read with NO live context for the checkout evaluates
+/// locally and succeeds exactly as the standalone binary always has — and it
+/// neither consults nor creates any context state (full CLI warm-read
+/// routing through a live context is a later section).
+#[test]
+fn cli_reads_fall_back_to_local_eval_without_a_context() {
+    let fx = fixture_file();
+    let state = std::env::temp_dir().join(format!(
+        "mandala-cli-nocontext-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&state).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mandala"))
+        .args(["resolve", "@k3s"])
+        .env("MANDALA_AGGREGATE_FILE", &fx)
+        .env("MANDALA_EVAL", "subprocess")
+        .env("MANDALA_FLEET_STATE", &state)
+        .output()
+        .expect("spawn mandala");
+    assert!(out.status.success(), "local read failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "cache\nweb\n");
+    assert!(
+        !state.join("mcp").join("contexts").exists(),
+        "a CLI read must not create (or need) a context"
     );
     let _ = std::fs::remove_file(&fx);
 }

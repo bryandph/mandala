@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 mandala-core.workspace = true
+# The fleet execution context (mandala-native-tui section 3): `mandala mcp`
+# joins (or claims) the per-checkout context at start — leader hosts the
+# endpoint, followers forward tool execution through `ContextSession`.
+mandala-context.workspace = true
 # rust-mcp-sdk: server-only, stdio transport, tool macros (phase-1 spike,
 # section 1.2). HTTP/SSE transports (hyper-server) come in phase 2.
 rust-mcp-sdk = { version = "0.10", default-features = false, features = [
@@ -35,9 +39,6 @@ tokio = { version = "1", features = [
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 
 [dev-dependencies]
-# The follower-proxy spike (`tests/context_proxy.rs`, mandala-native-tui task
-# 1.2): routes the real dispatch core through a context endpoint. Section 3
-# promotes this to a normal dependency when `mandala mcp` grows
-# leader/follower modes.
-mandala-context.workspace = true
+# The context/failover integration tests drive real TCP endpoints and
+# concurrent sessions (multi-thread runtimes).
 tokio = { version = "1", features = ["rt-multi-thread"] }

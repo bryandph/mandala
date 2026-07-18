@@ -200,6 +200,47 @@ async fn mutation_surfaces_structured_failover_without_retry() {
     assert!(session.is_leader().await);
 }
 
+/// A call issued AFTER the leader died (reader already at EOF — nothing in
+/// flight) must fail over promptly, never hang: the client's dead-connection
+/// guard fails it fast, the session re-races and promotes, and the retried
+/// read succeeds. Regression for the section-3 gotcha: a write into a
+/// half-closed socket can "succeed", so without the guard the waiter would
+/// wait forever on a settle that can never come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_issued_after_leader_death_fails_over_without_hanging() {
+    let (flake, state) = scratch("post-death");
+    let identity = ContextIdentity::with_port_range(&flake, 28820, 4).unwrap();
+    let leader_a = lead_as_a(&identity, &state).await;
+
+    let (events_s, _) = broadcast::channel(64);
+    let calls_s = Arc::new(AtomicUsize::new(0));
+    let session = ContextSession::acquire(
+        identity.clone(),
+        &state,
+        "session-s",
+        factory("S", Arc::clone(&calls_s), events_s),
+    )
+    .await
+    .unwrap();
+    assert!(!session.is_leader().await);
+
+    drop(leader_a);
+    // Let the follower's reader task observe the EOF BEFORE the call — the
+    // in-flight variant is covered above; this is the call-after-death one.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.call("read", serde_json::Map::new(), true),
+    )
+    .await
+    .expect("a post-death call must fail over promptly, never hang")
+    .expect("the retried read succeeds on the promoted session");
+    assert_eq!(result["served_by"], json!("S"));
+    assert_eq!(calls_s.load(Ordering::SeqCst), 1, "exactly one execution");
+    assert!(session.is_leader().await, "the session promoted");
+}
+
 // ---- simultaneous promotion -------------------------------------------------
 
 /// Three sessions lose their leader at once and all re-race through their

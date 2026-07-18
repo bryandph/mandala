@@ -85,6 +85,14 @@ struct Waiters {
     ping: Option<oneshot::Sender<()>>,
     subscribed: Option<oneshot::Sender<()>>,
     events: Option<mpsc::Sender<Value>>,
+    /// Set (under this lock) when the reader hits EOF: the connection is
+    /// dead and NOBODY will ever settle a newly registered waiter. A call
+    /// issued after this point must fail fast as [`CallFailure::
+    /// ConnectionLost`] — a write into the half-closed socket can still
+    /// "succeed" (only the peer's send side closed), so without this flag
+    /// such a call would hang forever (gotcha found by the section-3
+    /// stdio promotion test).
+    closed: bool,
 }
 
 /// A joined context connection (a follower's or observer's handle).
@@ -229,6 +237,10 @@ impl ContextClient {
                     }
                 }
                 let mut w = waiters.lock().expect("waiters lock poisoned");
+                // Atomic with the drain (same lock): anything registered
+                // later sees `closed` and fails fast instead of waiting on
+                // a settle that can never come.
+                w.closed = true;
                 for (_, sender) in w.calls.drain() {
                     let _ = sender.send(Err(CallFailure::ConnectionLost));
                 }
@@ -266,11 +278,16 @@ impl ContextClient {
     ) -> Result<Value, CallFailure> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (otx, orx) = oneshot::channel();
-        self.waiters
-            .lock()
-            .expect("waiters lock poisoned")
-            .calls
-            .insert(id, otx);
+        {
+            let mut w = self.waiters.lock().expect("waiters lock poisoned");
+            if w.closed {
+                // The reader already saw EOF: nobody would ever settle this
+                // waiter (and the write might not even error on a
+                // half-closed socket) — fail fast.
+                return Err(CallFailure::ConnectionLost);
+            }
+            w.calls.insert(id, otx);
+        }
         self.tx
             .send(Frame::Call {
                 id,
@@ -296,6 +313,9 @@ impl ContextClient {
         let (atx, arx) = oneshot::channel();
         {
             let mut w = self.waiters.lock().expect("waiters lock poisoned");
+            if w.closed {
+                return Err("context connection closed".to_string());
+            }
             w.events = Some(etx);
             w.subscribed = Some(atx);
         }
@@ -316,7 +336,13 @@ impl ContextClient {
     /// The waiter lock is poisoned (a routing task panicked).
     pub async fn ping(&self) -> bool {
         let (ptx, prx) = oneshot::channel();
-        self.waiters.lock().expect("waiters lock poisoned").ping = Some(ptx);
+        {
+            let mut w = self.waiters.lock().expect("waiters lock poisoned");
+            if w.closed {
+                return false;
+            }
+            w.ping = Some(ptx);
+        }
         if self.tx.send(Frame::Ping).await.is_err() {
             return false;
         }
