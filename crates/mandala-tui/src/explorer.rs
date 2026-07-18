@@ -34,9 +34,9 @@ use crate::event::AppEvent;
 use crate::state::{AppState, LoadRequest, LoadedInventory};
 use crate::term::{TerminalGuard, install_panic_hook};
 
-/// What the runtime needs beyond state: the contract to read and the survey
-/// launch line. Tests override `survey_argv` with an `sh -c` stub — never a
-/// live fleet, never real ansible.
+/// What the runtime needs beyond state: the contract to read and the
+/// action-tier launch lines. Tests override the argv seams with `sh -c`
+/// stubs — never a live fleet, never real ansible/nix/nom.
 #[derive(Debug, Clone)]
 pub struct ExplorerConfig {
     /// The fleet flake reference (`--flake`).
@@ -45,6 +45,31 @@ pub struct ExplorerConfig {
     /// ([`ansible_dir`]) and the `MANDALA_FLEET_STATE` /
     /// `ANSIBLE_FORCE_COLOR=0` environment at spawn time.
     pub survey_argv: Vec<String>,
+    /// The `p` ping launch line for a target (the `action_ping` argv).
+    /// Default: `ansible <target> -m ping` — deliberately the DEFAULT
+    /// stdout callback: `--one-line` AND the oneline/minimal callbacks are
+    /// deprecated in core 2.19 (removed 2.23) with no core replacement
+    /// (ansible/ansible #85333, closed not-planned), and community
+    /// presentation plugins would be a new dependency. The default callback
+    /// is the only stable surface; the pane wraps and scrolls.
+    pub ping_argv: fn(&str) -> Vec<String>,
+    /// The reboot launch line (target, serial, drain) — defaults to the
+    /// shared [`mandala_core::runner::reboot_argv`] (wrapper-preference +
+    /// availability semantics live there); `None` = reboot unavailable.
+    pub reboot_argv: fn(&str, &str, bool) -> Option<Vec<String>>,
+    /// Test seam: override the deploy screen's launched argv verbatim
+    /// (`DeployRun::program`); `None` builds the real playbook line.
+    pub deploy_program: Option<Vec<String>>,
+}
+
+/// The default `p` argv (see [`ExplorerConfig::ping_argv`]).
+fn default_ping_argv(target: &str) -> Vec<String> {
+    vec![
+        "ansible".to_string(),
+        target.to_string(),
+        "-m".to_string(),
+        "ping".to_string(),
+    ]
 }
 
 impl Default for ExplorerConfig {
@@ -55,6 +80,9 @@ impl Default for ExplorerConfig {
                 "ansible-playbook".to_string(),
                 "mandala.fleet.state".to_string(),
             ],
+            ping_argv: default_ping_argv,
+            reboot_argv: mandala_core::runner::reboot_argv,
+            deploy_program: None,
         }
     }
 }
@@ -273,8 +301,9 @@ pub async fn run_survey(
         .await;
 }
 
-/// Forward a pipe's lines into the merged stream.
-async fn pump_lines(reader: impl AsyncRead + Unpin, tx: mpsc::Sender<String>) {
+/// Forward a pipe's lines into the merged stream (shared with the task
+/// screens' subprocess pump).
+pub(crate) async fn pump_lines(reader: impl AsyncRead + Unpin, tx: mpsc::Sender<String>) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if tx.send(line).await.is_err() {

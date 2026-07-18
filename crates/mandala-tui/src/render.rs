@@ -43,6 +43,9 @@ pub fn rich_style(spec: &str) -> Option<Style> {
             "red" => style.fg(Color::Red),
             "yellow" => style.fg(Color::Yellow),
             "magenta" => style.fg(Color::Magenta),
+            // The deploy tier's `_STATE_STYLE` vocabulary (screen.rs).
+            "cyan" => style.fg(Color::Cyan),
+            "blue" => style.fg(Color::Blue),
             _ => return None,
         };
     }
@@ -99,8 +102,28 @@ pub fn footer_hints(state: &AppState) -> Vec<(&'static str, &'static str)> {
     hints
 }
 
-/// Top-level render: header, tab bar, active view, status line, footer.
+/// Top-level render: the active screen when one is pushed (modals overlay
+/// the explorer; task/deploy screens replace it), else the explorer.
 pub fn render(state: &AppState, frame: &mut Frame) {
+    use crate::screen::{self, ScreenState};
+    match &state.screen {
+        None => render_explorer(state, frame),
+        Some(ScreenState::Confirm(confirm)) => {
+            render_explorer(state, frame);
+            screen::render_confirm(confirm, frame);
+        }
+        Some(ScreenState::Reboot(reboot)) => {
+            render_explorer(state, frame);
+            screen::render_reboot(reboot, frame);
+        }
+        Some(ScreenState::Task(task)) => screen::render_task(task, frame),
+        Some(ScreenState::AttachedLog(attached)) => screen::render_attached(attached, frame),
+        Some(ScreenState::Deploy(deploy)) => screen::render_deploy(deploy, frame),
+    }
+}
+
+/// The explorer view: header, tab bar, active view, status line, footer.
+fn render_explorer(state: &AppState, frame: &mut Frame) {
     let [header, tabs, view, status, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),

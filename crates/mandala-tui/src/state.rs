@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use mandala_core::drift::{self, DriftStatus, Snapshot};
 use mandala_core::inventory::Inventory;
 
+use crate::screen::ScreenState;
 use crate::select::SelectTable;
 
 /// Braille spinner frames advanced by the tick timer while any job runs.
@@ -174,6 +175,13 @@ pub struct AppState {
     /// section 6). Only the footer-hint plumbing reads it here — the
     /// `check_action`-style conditional-visibility mechanism.
     pub debug_mcp: bool,
+
+    /// The action tier's ONE screen/overlay slot (section-5 decision of
+    /// record: the Python explorer never stacks two screens — every modal
+    /// dismisses before the next push — so an `Option` models exactly the
+    /// reachable states; a stack would model impossible ones). Modals
+    /// render over the explorer; task/deploy screens replace the view.
+    pub screen: Option<ScreenState>,
 }
 
 impl Default for AppState {
@@ -208,6 +216,7 @@ impl AppState {
             status_sticky: false,
             spin: 0,
             debug_mcp: false,
+            screen: None,
         }
     }
 
@@ -581,6 +590,20 @@ impl AppState {
         } else {
             let msg = format!("survey failed (exit {rc}): {}", error.unwrap_or(""));
             self.set_status(msg.trim_end().to_string(), true);
+        }
+    }
+
+    /// A mutation screen (deploy/reboot task, attached run) just closed —
+    /// the `_after_mutation` rule: a completed run (rc set — even non-zero:
+    /// seeing the resulting state is exactly what you want) auto-refreshes
+    /// drift; an operator cancel (rc `None`) does not. Returns the
+    /// (eval, survey) jobs to start, exactly like `S`.
+    #[must_use]
+    pub fn after_mutation(&mut self, rc: Option<i64>) -> (bool, bool) {
+        if rc.is_some() {
+            self.refresh_drift()
+        } else {
+            (false, false)
         }
     }
 

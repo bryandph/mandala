@@ -1,5 +1,5 @@
 //! The runtime half of the `AppState`/`App` split: terminal, channels,
-//! timers, and the single `tokio::select!` loop.
+//! timers, subprocess/pty handles, and the single `tokio::select!` loop.
 //!
 //! Loop shape (design decision, herdr-style hand-rolled):
 //! one select over the terminal event stream, the internal channel, and the
@@ -8,25 +8,37 @@
 //! rendering in between; the frame is drawn only when a handler marked the
 //! state dirty.
 //!
-//! The [`AppState`] transitions stay pure (state.rs); this module maps keys
-//! and settle events onto them and spawns the background tasks they request
-//! (aggregate load, expected eval, state survey — [`crate::explorer`]).
+//! The [`AppState`] transitions stay pure (state.rs / screen.rs); this
+//! module maps keys and settle events onto them and owns everything with a
+//! handle: the background explorer jobs, the task screens' subprocesses, and
+//! the deploy screen's run + nom pane. Screen dismissal continuations are
+//! DATA on the screen states (`ConfirmAction`, `after_mutation`) — the
+//! runtime reads them here, so there is no callback plumbing.
 
 use std::io;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::Utc;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use mandala_core::drift;
+use mandala_core::runner::{DeployRun, ansible_dir};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::deploy::DeployJob;
 use crate::event::{AppEvent, Deadlines, LoopEvent, TimerId};
-use crate::explorer::{ExplorerConfig, spawn_eval_expected, spawn_load, spawn_survey};
+use crate::explorer::{ExplorerConfig, pump_lines, spawn_eval_expected, spawn_load, spawn_survey};
 use crate::render::render;
+use crate::screen::{
+    self, AttachedLogState, ConfirmAction, ConfirmState, DeployTab, RebootState, ScreenState,
+    TaskState,
+};
 use crate::state::{AppState, LoadRequest, Tab};
 use crate::term::TerminalGuard;
 
@@ -38,16 +50,22 @@ const DRAIN_BUDGET: usize = 64;
 /// One spinner frame per 100ms — the Python `set_interval(0.1, self._tick)`.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The deploy screen's poll cadence (`set_interval(0.25, self._tick)`).
+const DEPLOY_POLL: Duration = Duration::from_millis(250);
+
+/// The attached-log screen's poll cadence (`set_interval(0.5, self._pump)`).
+const ATTACHED_POLL: Duration = Duration::from_millis(500);
+
 /// Operator actions above plain navigation — the explicit Action enum of
-/// the design's loop decision. The read tier stops at the seam: each
-/// variant's dispatch is a section-5 screen push, stubbed here.
+/// the design's loop decision. Each variant computes the target
+/// (selection-else-cursor) and pushes its screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// `p`: ansible ad-hoc ping of the selection (section 5 TaskScreen).
+    /// `p`: ansible ad-hoc ping of the selection (TaskScreen).
     Ping,
-    /// `R`: reboot the selection behind options + confirm (section 5).
+    /// `R`: reboot the selection behind options + availability pre-check.
     Reboot,
-    /// `D`: deploy the selection behind confirm (section 5 DeployScreen).
+    /// `D`: deploy the selection behind confirm (DeployScreen).
     Deploy,
 }
 
@@ -60,6 +78,15 @@ enum Wake {
     Closed,
 }
 
+/// The runtime handle for one task screen's subprocess. The pump task owns
+/// the child (drain lines → wait → settle event); esc terminates via the
+/// recorded pid, exactly like `DeployRun::terminate`.
+struct TaskJob {
+    task_id: u64,
+    pid: Option<u32>,
+    exited: bool,
+}
+
 /// The runtime: everything with a handle lives here, never in
 /// [`AppState`].
 pub struct App {
@@ -67,12 +94,18 @@ pub struct App {
     /// Present when the app owns a real terminal; `None` under tests.
     /// Enables ctrl-z suspend-to-shell.
     pub guard: Option<TerminalGuard>,
+    /// The standalone deploy screen's exit code (`run_deploy` reads it
+    /// after the loop; the Python `app.exit(returncode)`).
+    pub exit_code: Option<i64>,
     cfg: ExplorerConfig,
     dirty: bool,
     quit: bool,
     deadlines: Deadlines,
     tx: mpsc::Sender<AppEvent>,
     rx: mpsc::Receiver<AppEvent>,
+    task: Option<TaskJob>,
+    deploy: Option<DeployJob>,
+    next_task_id: u64,
 }
 
 impl App {
@@ -81,12 +114,16 @@ impl App {
         Self {
             state,
             guard: None,
+            exit_code: None,
             cfg,
             dirty: true,
             quit: false,
             deadlines: Deadlines::default(),
             tx,
             rx,
+            task: None,
+            deploy: None,
+            next_task_id: 0,
         }
     }
 
@@ -115,8 +152,23 @@ impl App {
     {
         while !self.quit {
             if self.dirty {
+                let state = &self.state;
+                let deploy = self.deploy.as_ref();
                 terminal
-                    .draw(|frame| render(&self.state, frame))
+                    .draw(|frame| {
+                        render(state, frame);
+                        // The nom pane is runtime state (a pty emulator) —
+                        // the pure render leaves the build tab empty and the
+                        // runtime blits the pane over it.
+                        if let (Some(ScreenState::Deploy(view)), Some(job)) =
+                            (state.screen.as_ref(), deploy)
+                            && view.active == DeployTab::Build
+                            && let Ok(nom) = job.nom.lock()
+                        {
+                            let area = screen::deploy_content_area(frame.area());
+                            frame.render_widget(&*nom, area);
+                        }
+                    })
                     .map_err(io::Error::other)?;
                 self.dirty = false;
             }
@@ -138,11 +190,11 @@ impl App {
                 ), if deadline.is_some() => Wake::Deadline,
             };
             match wake {
-                Wake::Term(ev) => self.handle(LoopEvent::Term(ev), terminal)?,
-                Wake::App(ev) => self.handle(LoopEvent::App(ev), terminal)?,
+                Wake::Term(ev) => self.handle(LoopEvent::Term(ev), terminal).await?,
+                Wake::App(ev) => self.handle(LoopEvent::App(ev), terminal).await?,
                 Wake::Deadline => {
                     for id in self.deadlines.pop_due(Instant::now()) {
-                        self.handle(LoopEvent::Timer(id), terminal)?;
+                        self.handle(LoopEvent::Timer(id), terminal).await?;
                     }
                 }
                 Wake::Closed => self.quit = true,
@@ -163,7 +215,7 @@ impl App {
             while budget > 0 && !self.quit {
                 match self.rx.try_recv() {
                     Ok(ev) => {
-                        self.handle(LoopEvent::App(ev), terminal)?;
+                        self.handle(LoopEvent::App(ev), terminal).await?;
                         budget -= 1;
                     }
                     Err(_) => break,
@@ -173,15 +225,28 @@ impl App {
         Ok(())
     }
 
-    fn handle<B: Backend>(&mut self, event: LoopEvent, terminal: &mut Terminal<B>) -> io::Result<()>
+    async fn handle<B: Backend>(
+        &mut self,
+        event: LoopEvent,
+        terminal: &mut Terminal<B>,
+    ) -> io::Result<()>
     where
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         match event {
             LoopEvent::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                self.on_key(key.code, key.modifiers, terminal)?;
+                self.on_key(key.code, key.modifiers, terminal).await?;
             }
-            LoopEvent::Term(Event::Resize(..)) => self.dirty = true,
+            LoopEvent::Term(Event::Resize(width, height)) => {
+                // Propagate a resize to the deploy screen's pty pane.
+                if let Some(job) = self.deploy.as_ref()
+                    && let Ok(mut nom) = job.nom.lock()
+                {
+                    let area = screen::deploy_content_area(Rect::new(0, 0, width, height));
+                    nom.resize(area.height, area.width);
+                }
+                self.dirty = true;
+            }
             LoopEvent::Term(_) => {}
             LoopEvent::Timer(TimerId::SpinnerTick) => {
                 if self.state.tick_spinner() {
@@ -192,6 +257,24 @@ impl App {
                         self.deadlines
                             .arm(TimerId::SpinnerTick, Instant::now() + SPINNER_INTERVAL);
                     }
+                }
+            }
+            LoopEvent::Timer(TimerId::DeployPoll) => {
+                if let Some(job) = self.deploy.as_mut()
+                    && let Some(ScreenState::Deploy(view)) = self.state.screen.as_mut()
+                {
+                    job.tick(view);
+                    self.dirty = true;
+                    self.deadlines
+                        .arm(TimerId::DeployPoll, Instant::now() + DEPLOY_POLL);
+                }
+            }
+            LoopEvent::Timer(TimerId::AttachedLogPoll) => {
+                if let Some(ScreenState::AttachedLog(attached)) = self.state.screen.as_mut() {
+                    screen::attached_pump(attached);
+                    self.dirty = true;
+                    self.deadlines
+                        .arm(TimerId::AttachedLogPoll, Instant::now() + ATTACHED_POLL);
                 }
             }
             LoopEvent::App(ev) => self.on_app_event(ev),
@@ -224,6 +307,27 @@ impl App {
                     .on_survey_done(n, rc, error.as_deref(), &snapshots, Utc::now());
                 None
             }
+            AppEvent::TaskLine { task_id, line } => {
+                if let Some(ScreenState::Task(task)) = self.state.screen.as_mut()
+                    && task.task_id == task_id
+                {
+                    task.push_line(line);
+                }
+                None
+            }
+            AppEvent::TaskExited { task_id, rc } => {
+                if let Some(job) = self.task.as_mut()
+                    && job.task_id == task_id
+                {
+                    job.exited = true;
+                }
+                if let Some(ScreenState::Task(task)) = self.state.screen.as_mut()
+                    && task.task_id == task_id
+                {
+                    task.on_exited(rc);
+                }
+                None
+            }
         };
         if let Some(req) = follow_up {
             self.start_load(req);
@@ -232,7 +336,7 @@ impl App {
         self.dirty = true;
     }
 
-    fn on_key<B: Backend>(
+    async fn on_key<B: Backend>(
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
@@ -241,9 +345,12 @@ impl App {
     where
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        // Global keys work everywhere, screens or not.
         match code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.quit = true;
+                return Ok(());
+            }
             KeyCode::Char('z') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(guard) = self.guard.as_mut() {
                     guard.suspend_to_shell()?;
@@ -251,7 +358,18 @@ impl App {
                     terminal.clear().map_err(io::Error::other)?;
                     self.dirty = true;
                 }
+                return Ok(());
             }
+            _ => {}
+        }
+
+        if self.state.screen.is_some() {
+            let size = terminal.size().map_err(io::Error::other)?;
+            return self.on_screen_key(code, (size.width, size.height)).await;
+        }
+
+        match code {
+            KeyCode::Char('q') => self.quit = true,
 
             // -- tabs -----------------------------------------------------
             KeyCode::Tab => {
@@ -330,7 +448,7 @@ impl App {
                 self.dirty = true;
             }
 
-            // -- action tier (section 5 screens; seam only here) ----------
+            // -- action tier (pushed screens; views stay read-only) -------
             KeyCode::Char('p') => self.dispatch(Action::Ping),
             KeyCode::Char('R') => self.dispatch(Action::Reboot),
             KeyCode::Char('D') => self.dispatch(Action::Deploy),
@@ -339,22 +457,342 @@ impl App {
         Ok(())
     }
 
-    /// Action dispatch seam. The read tier computes the target
-    /// (selection-else-cursor) and stops: pushing the confirm/task/deploy
-    /// screens is section 5; until then an action with no target — or any
-    /// action at all — is a no-op.
+    /// Keys while a screen is up. Modals are keyboard-driven exactly like
+    /// the Python bindings; task/attached/deploy close on esc/q with their
+    /// per-screen dismissal semantics.
+    async fn on_screen_key(&mut self, code: KeyCode, size: (u16, u16)) -> io::Result<()> {
+        match self.state.screen.as_mut().expect("screen present") {
+            // ConfirmScreen: y confirm, esc/n cancel.
+            ScreenState::Confirm(_) => match code {
+                KeyCode::Char('y') => {
+                    let Some(ScreenState::Confirm(confirm)) = self.state.screen.take() else {
+                        unreachable!("matched Confirm above");
+                    };
+                    self.dirty = true;
+                    match confirm.action {
+                        ConfirmAction::Deploy { target } => {
+                            let mut run = DeployRun::new(target);
+                            if let Some(program) = self.cfg.deploy_program.clone() {
+                                run.program = Some(program);
+                            }
+                            self.start_deploy(run, false, true, false, size).await;
+                        }
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.state.screen = None;
+                    self.dirty = true;
+                }
+                _ => {}
+            },
+
+            // RebootScreen: 1/2/3 order, d drain, y run, esc/n cancel.
+            ScreenState::Reboot(reboot) => match code {
+                KeyCode::Char(key @ ('1' | '2' | '3')) => {
+                    reboot.set_order(key);
+                    self.dirty = true;
+                }
+                KeyCode::Char('d') => {
+                    reboot.toggle_drain();
+                    self.dirty = true;
+                }
+                KeyCode::Char('y') => {
+                    let Some(ScreenState::Reboot(reboot)) = self.state.screen.take() else {
+                        unreachable!("matched Reboot above");
+                    };
+                    let choice = reboot.choice();
+                    // The chosen order + drain ride as extra-vars through
+                    // `reboot_argv` (shared with the MCP tool — the
+                    // wrapper-preference rationale lives there).
+                    match (self.cfg.reboot_argv)(&reboot.target, choice.serial, choice.drain) {
+                        None => self.state.set_status(screen::REBOOT_UNAVAILABLE, false),
+                        Some(argv) => {
+                            let title = format!("reboot {}", reboot.target);
+                            self.push_task(title, argv, ansible_dir(), true);
+                        }
+                    }
+                    self.dirty = true;
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.state.screen = None;
+                    self.dirty = true;
+                }
+                _ => {}
+            },
+
+            // TaskScreen: esc/q terminates a still-running task, then
+            // dismisses with the rc (None while running / never launched).
+            ScreenState::Task(_) => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+                    let Some(ScreenState::Task(task)) = self.state.screen.take() else {
+                        unreachable!("matched Task above");
+                    };
+                    if let Some(job) = self.task.take()
+                        && !job.exited
+                        && let Some(pid) = job.pid
+                    {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                    }
+                    self.finish_screen(task.rc, task.after_mutation);
+                }
+            }
+
+            // AttachedLogScreen: esc/q DETACHES — never terminates; the rc
+            // rides the dismissal only once the run has settled.
+            ScreenState::AttachedLog(_) => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+                    let Some(ScreenState::AttachedLog(attached)) = self.state.screen.take() else {
+                        unreachable!("matched AttachedLog above");
+                    };
+                    self.deadlines.disarm(TimerId::AttachedLogPoll);
+                    let rc = screen::attached_close_rc(&attached.run_id);
+                    self.finish_screen(rc, attached.after_mutation);
+                }
+            }
+
+            // DeployScreen: b/p/s + tab cycling; esc terminates (owned) or
+            // detaches (attached), standalone exits the app with the rc.
+            ScreenState::Deploy(view) => match code {
+                KeyCode::Char('b') => {
+                    view.active = DeployTab::Build;
+                    self.dirty = true;
+                }
+                KeyCode::Char('p') => {
+                    view.active = DeployTab::Playbook;
+                    self.dirty = true;
+                }
+                // `s` jumps to the summary only once it exists.
+                KeyCode::Char('s') if view.summary.is_some() => {
+                    view.active = DeployTab::Summary;
+                    self.dirty = true;
+                }
+                KeyCode::Tab => {
+                    view.active = screen::cycle_tab(view, 1);
+                    self.dirty = true;
+                }
+                KeyCode::BackTab => {
+                    view.active = screen::cycle_tab(view, -1);
+                    self.dirty = true;
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    let Some(ScreenState::Deploy(view)) = self.state.screen.take() else {
+                        unreachable!("matched Deploy above");
+                    };
+                    self.deadlines.disarm(TimerId::DeployPoll);
+                    let rc = match self.deploy.as_mut() {
+                        Some(job) => {
+                            // A no-op in attached mode (an observer never
+                            // owns the subprocess) or once it has exited.
+                            job.run.terminate();
+                            job.run.returncode()
+                        }
+                        None => None,
+                    };
+                    self.deploy = None; // Drop reaps the nom pane's pty child
+                    if view.standalone {
+                        // returncode is None if the operator bailed before
+                        // it finished (`DeployApp(run).run() or 0`).
+                        self.exit_code = Some(rc.unwrap_or(0));
+                        self.state.screen = None;
+                        self.quit = true;
+                    } else {
+                        self.finish_screen(rc, view.after_mutation);
+                    }
+                }
+                _ => {}
+            },
+        }
+        Ok(())
+    }
+
+    /// A screen dismissed with `rc`. The after-mutation rule: a completed
+    /// mutation (rc `Some`) auto-refreshes drift; an operator cancel does
+    /// not (the Python `_after_mutation` callback).
+    fn finish_screen(&mut self, rc: Option<i64>, after_mutation: bool) {
+        self.state.screen = None;
+        if after_mutation {
+            let (eval, survey) = self.state.after_mutation(rc);
+            if eval {
+                self.start_eval_expected();
+            }
+            if survey {
+                self.start_survey();
+            }
+            self.sync_spinner();
+        }
+        self.dirty = true;
+    }
+
+    /// Action dispatch: compute the target (selection-else-cursor) and push
+    /// the action's screen. No target → no-op.
     fn dispatch(&mut self, action: Action) {
-        let Some(_target) = self.state.target() else {
+        let Some(target) = self.state.target() else {
             return;
         };
         match action {
-            // Section 5: TaskScreen(ansible <target> -m ping).
-            Action::Ping => {}
-            // Section 5: RebootScreen options → confirm → reboot_argv run.
-            Action::Reboot => {}
-            // Section 5: ConfirmScreen → DeployScreen(DeployRun{limit}).
-            Action::Deploy => {}
+            Action::Ping => {
+                let argv = (self.cfg.ping_argv)(&target);
+                self.push_task(format!("ping {target}"), argv, ansible_dir(), false);
+            }
+            Action::Reboot => {
+                // Availability pre-check: probe the shared launch line the
+                // way `action_reboot` does before showing the modal.
+                if (self.cfg.reboot_argv)(&target, "1", true).is_none() {
+                    self.state.set_status(screen::REBOOT_UNAVAILABLE, false);
+                    self.dirty = true;
+                    return;
+                }
+                self.state.screen = Some(ScreenState::Reboot(RebootState::new(target)));
+                self.dirty = true;
+            }
+            Action::Deploy => {
+                self.state.screen = Some(ScreenState::Confirm(ConfirmState::new(
+                    format!(
+                        "Deploy '{target}'?\n(eval-once batch build, then deploy-rs per host with magic rollback)"
+                    ),
+                    ConfirmAction::Deploy { target },
+                )));
+                self.dirty = true;
+            }
         }
+    }
+
+    /// Push a task screen and launch its subprocess: stdin null, stdout +
+    /// stderr merged into one line stream (the Python `stderr=STDOUT`),
+    /// output CAPTURED (writing through would shred the alternate screen),
+    /// `PYTHONUNBUFFERED=1` + `ANSIBLE_FORCE_COLOR=0`. A launch failure is
+    /// surfaced in-pane, never a crash.
+    pub fn push_task(
+        &mut self,
+        title: String,
+        argv: Vec<String>,
+        cwd: PathBuf,
+        after_mutation: bool,
+    ) {
+        self.next_task_id += 1;
+        let task_id = self.next_task_id;
+        let mut task = TaskState::new(title, task_id, after_mutation);
+        task.push_line(format!("$ {}  (cwd={})", argv.join(" "), cwd.display()));
+
+        if argv.is_empty() {
+            task.push_line("failed to launch: empty argv".to_string());
+            self.task = Some(TaskJob {
+                task_id,
+                pid: None,
+                exited: true,
+            });
+            self.state.screen = Some(ScreenState::Task(task));
+            self.dirty = true;
+            return;
+        }
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .current_dir(&cwd)
+            .env("PYTHONUNBUFFERED", "1")
+            .env("ANSIBLE_FORCE_COLOR", "0")
+            // NEVER inherit stdin: an interactive prompt (ssh, vault,
+            // become) would wedge the run silently.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match cmd.spawn() {
+            Err(e) => {
+                task.push_line(format!("failed to launch: {e}"));
+                self.task = Some(TaskJob {
+                    task_id,
+                    pid: None,
+                    exited: true,
+                });
+            }
+            Ok(mut child) => {
+                task.launched = true;
+                let pid = child.id();
+                let tx = self.tx.clone();
+                let (line_tx, mut line_rx) = mpsc::channel::<String>(64);
+                if let Some(stdout) = child.stdout.take() {
+                    tokio::spawn(pump_lines(stdout, line_tx.clone()));
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    tokio::spawn(pump_lines(stderr, line_tx.clone()));
+                }
+                drop(line_tx);
+                // The pump task owns the child: drain, wait, settle.
+                tokio::spawn(async move {
+                    while let Some(line) = line_rx.recv().await {
+                        let _ = tx.send(AppEvent::TaskLine { task_id, line }).await;
+                    }
+                    let rc = match child.wait().await {
+                        Ok(status) => exit_code(status),
+                        Err(_) => -1,
+                    };
+                    let _ = tx.send(AppEvent::TaskExited { task_id, rc }).await;
+                });
+                self.task = Some(TaskJob {
+                    task_id,
+                    pid,
+                    exited: false,
+                });
+            }
+        }
+        self.state.screen = Some(ScreenState::Task(task));
+        self.dirty = true;
+    }
+
+    /// Push a read-only attached-log screen over a registered run (used by
+    /// the section-6 auto-attach; tests drive it directly). Pumps once
+    /// immediately, then on the 500ms timer.
+    pub fn push_attached_log(&mut self, title: String, run_id: String, after_mutation: bool) {
+        let mut attached = AttachedLogState::new(title, run_id, after_mutation);
+        screen::attached_pump(&mut attached);
+        self.state.screen = Some(ScreenState::AttachedLog(attached));
+        self.deadlines
+            .arm(TimerId::AttachedLogPoll, Instant::now() + ATTACHED_POLL);
+        self.dirty = true;
+    }
+
+    /// Push the deploy screen. Owned mode (`attached == false`) starts the
+    /// run; attached mode never does (the run was launched elsewhere — this
+    /// only tails it). The nixlog sink is wired BEFORE the first poll so
+    /// nom sees the build from line one. Returns whether the screen pushed
+    /// (an owned launch failure surfaces in the status bar instead).
+    pub async fn start_deploy(
+        &mut self,
+        run: DeployRun,
+        standalone: bool,
+        after_mutation: bool,
+        attached: bool,
+        size: (u16, u16),
+    ) -> bool {
+        let mut job = DeployJob::new(run);
+        let pane = screen::deploy_content_area(Rect::new(0, 0, size.0, size.1));
+        job.spawn_nom(pane.height, pane.width);
+        if !attached {
+            job.started_at = Some(std::time::Instant::now());
+            if let Err(e) = job.run.start().await {
+                self.state
+                    .set_status(format!("deploy failed to launch: {e}"), true);
+                self.dirty = true;
+                return false;
+            }
+        }
+        job.attach_nixlog_sink();
+        let mut view = screen::DeployViewState::new(
+            job.run.limit.clone(),
+            job.run.dry_activate,
+            standalone,
+            attached,
+            after_mutation,
+        );
+        job.tick(&mut view); // first poll AFTER the sink is attached
+        self.state.screen = Some(ScreenState::Deploy(view));
+        self.deploy = Some(job);
+        self.deadlines
+            .arm(TimerId::DeployPoll, Instant::now() + DEPLOY_POLL);
+        self.dirty = true;
+        true
     }
 
     /// Arm the spinner tick when a job just started (never pushing an
@@ -381,4 +819,13 @@ impl App {
     fn start_survey(&mut self) {
         spawn_survey(self.tx.clone(), self.cfg.clone());
     }
+}
+
+/// Exit code the way Python's `Popen.wait()` reports it: the code, or
+/// `-signum` when signalled.
+fn exit_code(status: std::process::ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .map_or_else(|| i64::from(-status.signal().unwrap_or(0)), i64::from)
 }

@@ -1,0 +1,14 @@
+---
+source: crates/mandala-tui/tests/screens.rs
+expression: terminal.backend()
+---
+"mandala — ping web,cache                                                        "
+"$ ansible web,cache -m ping  (cwd=ansible)                                      "
+"web | SUCCESS => {                                                              "
+"    "ping": "pong"                                                              "
+"}                                                                               "
+"— exit 0                                                                        "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"esc back (terminates if running)                                                "

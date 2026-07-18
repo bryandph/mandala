@@ -47,6 +47,13 @@ pub enum AppEvent {
         rc: i32,
         error: Option<String>,
     },
+    /// A task screen's subprocess emitted one output line. `task_id` routes
+    /// it to the screen that launched it — a dismissed task's late lines
+    /// must not leak into a newer screen.
+    TaskLine { task_id: u64, line: String },
+    /// A task screen's subprocess settled (rc with Python `-signum`
+    /// semantics when signalled).
+    TaskExited { task_id: u64, rc: i64 },
 }
 
 /// Identity of an armed timer. One id = one logical timer; re-arming an id
@@ -55,6 +62,10 @@ pub enum AppEvent {
 pub enum TimerId {
     /// Spinner frame advance while a job runs.
     SpinnerTick,
+    /// The deploy screen's 250ms event/exit poll (the `set_interval(0.25)`).
+    DeployPoll,
+    /// The attached-log screen's 500ms tail/liveness poll.
+    AttachedLogPoll,
 }
 
 /// Deadline-min timer set: the loop sleeps until the *earliest* armed

@@ -1,0 +1,20 @@
+---
+source: crates/mandala-tui/tests/screens.rs
+expression: terminal.backend()
+---
+"mandala — deploy runner   -l alpha,beta — exit 1                                                    "
+"batch build  built 2/4  fetched 9/9  errors 0  —  system-path                                       "
+" ⚙ build │ ansible │ ⇄ alpha │ ↩ beta │ summary                                                     "
+"deploy FAILED (exit 1)   -l alpha,beta   1m23s                                                      "
+"batch build: built 2/4, fetched 9/9, errors 0, rc None                                              "
+"                                                                                                    "
+"host                     state          rc                                                          "
+"⇄ alpha                  copying         -                                                          "
+"↩ beta                   rolled-back     -                                                          "
+"                                                                                                    "
+"PLAY RECAP *****                                                                                    "
+"alpha : ok=3 failed=0                                                                               "
+"beta : ok=2 failed=1                                                                                "
+"                                                                                                    "
+" ⇄ alpha:copying  ↩ beta:rolled-back                                                                "
+"b nom build tab  ·  p playbook output tab  ·  s summary tab  ·  tab cycle tabs  ·  esc back (termina"

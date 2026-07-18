@@ -1,10 +1,10 @@
 //! mandala-tui — the native fleet TUI (OpenSpec change `mandala-native-tui`).
 //!
-//! Section 4 state: the READ-ONLY explorer tier at parity with the Python
-//! `tui/explorer.py` + `tui/select_table.py` — tabs, multi-select tables,
-//! the drift dashboard, and the concurrent-jobs status machinery. The
-//! action tier (screens/modals/deploy runner) is section 5; context/MCP
-//! integration is section 6.
+//! Section 5 state: the explorer tier (section 4) plus the ACTION TIER and
+//! DEPLOY RUNNER at parity with the Python `tui/tasks.py` + `tui/deploy.py`
+//! — confirm/reboot modals, task/attached-log screens, the deploy screen
+//! with the pty-hosted nom pane, and the standalone `tui deploy` entry.
+//! Context/MCP integration is section 6.
 //!
 //! - [`state`] — the strict pure-data [`state::AppState`]: everything the
 //!   render fns may see, and nothing they may touch (no handles, no
@@ -26,13 +26,24 @@
 //! - [`term`] — raw-mode/alternate-screen guard, panic-hook restore,
 //!   suspend-to-shell.
 //! - [`nom_pane`] — `nom --json` hosted on a pane-sized pty, vt100-emulated
-//!   into the pane (the `nom.py` port, spike 1.3; consumed in section 5).
+//!   into the pane (the `nom.py` port, spike 1.3; wired into the deploy
+//!   screen's build tab).
+//! - [`ansi`] — the `render.py` CSI/C0 pre-filter + SGR→spans conversion
+//!   every streamed pane line goes through.
+//! - [`screen`] — the action tier's pushed screens as pure data + render
+//!   fns (`tasks.py` + the `deploy.py` view half); dismissal continuations
+//!   are data, not callbacks.
+//! - [`deploy`] — the deploy screen's runtime ([`deploy::DeployJob`]) and
+//!   the standalone [`deploy::run_deploy`] entry.
 
+pub mod ansi;
 pub mod app;
+pub mod deploy;
 pub mod event;
 pub mod explorer;
 pub mod nom_pane;
 pub mod render;
+pub mod screen;
 pub mod select;
 pub mod state;
 pub mod term;

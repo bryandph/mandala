@@ -67,6 +67,12 @@ tokio = { version = "1", features = [
 # `StreamExt::next` for the EventStream + `FutureExt::now_or_never` for the
 # bounded post-wake drain. No default features: no executor, no macros.
 futures-util = { version = "0.3", default-features = false }
+# SGR → ratatui spans for the task/deploy log panes (section 5.3). In the
+# design's settled cherry-picked widget set; 8.x targets ratatui-core 0.1 —
+# the same core ratatui 0.30 is built on, so the Text/Span types unify.
+# The `render.py` CSI/C0 pre-filter is OURS (`ansi::filter_ansi`) — this
+# crate only converts the SGR that survives it.
+ansi-to-tui = "8"
 
 [dev-dependencies]
 # Snapshot tests over TestBackend's Display impl — the AppState→render seam

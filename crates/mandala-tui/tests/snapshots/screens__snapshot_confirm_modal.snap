@@ -1,0 +1,16 @@
+---
+source: crates/mandala-tui/tests/screens.rs
+expression: terminal.backend()
+---
+"mandala — fleet                                                                           "
+" members │ groups │ drift                                                                 "
+"  member           platform   arch             category   role       tags              ads"
+"          ┌────────────────────────────────────────────────────────────────────┐          "
+"          │Deploy 'web'?                                                       │          "
+"          │(eval-once batch build, then deploy-rs per host with magic rollback)│          "
+"          │                                                                    │          "
+"          │y to run   esc to cancel                                            │          "
+"          └────────────────────────────────────────────────────────────────────┘          "
+"                                                                                          "
+"                                                                                          "
+"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D "

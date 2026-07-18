@@ -1,0 +1,20 @@
+---
+source: crates/mandala-tui/tests/screens.rs
+expression: terminal.backend()
+---
+"mandala — fleet                                                                           "
+" member┌──────────────────────────────────────────────────────────────────────────┐       "
+"  membe│Reboot 'web,cache'?                                                       │    ads"
+"       │                                                                          │       "
+"       │Order (1/2/3)                                                             │       "
+"       │  ● Serial — one host at a time                                           │       "
+"       │  ○ Rolling — 2 hosts in flight                                           │       "
+"       │  ○ All-at-once — every targeted host together                            │       "
+"       │                                                                          │       "
+"       │k8s (d)                                                                   │       "
+"       │  ● Drain-safe: cordon & drain k8s nodes first                            │       "
+"       │                                                                          │       "
+"       │y to run   esc to cancel                                                  │       "
+"       └──────────────────────────────────────────────────────────────────────────┘       "
+"                                                                                          "
+"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D "
