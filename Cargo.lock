@@ -930,11 +930,14 @@ dependencies = [
 name = "mandala-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossterm",
  "futures-util",
  "insta",
+ "mandala-core",
  "nix 0.30.1",
  "ratatui",
+ "serde_json",
  "tokio",
  "tui-term",
  "vt100",

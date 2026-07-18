@@ -308,7 +308,19 @@ fn with_inventory(flake: &str, f: impl FnOnce(&Inventory) -> ExitCode) -> ExitCo
 /// to a JSON aggregate — lets integration tests inject a fixture without a real
 /// flake eval), else evaluate `<flake>#mandala` through the [`Evaluator`]
 /// (`MANDALA_EVAL` selects worker vs subprocess).
-fn load_inventory(flake: &str) -> Result<Inventory, String> {
+///
+/// `pub` because the TUI explorer's background load (mandala-tui) is the SAME
+/// read path — one loader, one seam, so the TUI tests inject fixtures exactly
+/// like the CLI tests do.
+pub fn load_inventory(flake: &str) -> Result<Inventory, String> {
+    load_inventory_with(flake, &mut Evaluator::from_env())
+}
+
+/// As [`load_inventory`], over a caller-configured evaluator — the TUI passes
+/// an [`Evaluator::quiet`] one so the eval worker's stderr never writes
+/// through the alternate screen. The seam path ignores the evaluator (an
+/// unused `Evaluator` costs nothing: the worker spawns lazily).
+pub fn load_inventory_with(flake: &str, evaluator: &mut Evaluator) -> Result<Inventory, String> {
     if let Ok(path) = std::env::var("MANDALA_AGGREGATE_FILE")
         && !path.is_empty()
     {
@@ -318,8 +330,7 @@ fn load_inventory(flake: &str) -> Result<Inventory, String> {
             serde_json::from_str(&text).map_err(|e| format!("parsing {path}: {e}"))?;
         return Inventory::from_value(value).map_err(|e| e.to_string());
     }
-    let mut evaluator = Evaluator::from_env();
-    Inventory::from_evaluator(&mut evaluator, flake).map_err(|e| e.to_string())
+    Inventory::from_evaluator(evaluator, flake).map_err(|e| e.to_string())
 }
 
 // ---- built-in root views ---------------------------------------------------

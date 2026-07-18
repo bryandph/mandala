@@ -1,0 +1,16 @@
+---
+source: crates/mandala-tui/tests/harness.rs
+expression: terminal.backend()
+---
+"mandala — fleet                                                                                     "
+" members │ groups │ drift                                                                           "
+"  member           platform   arch             category   role       tags                        ads"
+"  cache            metal      x86_64-linux     ?          -                                      ---"
+"  router           opnsense   ?                ?          -                                      ---"
+"  web              metal      x86_64-linux     server     web        edge                        ad-"
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"running   ⠋ eval   ·   ⠋ survey (2 read)                                                            "
+"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D deploy  · "

@@ -8,6 +8,20 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The explorer tier reads the fleet through the SAME cores as the CLI/MCP:
+# Inventory + selector algebra, drift compare + the one STATUS styling
+# vocabulary, `runner::ansible_dir`, and the `cli::load_inventory` seam
+# (`MANDALA_AGGREGATE_FILE`) so tests inject fixtures exactly like the CLI's.
+mandala-core.workspace = true
+# Same minimal chrono as mandala-core/mandala-mcp: the drift view passes
+# `Utc::now()` + `default_max_age()` into `drift::compare`.
+chrono = { version = "0.4", default-features = false, features = [
+  "std",
+  "now",
+] }
+# Member records are raw JSON objects (mandala-core's serde-fidelity rule);
+# the member/role/tags columns read them as `serde_json::Value`.
+serde_json = "1"
 # The TUI is herdr-style hand-rolled (design decision, settled 2026-07-16):
 # stock ratatui + cherry-picked widget crates only, no framework. The
 # `crossterm` feature selects the crossterm backend (`CrosstermBackend`).
@@ -39,8 +53,17 @@ nix = { version = "0.30", default-features = false, features = [
 ] }
 # One async runtime across the workspace (design mandate): the loop is a
 # single `tokio::select!` over the event stream, the internal channel, and
-# the deadline-min timer set.
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# the deadline-min timer set. `process` + `io-util` power the background
+# survey (`ansible-playbook mandala.fleet.state` output-captured off the UI
+# — writing through would shred the alternate screen, the Python lesson).
+tokio = { version = "1", features = [
+  "rt",
+  "sync",
+  "time",
+  "macros",
+  "process",
+  "io-util",
+] }
 # `StreamExt::next` for the EventStream + `FutureExt::now_or_never` for the
 # bounded post-wake drain. No default features: no executor, no macros.
 futures-util = { version = "0.3", default-features = false }

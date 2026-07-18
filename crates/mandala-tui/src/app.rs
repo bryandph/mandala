@@ -7,28 +7,49 @@
 //! the already-queued backlog is drained under a fixed budget WITHOUT
 //! rendering in between; the frame is drawn only when a handler marked the
 //! state dirty.
+//!
+//! The [`AppState`] transitions stay pure (state.rs); this module maps keys
+//! and settle events onto them and spawns the background tasks they request
+//! (aggregate load, expected eval, state survey — [`crate::explorer`]).
 
 use std::io;
 use std::time::Duration;
 
+use chrono::Utc;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use futures_util::{FutureExt, Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
+use mandala_core::drift;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::event::{AppEvent, Deadlines, LoopEvent, TimerId};
+use crate::explorer::{ExplorerConfig, spawn_eval_expected, spawn_load, spawn_survey};
 use crate::render::render;
-use crate::state::{AppState, Status};
+use crate::state::{AppState, LoadRequest, Tab};
 use crate::term::TerminalGuard;
 
-/// How many already-queued events one wake may consume before the loop
-/// gets a chance to render — a flood coalesces into one frame instead of
-/// rendering per-event.
+/// How many already-queued INTERNAL events one wake may consume before the
+/// loop gets a chance to render — a flood (subprocess output, activity
+/// events) coalesces into one frame instead of rendering per-event.
 const DRAIN_BUDGET: usize = 64;
 
-const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
+/// One spinner frame per 100ms — the Python `set_interval(0.1, self._tick)`.
+const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Operator actions above plain navigation — the explicit Action enum of
+/// the design's loop decision. The read tier stops at the seam: each
+/// variant's dispatch is a section-5 screen push, stubbed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// `p`: ansible ad-hoc ping of the selection (section 5 TaskScreen).
+    Ping,
+    /// `R`: reboot the selection behind options + confirm (section 5).
+    Reboot,
+    /// `D`: deploy the selection behind confirm (section 5 DeployScreen).
+    Deploy,
+}
 
 /// What one select wake produced, before mapping into [`LoopEvent`]s.
 enum Wake {
@@ -43,9 +64,10 @@ enum Wake {
 /// [`AppState`].
 pub struct App {
     pub state: AppState,
-    /// Present when the app owns a real terminal (the demo); `None` under
-    /// tests. Enables ctrl-z suspend-to-shell.
+    /// Present when the app owns a real terminal; `None` under tests.
+    /// Enables ctrl-z suspend-to-shell.
     pub guard: Option<TerminalGuard>,
+    cfg: ExplorerConfig,
     dirty: bool,
     quit: bool,
     deadlines: Deadlines,
@@ -54,11 +76,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(state: AppState) -> Self {
+    pub fn new(state: AppState, cfg: ExplorerConfig) -> Self {
         let (tx, rx) = mpsc::channel(256);
         Self {
             state,
             guard: None,
+            cfg,
             dirty: true,
             quit: false,
             deadlines: Deadlines::default(),
@@ -70,6 +93,15 @@ impl App {
     /// Sender for background tasks feeding the internal channel.
     pub fn sender(&self) -> mpsc::Sender<AppEvent> {
         self.tx.clone()
+    }
+
+    /// Kick the initial aggregate load (the `on_mount` `_load`). Call once
+    /// before [`App::run`].
+    pub fn start_initial_load(&mut self) {
+        if let Some(req) = self.state.request_load() {
+            self.start_load(req);
+        }
+        self.sync_spinner();
     }
 
     /// Drive the loop until quit. Generic over the backend AND the event
@@ -116,23 +148,25 @@ impl App {
                 Wake::Closed => self.quit = true,
             }
 
-            // Bounded drain: consume whatever is ALREADY queued, then fall
-            // through to the single render at the top of the loop.
+            // Bounded drain: consume whatever is ALREADY queued on the
+            // INTERNAL channel, then fall through to the single render at
+            // the top of the loop. The terminal stream is deliberately NOT
+            // drained here (the spike did, via `now_or_never`): crossterm's
+            // `EventStream` hands its background wake task the waker of
+            // whichever poll spawned it, so a poll under `now_or_never`'s
+            // NOOP waker leaves the stream waking a dead waker — the loop
+            // goes deaf to input once no other source happens to re-poll it
+            // (operator-reported post-eval freeze, reproduced on a pty).
+            // Terminal events are human-rate; the flood source is `rx`, and
+            // `try_recv` registers no waker at all.
             let mut budget = DRAIN_BUDGET;
             while budget > 0 && !self.quit {
-                if let Ok(ev) = self.rx.try_recv() {
-                    self.handle(LoopEvent::App(ev), terminal)?;
-                    budget -= 1;
-                    continue;
-                }
-                match events.next().now_or_never() {
-                    Some(Some(Ok(ev))) => {
-                        self.handle(LoopEvent::Term(ev), terminal)?;
+                match self.rx.try_recv() {
+                    Ok(ev) => {
+                        self.handle(LoopEvent::App(ev), terminal)?;
                         budget -= 1;
                     }
-                    Some(Some(Err(e))) => return Err(e),
-                    Some(None) => self.quit = true,
-                    None => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -152,20 +186,50 @@ impl App {
             LoopEvent::Timer(TimerId::SpinnerTick) => {
                 if self.state.tick_spinner() {
                     self.dirty = true;
-                    self.deadlines
-                        .arm(TimerId::SpinnerTick, Instant::now() + SPINNER_INTERVAL);
+                    // Re-arm only while jobs run: the timer stops once every
+                    // job is idle (the Python `_tick` stop condition).
+                    if self.state.any_job_running() {
+                        self.deadlines
+                            .arm(TimerId::SpinnerTick, Instant::now() + SPINNER_INTERVAL);
+                    }
                 }
             }
-            LoopEvent::App(AppEvent::WorkFinished(result)) => {
-                self.state.status = match result {
-                    Ok(()) => Status::Idle,
-                    Err(msg) => Status::Error(msg),
-                };
-                self.deadlines.disarm(TimerId::SpinnerTick);
-                self.dirty = true;
-            }
+            LoopEvent::App(ev) => self.on_app_event(ev),
         }
         Ok(())
+    }
+
+    /// A background job settled or progressed. The drift inputs (snapshot
+    /// dir + clock) are read HERE, at the runtime edge, so the state
+    /// transitions stay pure.
+    fn on_app_event(&mut self, ev: AppEvent) {
+        let follow_up = match ev {
+            AppEvent::LoadFinished { generation, result } => {
+                let snapshots = drift::read_snapshots(&drift::state_dir());
+                self.state
+                    .on_load_finished(generation, result, &snapshots, Utc::now())
+            }
+            AppEvent::DriftEvalFinished { result } => {
+                let snapshots = drift::read_snapshots(&drift::state_dir());
+                self.state
+                    .on_drift_eval_finished(result, &snapshots, Utc::now())
+            }
+            AppEvent::SurveyProgress { n } => {
+                self.state.on_survey_progress(n);
+                None
+            }
+            AppEvent::SurveyDone { n, rc, error } => {
+                let snapshots = drift::read_snapshots(&drift::state_dir());
+                self.state
+                    .on_survey_done(n, rc, error.as_deref(), &snapshots, Utc::now());
+                None
+            }
+        };
+        if let Some(req) = follow_up {
+            self.start_load(req);
+        }
+        self.sync_spinner();
+        self.dirty = true;
     }
 
     fn on_key<B: Backend>(
@@ -178,7 +242,7 @@ impl App {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('z') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(guard) = self.guard.as_mut() {
@@ -188,23 +252,133 @@ impl App {
                     self.dirty = true;
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.dirty |= self.state.move_cursor(1),
-            KeyCode::Char('k') | KeyCode::Up => self.dirty |= self.state.move_cursor(-1),
-            KeyCode::Char('s') if !matches!(self.state.status, Status::Working(_)) => {
-                self.state.status = Status::Working("demo job".into());
-                self.deadlines
-                    .arm(TimerId::SpinnerTick, Instant::now() + SPINNER_INTERVAL);
+
+            // -- tabs -----------------------------------------------------
+            KeyCode::Tab => {
+                self.state.tab = self.state.tab.next();
                 self.dirty = true;
-                // The demo background task: settles through the internal
-                // channel like any real worker would.
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let _ = tx.send(AppEvent::WorkFinished(Ok(()))).await;
-                });
             }
+            KeyCode::BackTab => {
+                self.state.tab = self.state.tab.prev();
+                self.dirty = true;
+            }
+            KeyCode::Char('1') => {
+                self.state.tab = Tab::Members;
+                self.dirty = true;
+            }
+            KeyCode::Char('2') => {
+                self.state.tab = Tab::Groups;
+                self.dirty = true;
+            }
+            KeyCode::Char('3') => {
+                self.state.tab = Tab::Drift;
+                self.dirty = true;
+            }
+
+            // -- select-table semantics (select_table.py) -----------------
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if code == KeyCode::Up { -1 } else { 1 };
+                let table = self.state.active_table_mut();
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    table.extend(delta);
+                } else if modifiers.contains(KeyModifiers::CONTROL) {
+                    table.skip(delta);
+                } else {
+                    table.move_cursor(delta);
+                }
+                self.dirty = true;
+            }
+            KeyCode::Char('k') => {
+                self.state.active_table_mut().move_cursor(-1);
+                self.dirty = true;
+            }
+            KeyCode::Char('j') => {
+                self.state.active_table_mut().move_cursor(1);
+                self.dirty = true;
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let delta = if code == KeyCode::PageUp { -10 } else { 10 };
+                self.state.active_table_mut().move_cursor(delta);
+                self.dirty = true;
+            }
+            KeyCode::Char(' ') => {
+                self.state.active_table_mut().toggle();
+                self.dirty = true;
+            }
+            KeyCode::Esc => {
+                self.state.active_table_mut().clear_selection();
+                self.dirty = true;
+            }
+
+            // -- data refresh ---------------------------------------------
+            KeyCode::Char('r') => {
+                if let Some(req) = self.state.request_reload() {
+                    self.start_load(req);
+                }
+                self.sync_spinner();
+                self.dirty = true;
+            }
+            KeyCode::Char('S') => {
+                let (eval, survey) = self.state.refresh_drift();
+                if eval {
+                    self.start_eval_expected();
+                }
+                if survey {
+                    self.start_survey();
+                }
+                self.sync_spinner();
+                self.dirty = true;
+            }
+
+            // -- action tier (section 5 screens; seam only here) ----------
+            KeyCode::Char('p') => self.dispatch(Action::Ping),
+            KeyCode::Char('R') => self.dispatch(Action::Reboot),
+            KeyCode::Char('D') => self.dispatch(Action::Deploy),
             _ => {}
         }
         Ok(())
+    }
+
+    /// Action dispatch seam. The read tier computes the target
+    /// (selection-else-cursor) and stops: pushing the confirm/task/deploy
+    /// screens is section 5; until then an action with no target — or any
+    /// action at all — is a no-op.
+    fn dispatch(&mut self, action: Action) {
+        let Some(_target) = self.state.target() else {
+            return;
+        };
+        match action {
+            // Section 5: TaskScreen(ansible <target> -m ping).
+            Action::Ping => {}
+            // Section 5: RebootScreen options → confirm → reboot_argv run.
+            Action::Reboot => {}
+            // Section 5: ConfirmScreen → DeployScreen(DeployRun{limit}).
+            Action::Deploy => {}
+        }
+    }
+
+    /// Arm the spinner tick when a job just started (never pushing an
+    /// already-armed deadline forward — one shared 100ms cadence).
+    fn sync_spinner(&mut self) {
+        if self.state.any_job_running() && !self.deadlines.is_armed(TimerId::SpinnerTick) {
+            self.deadlines
+                .arm(TimerId::SpinnerTick, Instant::now() + SPINNER_INTERVAL);
+        }
+    }
+
+    fn start_load(&mut self, req: LoadRequest) {
+        spawn_load(self.tx.clone(), self.cfg.clone(), req);
+    }
+
+    fn start_eval_expected(&mut self) {
+        spawn_eval_expected(
+            self.tx.clone(),
+            self.cfg.clone(),
+            self.state.inventory.clone(),
+        );
+    }
+
+    fn start_survey(&mut self) {
+        spawn_survey(self.tx.clone(), self.cfg.clone());
     }
 }

@@ -63,6 +63,7 @@ pub struct Evaluator {
     backend: Backend,
     worker: Option<Worker>,
     next_id: u64,
+    quiet: bool,
 }
 
 impl Evaluator {
@@ -79,7 +80,20 @@ impl Evaluator {
             backend,
             worker: None,
             next_id: 1,
+            quiet: false,
         }
+    }
+
+    /// Silence child-evaluator stderr (the worker's chatter: dirty-tree
+    /// warnings, fetch/copy progress). The CLI wants that chatter on its
+    /// terminal; the TUI must NOT let any subprocess write through the
+    /// alternate screen (the design's output-captured rule — the survey
+    /// lesson generalized to the eval worker). Errors are unaffected: they
+    /// travel in-band in the worker protocol / captured subprocess output.
+    #[must_use]
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
 
     /// `<flake>#mandala`, fully evaluated to JSON.
@@ -160,7 +174,7 @@ impl Evaluator {
     ) -> Result<Option<Json>, EvalError> {
         for attempt in 0..2 {
             if self.worker.is_none() {
-                self.worker = Some(Worker::spawn()?);
+                self.worker = Some(Worker::spawn(self.quiet)?);
             }
             let id = self.next_id;
             self.next_id += 1;
@@ -211,12 +225,20 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn() -> Result<Self, EvalError> {
+    fn spawn(quiet: bool) -> Result<Self, EvalError> {
         let bin = worker_binary();
+        // `quiet` nulls the worker's stderr: under the TUI its chatter
+        // (dirty warnings, copy progress) would scribble over the alternate
+        // screen. Errors still arrive in-band over the stdio protocol.
+        let stderr = if quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        };
         let mut child = Command::new(&bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
         let stdin = child.stdin.take().ok_or("worker stdin unavailable")?;

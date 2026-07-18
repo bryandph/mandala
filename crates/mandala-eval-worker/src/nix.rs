@@ -125,6 +125,13 @@ impl Evaluator {
         ctx.set_setting("experimental-features", &features)
             .map_err(e2s)?;
 
+        // Parity with the CLI's documented `nix eval --no-warn-dirty` argv
+        // (this worker's contract — see `aggregate`): a fleet checkout is
+        // dirty for the whole life of any change, so warning on every lock
+        // is pure noise — and libnix writes it to stderr, which under the
+        // TUI would land on the alternate screen.
+        ctx.set_setting("warn-dirty", "false").map_err(e2s)?;
+
         let store = Arc::new(Store::open(&ctx, None).map_err(e2s)?);
         let flake_settings = Arc::new(FlakeSettings::new(&ctx).map_err(e2s)?);
         let fetch_settings = FetchersSettings::new(&ctx).map_err(e2s)?;

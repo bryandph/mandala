@@ -1,0 +1,16 @@
+---
+source: crates/mandala-tui/tests/harness.rs
+expression: terminal.backend()
+---
+"mandala — fleet                                                                                                         "
+" members │ groups │ drift                                                                                               "
+"  member           status         current            expected           booted             captured                     "
+"  cache            drift          curcache-toplevel  expcache-toplevel  curcache-toplevel  2026-06-12T11:59:00          "
+"  web              in-sync        curweb00-toplevel  curweb00-toplevel  curweb00-toplevel  2026-06-12T11:59:00          "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"S refresh drift (survey + eval) · R reboot a reboot-pending row   expected @ aaaaaaaaaaa                                "
+"drift refreshed                                                                                                         "
+"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D deploy  ·  q quit             "

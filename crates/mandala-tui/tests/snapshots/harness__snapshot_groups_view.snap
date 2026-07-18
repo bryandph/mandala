@@ -1,0 +1,14 @@
+---
+source: crates/mandala-tui/tests/harness.rs
+expression: terminal.backend()
+---
+"mandala — fleet                                                                 "
+" members │ groups │ drift                                                       "
+"  group            n    members                                                 "
+"  gateway          1    router                                                  "
+"  k3s              2    cache web                                               "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"3 members, 2 groups — space/shift+↑↓ select · p ping · R reboot · D deploy      "
+"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reb"

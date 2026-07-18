@@ -5,7 +5,11 @@
 //! is touched. New sources (context events, subprocess output) add a
 //! variant here, never a second dispatch path.
 
+use std::collections::BTreeMap;
+
 use tokio::time::Instant;
+
+use crate::state::LoadedInventory;
 
 /// Everything the loop can wake on, unified.
 #[derive(Debug)]
@@ -18,11 +22,31 @@ pub enum LoopEvent {
     App(AppEvent),
 }
 
-/// Internal events background tasks send into the loop's channel.
+/// Internal events background tasks send into the loop's channel — the
+/// settle half of every explorer job (the `call_from_thread` analog).
 #[derive(Debug)]
 pub enum AppEvent {
-    /// The demo job settled: `Ok` clears to idle, `Err` sticks as an error.
-    WorkFinished(Result<(), String>),
+    /// The aggregate load task settled. `generation` is the inventory
+    /// generation the task was started for — a stale one is dropped, not
+    /// painted (the `_fill` identity guard).
+    LoadFinished {
+        generation: u64,
+        result: Result<LoadedInventory, String>,
+    },
+    /// The expected-toplevel eval settled: `(repo rev, toplevels)` on
+    /// success, the surfaced `eval failed: …` message on failure.
+    DriftEvalFinished {
+        result: Result<(Option<String>, BTreeMap<String, String>), String>,
+    },
+    /// The survey's live fresh-snapshot tally moved.
+    SurveyProgress { n: usize },
+    /// The survey subprocess settled: final tally, exit code, and (on
+    /// failure) the last captured output line.
+    SurveyDone {
+        n: usize,
+        rc: i32,
+        error: Option<String>,
+    },
 }
 
 /// Identity of an armed timer. One id = one logical timer; re-arming an id
@@ -52,6 +76,13 @@ impl Deadlines {
         self.armed.retain(|(armed_id, _)| *armed_id != id);
     }
 
+    /// Whether `id` currently has a pending deadline (so job starts arm the
+    /// spinner once instead of pushing its deadline forward).
+    #[must_use]
+    pub fn is_armed(&self, id: TimerId) -> bool {
+        self.armed.iter().any(|(armed_id, _)| *armed_id == id)
+    }
+
     /// The earliest armed deadline, if any — what the loop sleeps until.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.armed.iter().map(|(_, at)| *at).min()
@@ -76,10 +107,12 @@ mod tests {
         let mut d = Deadlines::default();
         d.arm(TimerId::SpinnerTick, now + Duration::from_secs(10));
         d.arm(TimerId::SpinnerTick, now + Duration::from_secs(1));
+        assert!(d.is_armed(TimerId::SpinnerTick));
         assert_eq!(d.next_deadline(), Some(now + Duration::from_secs(1)));
         assert!(d.pop_due(now).is_empty());
         let due = d.pop_due(now + Duration::from_secs(2));
         assert_eq!(due, vec![TimerId::SpinnerTick]);
         assert_eq!(d.next_deadline(), None);
+        assert!(!d.is_armed(TimerId::SpinnerTick));
     }
 }
