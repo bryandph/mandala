@@ -424,9 +424,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
+        // A process-wide counter, not just (pid, now): the sandbox clock is
+        // coarse enough that two parallel tests can read the same nanos and
+        // silently SHARE a scratch dir (one test's real-timestamped run then
+        // pollutes another's listing).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mandala-registry-test-{}-{:?}",
+            "mandala-registry-test-{}-{}-{:?}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

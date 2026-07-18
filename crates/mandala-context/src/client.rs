@@ -53,10 +53,35 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+/// Why a forwarded call did not return a result — the distinction the
+/// failover retry discipline turns on (fleet-context spec: idempotent reads
+/// may be retried once after promotion, mutations never).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallFailure {
+    /// The leader answered: the tool itself failed with this message. The
+    /// call EXECUTED — never retry-worthy.
+    Tool(String),
+    /// The connection died before the result arrived. Whether the call
+    /// executed at the (former) leader is unknown — the ambiguity that makes
+    /// automatic mutation retries unsafe.
+    ConnectionLost,
+}
+
+impl std::fmt::Display for CallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tool(msg) => write!(f, "{msg}"),
+            Self::ConnectionLost => write!(f, "context connection closed"),
+        }
+    }
+}
+
+impl std::error::Error for CallFailure {}
+
 /// Waiters the reader task settles.
 #[derive(Default)]
 struct Waiters {
-    calls: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
+    calls: HashMap<u64, oneshot::Sender<Result<Value, CallFailure>>>,
     ping: Option<oneshot::Sender<()>>,
     subscribed: Option<oneshot::Sender<()>>,
     events: Option<mpsc::Sender<Value>>,
@@ -165,13 +190,19 @@ impl ContextClient {
                     let mut w = waiters.lock().expect("waiters lock poisoned");
                     match frame {
                         Frame::CallResult {
-                            id, ok, result, error, ..
+                            id,
+                            ok,
+                            result,
+                            error,
+                            ..
                         } => {
                             if let Some(sender) = w.calls.remove(&id) {
                                 let outcome = if ok {
                                     Ok(result.unwrap_or(Value::Null))
                                 } else {
-                                    Err(error.unwrap_or_else(|| "call failed".to_string()))
+                                    Err(CallFailure::Tool(
+                                        error.unwrap_or_else(|| "call failed".to_string()),
+                                    ))
                                 };
                                 let _ = sender.send(outcome);
                             }
@@ -199,8 +230,12 @@ impl ContextClient {
                 }
                 let mut w = waiters.lock().expect("waiters lock poisoned");
                 for (_, sender) in w.calls.drain() {
-                    let _ = sender.send(Err("context connection closed".to_string()));
+                    let _ = sender.send(Err(CallFailure::ConnectionLost));
                 }
+                // Close the subscription stream too: a dropped leader must
+                // surface as end-of-stream (the resumption trigger), never
+                // as a silent hang.
+                w.events = None;
             });
         }
 
@@ -214,11 +249,13 @@ impl ContextClient {
         })
     }
 
-    /// Execute one tool call at the leader. `Err` carries either the tool's
-    /// own error text or the structured connection-loss message.
+    /// Execute one tool call at the leader.
     ///
     /// # Errors
-    /// The forwarded call failed, or the connection dropped mid-call.
+    /// [`CallFailure::Tool`] when the leader answered with a tool-level error
+    /// (the call executed); [`CallFailure::ConnectionLost`] when the
+    /// connection died before the result arrived (execution state unknown —
+    /// the failover-retry distinction).
     ///
     /// # Panics
     /// The waiter lock is poisoned (a routing task panicked).
@@ -226,7 +263,7 @@ impl ContextClient {
         &self,
         tool: &str,
         args: serde_json::Map<String, Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, CallFailure> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (otx, orx) = oneshot::channel();
         self.waiters
@@ -241,9 +278,8 @@ impl ContextClient {
                 args,
             })
             .await
-            .map_err(|_| "context connection closed".to_string())?;
-        orx.await
-            .map_err(|_| "context connection closed".to_string())?
+            .map_err(|_| CallFailure::ConnectionLost)?;
+        orx.await.map_err(|_| CallFailure::ConnectionLost)?
     }
 
     /// Subscribe to the leader's activity stream. Resolves once the server
@@ -280,10 +316,7 @@ impl ContextClient {
     /// The waiter lock is poisoned (a routing task panicked).
     pub async fn ping(&self) -> bool {
         let (ptx, prx) = oneshot::channel();
-        self.waiters
-            .lock()
-            .expect("waiters lock poisoned")
-            .ping = Some(ptx);
+        self.waiters.lock().expect("waiters lock poisoned").ping = Some(ptx);
         if self.tx.send(Frame::Ping).await.is_err() {
             return false;
         }

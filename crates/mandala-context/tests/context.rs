@@ -43,11 +43,13 @@ fn scratch(tag: &str) -> (PathBuf, PathBuf) {
 
 /// A dispatch that echoes `{tool, origin, args}` after an optional
 /// `sleep_ms` delay, and (when given a sender) publishes one activity event
-/// before settling.
+/// before settling. Wire calls carry the hello client as origin; local
+/// calls echo `"local"`.
 fn echo_dispatch(events: Option<broadcast::Sender<Value>>) -> mandala_context::Dispatch {
     Arc::new(move |origin, tool, args| {
         let events = events.clone();
         Box::pin(async move {
+            let origin = origin.unwrap_or_else(|| "local".to_string());
             if let Some(ms) = args.get("sleep_ms").and_then(Value::as_u64) {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
@@ -89,9 +91,7 @@ async fn promotion_race_has_exactly_one_winner() {
     for i in 0..8 {
         let identity = identity.clone();
         let state = state.clone();
-        tasks.spawn(async move {
-            acquire(&identity, &state, &format!("racer-{i}"), config()).await
-        });
+        tasks.spawn(async move { acquire(&identity, &state, &format!("racer-{i}"), config).await });
     }
     let mut leaders = Vec::new();
     let mut followers = Vec::new();
@@ -157,7 +157,7 @@ async fn stale_discovery_is_reclaimed_without_cleanup() {
     )
     .unwrap();
 
-    let acquired = acquire(&identity, &state, "reclaimer", config())
+    let acquired = acquire(&identity, &state, "reclaimer", config)
         .await
         .expect("stale discovery must not block the claim");
     let Acquired::Leader(host) = acquired else {
@@ -171,9 +171,7 @@ async fn stale_discovery_is_reclaimed_without_cleanup() {
     assert!(identity.ports().any(|p| p == host.port()));
 
     // And the rewritten discovery actually serves joiners.
-    let joiner = acquire(&identity, &state, "joiner", config())
-        .await
-        .unwrap();
+    let joiner = acquire(&identity, &state, "joiner", config).await.unwrap();
     assert!(matches!(joiner, Acquired::Follower(_)));
 }
 
@@ -204,13 +202,15 @@ async fn derived_port_collision_walks_and_converges() {
     let (_, state_a) = scratch("collide-state-a");
     let (_, state_b) = scratch("collide-state-b");
 
-    let leader_a = match acquire(&a, &state_a, "ctx-a", config()).await.unwrap() {
+    let leader_a = match acquire(&a, &state_a, "ctx-a", config).await.unwrap() {
         Acquired::Leader(host) => host,
         Acquired::Follower(_) => panic!("first context must lead"),
     };
-    let leader_b = match acquire(&b, &state_b, "ctx-b", config()).await.unwrap() {
+    let leader_b = match acquire(&b, &state_b, "ctx-b", config).await.unwrap() {
         Acquired::Leader(host) => host,
-        Acquired::Follower(_) => panic!("colliding context must walk to its own bind, not join a foreign flake"),
+        Acquired::Follower(_) => {
+            panic!("colliding context must walk to its own bind, not join a foreign flake")
+        }
     };
 
     assert_ne!(leader_a.port(), leader_b.port());
@@ -232,7 +232,7 @@ async fn derived_port_collision_walks_and_converges() {
     }
 
     // Convergence: a joiner for B follows B's discovery to the walked port.
-    let joiner = acquire(&b, &state_b, "b-joiner", config()).await.unwrap();
+    let joiner = acquire(&b, &state_b, "b-joiner", config).await.unwrap();
     let Acquired::Follower(client) = joiner else {
         panic!("B's context is live — joiners must follow, not re-lead");
     };
@@ -244,7 +244,10 @@ async fn derived_port_collision_walks_and_converges() {
 
 /// Bind an ephemeral port and serve the protocol on it (pure protocol tests
 /// need no derived ports).
-async fn test_host(events: broadcast::Sender<Value>, heartbeat: Duration) -> (RunningHost, SocketAddr, String) {
+async fn test_host(
+    events: broadcast::Sender<Value>,
+    heartbeat: Duration,
+) -> (RunningHost, SocketAddr, String) {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -310,7 +313,10 @@ async fn call_subscribe_ping_roundtrips() {
         .call("echo", json!({"x": 1}).as_object().cloned().unwrap())
         .await
         .unwrap();
-    assert_eq!(result, json!({"tool": "echo", "origin": "caller", "args": {"x": 1}}));
+    assert_eq!(
+        result,
+        json!({"tool": "echo", "origin": "caller", "args": {"x": 1}})
+    );
 
     // The dispatch published one event; the subscribed observer receives it,
     // origin-labeled with the CALLER's hello identity.
@@ -318,7 +324,10 @@ async fn call_subscribe_ping_roundtrips() {
         .await
         .expect("event within 5s")
         .expect("stream open");
-    assert_eq!(event, json!({"tool": "echo", "origin": "caller", "status": "ok"}));
+    assert_eq!(
+        event,
+        json!({"tool": "echo", "origin": "caller", "status": "ok"})
+    );
 }
 
 /// A long-blocking call's connection stays observably alive: heartbeat
@@ -338,7 +347,10 @@ async fn heartbeats_cover_a_blocking_call() {
 
     // In flight for ~400ms at a 25ms cadence: the connection proves itself.
     let result = client
-        .call("slow", json!({"sleep_ms": 400}).as_object().cloned().unwrap())
+        .call(
+            "slow",
+            json!({"sleep_ms": 400}).as_object().cloned().unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(result["tool"], "slow");

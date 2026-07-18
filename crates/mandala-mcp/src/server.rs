@@ -178,7 +178,8 @@ impl MandalaHandler {
     /// The activity dispatch wrapper: `start` at entry, `ok`/`error` at
     /// settle (sharing a `seq`, carrying `elapsed` + a result summary), then
     /// the result. This is the one funnel every tool call passes through —
-    /// the audit trail exists even headless.
+    /// the audit trail exists even headless. Local calls carry no origin;
+    /// context-forwarded calls go through [`MandalaHandler::call_tool_from`].
     ///
     /// # Errors
     /// Tool-level failures (unknown tool, invalid arguments, `ToolError`-tier
@@ -189,29 +190,57 @@ impl MandalaHandler {
         name: &str,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult, CallToolError> {
+        self.call_tool_from(None, name, args).await
+    }
+
+    /// [`MandalaHandler::call_tool`] with an explicit ORIGIN: the hello
+    /// `client` identity of the context connection a forwarded call arrived
+    /// on. When present it is stamped on both activity events of the pair —
+    /// and thereby on the audit entry of a mutating settle (an ADDED audit
+    /// field: forward-compatible per fleet-state-formats; every existing
+    /// field is untouched). Leader-local calls pass `None` and carry no
+    /// origin at all.
+    ///
+    /// # Errors
+    /// Same as [`MandalaHandler::call_tool`].
+    pub async fn call_tool_from(
+        &self,
+        origin: Option<&str>,
+        name: &str,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult, CallToolError> {
         let seq = self.state.seq.fetch_add(1, Ordering::Relaxed);
         let args_value = Value::Object(args.clone());
         let started = Instant::now();
-        self.emit(&json!({
-            "tool": name, "args": args_value, "status": "start",
-            "detail": null, "seq": seq,
-        }));
+        self.emit(&with_origin(
+            json!({
+                "tool": name, "args": args_value, "status": "start",
+                "detail": null, "seq": seq,
+            }),
+            origin,
+        ));
         match self.dispatch(name, args).await {
             Ok(value) => {
-                self.emit(&json!({
-                    "tool": name, "args": args_value, "status": "ok",
-                    "detail": null, "seq": seq,
-                    "elapsed": round3(started.elapsed().as_secs_f64()),
-                    "result": result_summary(&value),
-                }));
+                self.emit(&with_origin(
+                    json!({
+                        "tool": name, "args": args_value, "status": "ok",
+                        "detail": null, "seq": seq,
+                        "elapsed": round3(started.elapsed().as_secs_f64()),
+                        "result": result_summary(&value),
+                    }),
+                    origin,
+                ));
                 Ok(to_call_result(value))
             }
             Err(err) => {
-                self.emit(&json!({
-                    "tool": name, "args": args_value, "status": "error",
-                    "detail": err.to_string(), "seq": seq,
-                    "elapsed": round3(started.elapsed().as_secs_f64()),
-                }));
+                self.emit(&with_origin(
+                    json!({
+                        "tool": name, "args": args_value, "status": "error",
+                        "detail": err.to_string(), "seq": seq,
+                        "elapsed": round3(started.elapsed().as_secs_f64()),
+                    }),
+                    origin,
+                ));
                 Err(err)
             }
         }
@@ -780,6 +809,15 @@ impl MandalaHandler {
 /// Round to three decimals (Python `round(x, 3)` for `elapsed`).
 fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
+}
+
+/// Stamp the originating client on an activity event — only when there is
+/// one (leader-local events must carry NO `origin` key, not a null).
+fn with_origin(mut event: Value, origin: Option<&str>) -> Value {
+    if let (Some(origin), Some(obj)) = (origin, event.as_object_mut()) {
+        obj.insert("origin".to_string(), Value::from(origin));
+    }
+    event
 }
 
 /// Merge `extra`'s keys over `base` (both objects) — the Python `{**result,

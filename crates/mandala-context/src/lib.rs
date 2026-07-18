@@ -19,6 +19,7 @@
 
 pub mod client;
 pub mod discovery;
+pub mod fleet;
 pub mod host;
 pub mod identity;
 pub mod protocol;
@@ -30,8 +31,9 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 
-pub use client::{ConnectError, ContextClient};
+pub use client::{CallFailure, ConnectError, ContextClient};
 pub use discovery::{Discovery, mint_token};
+pub use fleet::{CallError, ContextSession, FleetContext, HostConfigFactory, LocalContext};
 pub use host::{Dispatch, DispatchFuture, HostConfig, RunningHost};
 pub use identity::ContextIdentity;
 
@@ -69,7 +71,10 @@ impl std::fmt::Display for AcquireError {
             Self::Io(e) => write!(f, "context acquire failed: {e}"),
             Self::PortsExhausted => write!(f, "no free port in the context range"),
             Self::TokenUnavailable => {
-                write!(f, "live leader rejected our token and discovery never refreshed")
+                write!(
+                    f,
+                    "live leader rejected our token and discovery never refreshed"
+                )
             }
         }
     }
@@ -86,7 +91,8 @@ const TOKEN_RACE_POLL: Duration = Duration::from_millis(50);
 /// else bind-as-lock and become it.
 ///
 /// `client_name` is this process's identity in hellos (labels its calls in
-/// the leader's activity stream). `config` is only used on the leader path.
+/// the leader's activity stream). `config` is a factory invoked ONLY on the
+/// leader path — a joiner never pays for (or observes) leader-side setup.
 ///
 /// # Errors
 /// [`AcquireError`] — I/O failures, an exhausted port range, or an
@@ -95,8 +101,9 @@ pub async fn acquire(
     identity: &ContextIdentity,
     state_dir: &Path,
     client_name: &str,
-    config: HostConfig,
+    config: impl FnOnce() -> HostConfig,
 ) -> Result<Acquired, AcquireError> {
+    let mut config = Some(config);
     // Reuse the context's token when a discovery file for OUR flake exists —
     // stable across leader restarts (spec: token mint/reuse). A stale or
     // foreign file just means we mint.
@@ -120,12 +127,14 @@ pub async fn acquire(
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         match TcpListener::bind(addr).await {
             Ok(listener) => {
+                let config = config.take().expect("the leader path runs at most once")();
                 let host = RunningHost::start(
                     listener,
                     token.clone(),
                     identity.flake().to_string(),
                     config,
-                );
+                )
+                .published_at(state_dir, identity.key());
                 discovery::write(
                     state_dir,
                     identity.key(),

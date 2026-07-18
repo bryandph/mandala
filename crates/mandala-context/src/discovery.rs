@@ -118,10 +118,8 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mandala-context-disc-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mandala-context-disc-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -155,10 +153,7 @@ mod tests {
         );
 
         assert_eq!(read(&dir, "demo-abc"), Some(sample()));
-        assert_eq!(
-            sample().addr(),
-            Some("127.0.0.1:27160".parse().unwrap())
-        );
+        assert_eq!(sample().addr(), Some("127.0.0.1:27160".parse().unwrap()));
     }
 
     #[test]
