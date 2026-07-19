@@ -19,7 +19,7 @@ use mandala_core::registry::{self, Meta};
 use mandala_core::runner::{COMMAND_LOG, DeployRun};
 use mandala_mcp::MandalaHandler;
 use mandala_mcp::effects::{
-    AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure,
+    AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure, SurveyOutput,
 };
 use serde_json::{Value, json};
 
@@ -30,14 +30,15 @@ pub fn base_aggregate() -> Value {
         "schemaVersion": 1,
         "members": {
             "web": {
+                "name": "web",
                 "platform": "metal",
                 "architecture": "x86_64-linux",
                 "category": "server",
                 "role": "web",
                 "tags": ["edge"],
             },
-            "cache": {"platform": "metal", "architecture": "x86_64-linux"},
-            "router": {"platform": "opnsense"},
+            "cache": {"name": "cache", "platform": "metal", "architecture": "x86_64-linux"},
+            "router": {"name": "router", "platform": "opnsense"},
         },
         "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
         "projections": {"deploy": {"nodes": ["cache", "web"]}},
@@ -69,6 +70,8 @@ pub struct FakeEffects {
     pub eval: Option<Result<BTreeMap<String, String>, EvalFailure>>,
     /// `drift.repo_rev` stand-in.
     pub rev: Option<String>,
+    /// Read-only survey result for drift refresh tests.
+    pub refresh: Option<SurveyOutput>,
     /// The fresh aggregate `reload` evaluates.
     pub fresh: Option<Value>,
     /// `DeployRun.start` stubbed to `resolve_paths()` (no subprocess).
@@ -110,8 +113,11 @@ impl Effects for FakeEffects {
         self.rev.clone()
     }
 
-    async fn refresh_snapshots(&self) -> io::Result<i32> {
-        panic!("unexpected refresh_snapshots call")
+    async fn refresh_snapshots(&self) -> io::Result<SurveyOutput> {
+        Ok(self
+            .refresh
+            .clone()
+            .expect("unexpected refresh_snapshots call"))
     }
 
     async fn run_adhoc(&self, _argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {

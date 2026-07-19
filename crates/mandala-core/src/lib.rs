@@ -12,7 +12,9 @@ pub mod runner;
 pub use cli::{Cli, Engine, TuiRequest};
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};
 pub use inventory::{Aggregate, Inventory, InventoryError, Member, SUPPORTED_SCHEMA_VERSION};
-pub use registry::{ObservedRun, RunInfo, RunLiveness, list_runs, new_run_dir, open_run};
+pub use registry::{
+    ObservedRun, RunInfo, RunLiveness, is_valid_run_id, list_runs, new_run_dir, open_run,
+};
 pub use runner::{
     BuildModel, COMMAND_LOG, CommandRun, DeployRun, EventTailer, HostRun, HostState, ansible_dir,
     reboot_argv,

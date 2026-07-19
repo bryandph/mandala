@@ -23,6 +23,16 @@
 }: let
   engine = import ../lib {inherit lib;};
   cfg = config.mandala;
+  nixosMembers = lib.mapAttrs (_: c: c.config.host) (inputs.self.nixosConfigurations or {});
+  collisions = lib.intersectLists (lib.attrNames nixosMembers) (lib.attrNames cfg.extraMembers);
+  mergedMembers = nixosMembers // cfg.extraMembers;
+  validHostname = name:
+    builtins.stringLength name
+    <= 63
+    && builtins.match "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?" name != null
+    && lib.toLower name != "all";
+  invalidKeys = lib.filter (name: !validHostname name) (lib.attrNames mergedMembers);
+  mismatchedNames = lib.filter (name: !(mergedMembers.${name} ? name) || mergedMembers.${name}.name != name) (lib.attrNames mergedMembers);
 in {
   options.mandala = {
     extraMembers = lib.mkOption {
@@ -51,9 +61,12 @@ in {
   };
 
   config = {
-    mandala.members =
-      lib.mapAttrs (_: c: c.config.host) (inputs.self.nixosConfigurations or {})
-      // cfg.extraMembers;
+    mandala.members = assert lib.assertMsg (collisions == [])
+    "mandala member sources overlap: ${lib.concatStringsSep ", " collisions}";
+    assert lib.assertMsg (invalidKeys == [])
+    "mandala member keys must be bare RFC 1123 hostnames: ${lib.concatStringsSep ", " invalidKeys}";
+    assert lib.assertMsg (mismatchedNames == [])
+    "mandala member keys must equal host.name: ${lib.concatStringsSep ", " mismatchedNames}"; mergedMembers;
 
     flake.mandala = engine.aggregate {
       inherit (cfg) members projections operator;

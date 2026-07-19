@@ -398,10 +398,7 @@ fn subprocess_expected_toplevels(
     members: &[String],
 ) -> Result<BTreeMap<String, String>, EvalError> {
     for name in members {
-        if !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-        {
+        if !crate::inventory::is_valid_member_name(name) {
             return Err(format!("refusing to eval: invalid member name {name:?}"));
         }
     }

@@ -31,7 +31,7 @@ use mandala_core::inventory::{Inventory, InventoryError};
 use mandala_core::registry::{self, Meta, RunLiveness};
 use mandala_core::runner::{CommandRun, DeployRun};
 use mandala_mcp::effects::{
-    AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure,
+    AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure, SurveyOutput,
 };
 use mandala_mcp::{MandalaHandler, handler_dispatch, tool_is_idempotent};
 use mandala_tui::app::App;
@@ -74,8 +74,8 @@ fn aggregate() -> Value {
     json!({
         "schemaVersion": 1,
         "members": {
-            "web": {"platform": "metal"},
-            "cache": {"platform": "metal"},
+            "web": {"name": "web", "platform": "metal"},
+            "cache": {"name": "cache", "platform": "metal"},
         },
         "groups": {"k3s": ["cache", "web"]},
         "projections": {"deploy": {"nodes": ["cache", "web"]}},
@@ -481,8 +481,12 @@ impl Effects for StubEffects {
     async fn repo_rev(&self, _flake: &str) -> Option<String> {
         None
     }
-    async fn refresh_snapshots(&self) -> io::Result<i32> {
-        Ok(0)
+    async fn refresh_snapshots(&self) -> io::Result<SurveyOutput> {
+        Ok(SurveyOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: 0,
+        })
     }
     async fn run_adhoc(&self, _argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {
         panic!("unexpected run_adhoc call")

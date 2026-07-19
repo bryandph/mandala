@@ -49,8 +49,8 @@ fn aggregate() -> serde_json::Value {
     json!({
         "schemaVersion": 1,
         "members": {
-            "web": {"platform": "metal"},
-            "cache": {"platform": "metal"},
+            "web": {"name": "web", "platform": "metal"},
+            "cache": {"name": "cache", "platform": "metal"},
         },
         "groups": {"k3s": ["cache", "web"]},
         "projections": {"deploy": {"nodes": ["cache", "web"]}},

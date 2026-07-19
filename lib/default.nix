@@ -1,5 +1,20 @@
 # Engine library. Pure nixpkgs.lib — no packages, no operator data.
-{lib}: rec {
+{lib}: let
+  assertionModule = {lib, ...}: {
+    options.assertions = lib.mkOption {
+      type = lib.types.listOf lib.types.unspecified;
+      default = [];
+      internal = true;
+    };
+  };
+
+  checked = evaluated: let
+    failures = map (entry: entry.message) (lib.filter (entry: !entry.assertion) evaluated.config.assertions);
+  in
+    assert lib.assertMsg (failures == [])
+    ("mandala schema validation:\n  " + lib.concatStringsSep "\n  " failures);
+      evaluated.config;
+in rec {
   # Schema modules (paths, importable into any module evaluation).
   schemas = {
     operator = ../schema/operator.nix;
@@ -32,12 +47,13 @@
 
   # Same contract for PKI trust anchors (`{cas = {...};}`).
   evalPki = data:
-    (lib.evalModules {
+    (checked (lib.evalModules {
       modules = [
+        assertionModule
         schemas.pki
         {pki = data;}
       ];
-    }).config.pki;
+    })).pki;
 
   # Same contract for the overlay-mesh table (`{members = {...};}`).
   evalMesh = data:
@@ -61,25 +77,17 @@
         networks = net.resolveNetworks topology (data.networks or []);
       });
 
-  # Evaluate one member's data against the member schema, plus the
-  # cross-field invariants the module system can't express per-option
-  # (NixOS consumers enforce the same invariants as host assertions).
-  evalMember = data: let
-    m =
-      (lib.evalModules {
-        modules = [
-          schemas.member
-          {host = data;}
-        ];
-      }).config.host;
-    withRole = role: lib.filter (n: lib.elem role n.roles) m.networks;
-  in
-    assert lib.assertMsg
-    (lib.all (role: lib.length (withRole role) <= 1) ["dns" "reach" "gateway" "management"])
-    "member ${m.name}: at most one network may carry each address role";
-    assert lib.assertMsg
-    (lib.all (n: n.assignment != "reservation" || n.address != null) m.networks)
-    "member ${m.name}: assignment = \"reservation\" requires an address (it IS the reservation)"; m;
+  # Evaluate one member against the SAME `config.assertions` authored by the
+  # schema for direct NixOS consumers. The generic module evaluator receives
+  # the minimal assertion option that NixOS normally supplies.
+  evalMember = data:
+    (checked (lib.evalModules {
+      modules = [
+        assertionModule
+        schemas.member
+        {host = data;}
+      ];
+    })).host;
 
   # Evaluate secret declarations against the schema AND the fleet: readers
   # resolve to member names (explicit members ∪ group members ∪ the

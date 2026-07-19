@@ -339,9 +339,14 @@ impl Evaluator {
         flake: &str,
         member: &str,
     ) -> Result<Option<String>, EvalError> {
-        if !member
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        let bytes = member.as_bytes();
+        if !(1..=63).contains(&bytes.len())
+            || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            || member.eq_ignore_ascii_case("all")
         {
             return Err(format!("refusing invalid member name {member:?}"));
         }

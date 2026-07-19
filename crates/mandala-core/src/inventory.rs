@@ -34,6 +34,21 @@ use serde_json::Value;
 /// else is rejected at [`Inventory`] construction rather than misread.
 pub const SUPPORTED_SCHEMA_VERSION: u64 = 1;
 
+/// Validate a member selector as one bare RFC 1123 host label. Mandala keeps
+/// network plane/domain data separate and constructs FQDNs in projections, so
+/// dots and domain suffixes are deliberately not accepted here.
+#[must_use]
+pub fn is_valid_member_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        && !name.eq_ignore_ascii_case("all")
+}
+
 /// The parity error type for inventory construction and selector resolution —
 /// the Rust equivalent of the Python `InventoryError`. Each variant's
 /// [`fmt::Display`] reproduces the Python message text verbatim, so callers
@@ -220,6 +235,35 @@ impl Inventory {
         }
         let aggregate: Aggregate =
             serde_json::from_value(value).map_err(|e| InventoryError::Malformed(e.to_string()))?;
+        for (key, member) in &aggregate.members {
+            if !is_valid_member_name(key) {
+                return Err(InventoryError::Malformed(format!(
+                    "member key {key:?} is not a bare RFC 1123 hostname"
+                )));
+            }
+            match member.get("name").and_then(Value::as_str) {
+                Some(name) if name == key => {}
+                Some(name) => {
+                    return Err(InventoryError::Malformed(format!(
+                        "member key {key:?} does not match host.name {name:?}"
+                    )));
+                }
+                None => {
+                    return Err(InventoryError::Malformed(format!(
+                        "member {key:?} has no string host.name"
+                    )));
+                }
+            }
+        }
+        for (group, members) in &aggregate.groups {
+            for member in members {
+                if !aggregate.members.contains_key(member) {
+                    return Err(InventoryError::Malformed(format!(
+                        "group {group:?} references unknown member {member:?}"
+                    )));
+                }
+            }
+        }
         Ok(Self { aggregate })
     }
 
@@ -388,7 +432,11 @@ mod tests {
     fn test_inv() -> Inventory {
         Inventory::from_value(json!({
             "schemaVersion": 1,
-            "members": {"web": {}, "cache": {}, "router": {}},
+            "members": {
+                "web": {"name": "web"},
+                "cache": {"name": "cache"},
+                "router": {"name": "router"},
+            },
             "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
             "projections": {},
         }))
@@ -544,6 +592,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn member_names_are_bare_rfc1123_labels() {
+        for valid in ["web", "web-1", "1-web", "A1"] {
+            assert!(is_valid_member_name(valid), "rejected {valid:?}");
+        }
+        for invalid in [
+            "",
+            "all",
+            "-web",
+            "web-",
+            "web_node",
+            "web.example.test",
+            "../web",
+            "web,cache",
+            "web:cache",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!is_valid_member_name(invalid), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn inventory_rejects_unsafe_or_mismatched_member_identity() {
+        for (key, name) in [("web.example", "web.example"), ("web", "cache")] {
+            let err = Inventory::from_value(json!({
+                "schemaVersion": 1,
+                "members": {key: {"name": name}},
+                "groups": {},
+            }))
+            .unwrap_err();
+            assert!(err.to_string().contains("malformed aggregate"));
+        }
+    }
+
     // ---- surfaces() ---------------------------------------------------------
 
     #[test]
@@ -618,6 +700,7 @@ mod tests {
             "schemaVersion": 1,
             "members": {
                 "web": {
+                    "name": "web",
                     "platform": "nixos",
                     "architecture": "x86_64",
                     "category": "server",
@@ -648,7 +731,10 @@ mod tests {
         // member body contents.
         let inv = Inventory::from_value(json!({
             "schemaVersion": 1,
-            "members": {"alpha": {"junk": 1}, "beta": {}},
+            "members": {
+                "alpha": {"name": "alpha", "junk": 1},
+                "beta": {"name": "beta"},
+            },
             "groups": {"pair": ["alpha", "beta"]},
         }))
         .unwrap();

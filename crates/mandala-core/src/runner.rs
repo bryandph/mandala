@@ -26,7 +26,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
 
@@ -371,10 +371,11 @@ impl EventTailer {
 
 // ==== write-side: subprocess-owning runners ==============================
 //
-// `DeployRun` (fan-out playbook) and `CommandRun` (ad-hoc background command,
-// e.g. reboot) own a tokio subprocess, register the run in the discoverable
-// registry so other frontends can attach, and drain/reap it in background
-// tasks. Parity port of `runner.py` lines 35-62 (helpers) and 210-449.
+// `DeployRun` (fan-out playbook) launches a dedicated supervisor process;
+// `CommandRun` (ad-hoc background command, e.g. reboot) owns a tokio
+// subprocess directly. Both register the run in the discoverable registry so
+// other frontends can attach. Parity port of `runner.py` lines 35-62
+// (helpers) and 210-449.
 
 /// The operator repo's ansible root when present, else the cwd — the one
 /// working-directory convention every frontend shares. Parity of the Python
@@ -459,6 +460,118 @@ fn merge_meta(meta: &mut Meta, extra: &Meta) {
     }
 }
 
+const DEPLOY_SUPERVISOR_REQUEST: &str = "supervisor.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DeploySupervisorRequest {
+    argv: Vec<String>,
+    cwd: PathBuf,
+    events_dir: PathBuf,
+}
+
+fn supervisor_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MANDALA_DEPLOY_SUPERVISOR_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let sibling = directory.join("mandala-run-supervisor");
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        let sibling = directory.parent()?.join("mandala-run-supervisor");
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+    None
+}
+
+/// Run one deploy request from a dedicated process. The supervisor owns the
+/// actual playbook child, durable log descriptors, reaping, and terminal
+/// metadata, so none of those depend on the frontend's Tokio runtime.
+///
+/// # Errors
+/// Invalid registry paths, request decoding, log setup, spawn, wait, or meta
+/// settlement failures.
+pub fn run_deploy_supervisor(run_dir: &Path) -> std::io::Result<i64> {
+    let run_dir = run_dir.canonicalize()?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("run directory has no UTF-8 basename"))?;
+    if !registry::is_valid_run_id(run_id) {
+        return Err(std::io::Error::other("invalid run directory identifier"));
+    }
+    let registry_root = registry::runs_dir().canonicalize()?;
+    if run_dir.parent() != Some(registry_root.as_path()) {
+        return Err(std::io::Error::other(
+            "run directory is outside the registry",
+        ));
+    }
+
+    let request_path = run_dir.join(DEPLOY_SUPERVISOR_REQUEST);
+    let request: DeploySupervisorRequest =
+        serde_json::from_slice(&std::fs::read(&request_path)?).map_err(std::io::Error::other)?;
+    let _ = std::fs::remove_file(&request_path);
+    if request.argv.is_empty() || request.events_dir.canonicalize()? != run_dir {
+        return Err(std::io::Error::other("invalid deploy supervisor request"));
+    }
+
+    let log_path = run_dir.join(COMMAND_LOG);
+    let out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
+    let err = out.try_clone()?;
+    let mut command = std::process::Command::new(&request.argv[0]);
+    command
+        .args(&request.argv[1..])
+        .current_dir(&request.cwd)
+        .env("MANDALA_FLEET_EVENTS", &run_dir)
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    if std::env::var_os("ANSIBLE_FORCE_COLOR").is_none() {
+        command.env("ANSIBLE_FORCE_COLOR", "0");
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                let _ = writeln!(log, "failed to launch {}: {error}", request.argv[0]);
+            }
+            let mut fields = Meta::new();
+            fields.insert(
+                "supervisor_pid".into(),
+                Value::from(i64::from(std::process::id())),
+            );
+            fields.insert("pid".into(), Value::Null);
+            fields.insert("rc".into(), Value::from(127));
+            fields.insert("error".into(), Value::from(error.to_string()));
+            fields.insert("finished_at".into(), Value::from(now_epoch_f64()));
+            registry::update_meta(&run_dir, fields)?;
+            return Ok(127);
+        }
+    };
+
+    let mut running = Meta::new();
+    running.insert(
+        "supervisor_pid".into(),
+        Value::from(i64::from(std::process::id())),
+    );
+    running.insert("pid".into(), Value::from(i64::from(child.id())));
+    registry::update_meta(&run_dir, running)?;
+
+    let status = child.wait()?;
+    let code = exit_code(status);
+    let mut terminal = Meta::new();
+    terminal.insert("rc".into(), Value::from(code));
+    terminal.insert("finished_at".into(), Value::from(now_epoch_f64()));
+    registry::update_meta(&run_dir, terminal)?;
+    Ok(code)
+}
+
 /// Lines kept in a [`DeployRun`]'s stdout mirror (Python `deque(maxlen=4000)`).
 const DEPLOY_OUTPUT_MAX: usize = 4000;
 
@@ -478,8 +591,8 @@ where
     });
 }
 
-/// One fan-out deploy: an owned `ansible-playbook` subprocess (on tokio) plus
-/// the [`EventTailer`] over the run dir it streams into — or, in *attached*
+/// One fan-out deploy: an owned supervisor process plus the [`EventTailer`]
+/// over the run dir the supervised playbook streams into — or, in *attached*
 /// mode, a read-only observer of a run another process launched (a
 /// Claude-triggered deploy), owning no subprocess. Parity port of the Python
 /// `DeployRun`.
@@ -504,7 +617,9 @@ pub struct DeployRun {
     /// The bounded stdout+stderr mirror the reader tasks fill; shared with them,
     /// snapshot via [`DeployRun::output`].
     output: Arc<Mutex<VecDeque<String>>>,
-    /// Owned-mode subprocess; `None` in attached mode / before `start`.
+    /// Byte offset already copied from the supervisor-owned durable log.
+    output_offset: Mutex<u64>,
+    /// Owned-mode supervisor; `None` in attached mode / before `start`.
     child: Option<tokio::process::Child>,
     /// Cached exit status once reaped (tokio's `try_wait` yields it once).
     exited: Option<std::process::ExitStatus>,
@@ -529,6 +644,7 @@ impl DeployRun {
             tailer: None,
             program: None,
             output: Arc::new(Mutex::new(VecDeque::new())),
+            output_offset: Mutex::new(0),
             child: None,
             exited: None,
             attached: false,
@@ -615,6 +731,112 @@ impl DeployRun {
     /// A path-resolution or spawn failure. A *registry-write* failure is
     /// swallowed — it must never sink an already-launched run.
     pub async fn start(&mut self) -> std::io::Result<()> {
+        // Unit tests use a thread-local registry root that cannot cross a
+        // process boundary; keep their stub runner inline. Production and
+        // integration tests use the packaged sibling supervisor.
+        if cfg!(test) {
+            return self.start_inline().await;
+        }
+        let Some(supervisor) = supervisor_binary() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "mandala-run-supervisor is not installed beside the frontend",
+            ));
+        };
+        self.start_supervised(supervisor).await
+    }
+
+    async fn start_supervised(&mut self, supervisor: PathBuf) -> std::io::Result<()> {
+        self.resolve_paths()?;
+        let events_dir = self.events_dir.clone().expect("events_dir resolved");
+        self.tailer = Some(EventTailer::new(&events_dir));
+        let argv = self.argv();
+        let ansible_dir = self
+            .ansible_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let log_path = events_dir.join(COMMAND_LOG);
+        {
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            writeln!(
+                log,
+                "$ {}  (cwd={}, events={})",
+                argv.join(" "),
+                ansible_dir.display(),
+                events_dir.display()
+            )?;
+            log.flush()?;
+        }
+        let request = DeploySupervisorRequest {
+            argv,
+            cwd: ansible_dir,
+            events_dir: events_dir.clone(),
+        };
+        let request_tmp = events_dir.join(format!("{DEPLOY_SUPERVISOR_REQUEST}.tmp"));
+        std::fs::write(
+            &request_tmp,
+            serde_json::to_vec(&request).map_err(std::io::Error::other)?,
+        )?;
+        std::fs::rename(&request_tmp, events_dir.join(DEPLOY_SUPERVISOR_REQUEST))?;
+
+        let mut meta = Meta::new();
+        meta.insert(
+            "run_id".into(),
+            Value::from(self.run_id.clone().unwrap_or_default()),
+        );
+        meta.insert("limit".into(), Value::from(self.limit.clone()));
+        meta.insert("dry_activate".into(), Value::from(self.dry_activate));
+        meta.insert("throttle".into(), Value::from(self.throttle));
+        meta.insert(
+            "playbook".into(),
+            Value::from(self.playbook.clone().unwrap_or_default()),
+        );
+        meta.insert("pid".into(), Value::Null);
+        // The launcher owns this short initialization window. Recording it as
+        // the lifecycle owner prevents another frontend from seeing the run as
+        // finished before the dedicated supervisor is spawned and takes over.
+        meta.insert(
+            "supervisor_pid".into(),
+            Value::from(i64::from(std::process::id())),
+        );
+        meta.insert("started_at".into(), Value::from(now_epoch_f64()));
+        registry::write_meta(&events_dir, &meta)?;
+
+        let supervisor_out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
+        let supervisor_err = supervisor_out.try_clone()?;
+        let child = match tokio::process::Command::new(supervisor)
+            .arg(&events_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(supervisor_out))
+            .stderr(Stdio::from(supervisor_err))
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(events_dir.join(DEPLOY_SUPERVISOR_REQUEST));
+                if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                    let _ = writeln!(log, "failed to launch deploy supervisor: {error}");
+                }
+                let mut terminal = Meta::new();
+                terminal.insert("rc".into(), Value::from(127));
+                terminal.insert("error".into(), Value::from(error.to_string()));
+                terminal.insert("finished_at".into(), Value::from(now_epoch_f64()));
+                registry::update_meta(&events_dir, terminal)?;
+                return Err(error);
+            }
+        };
+        let supervisor_pid = i64::from(child.id().expect("newly spawned supervisor has a pid"));
+        let mut running = Meta::new();
+        running.insert("supervisor_pid".into(), Value::from(supervisor_pid));
+        registry::update_meta(&events_dir, running)?;
+        self.child = Some(child);
+        Ok(())
+    }
+
+    async fn start_inline(&mut self) -> std::io::Result<()> {
         self.resolve_paths()?;
         let events_dir = self.events_dir.clone().expect("events_dir resolved");
         self.tailer = Some(EventTailer::new(&events_dir));
@@ -689,9 +911,40 @@ impl DeployRun {
         }
     }
 
+    fn sync_output_log(&self) {
+        let Some(path) = self.events_dir.as_ref().map(|dir| dir.join(COMMAND_LOG)) else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return;
+        };
+        let Ok(mut offset) = self.output_offset.lock() else {
+            return;
+        };
+        if file.seek(SeekFrom::Start(*offset)).is_err() {
+            return;
+        }
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    *offset += read as u64;
+                    let clean = line.trim_end_matches(['\r', '\n']).to_string();
+                    if let Ok(mut output) = self.output.lock() {
+                        push_capped(&mut output, clean, DEPLOY_OUTPUT_MAX);
+                    }
+                    line.clear();
+                }
+            }
+        }
+    }
+
     /// A snapshot of the bounded stdout+stderr mirror.
     #[must_use]
     pub fn output(&self) -> Vec<String> {
+        self.sync_output_log();
         self.output
             .lock()
             .map(|o| o.iter().cloned().collect())
@@ -701,6 +954,7 @@ impl DeployRun {
     /// Consume newly appended events into the tailer; returns how many were
     /// read (Python's `poll` returns nothing — the count is a convenience).
     pub fn poll(&mut self) -> usize {
+        self.sync_output_log();
         self.tailer.as_mut().map_or(0, EventTailer::poll)
     }
 
@@ -720,6 +974,19 @@ impl DeployRun {
     /// mode = the registry pid is gone; owned mode = the child has exited.
     pub fn finished(&mut self) -> bool {
         if self.attached {
+            let meta = self
+                .events_dir
+                .as_deref()
+                .map(registry::read_meta)
+                .unwrap_or_default();
+            if meta.get("rc").and_then(Value::as_i64).is_some() {
+                return true;
+            }
+            let supervisor = meta.get("supervisor_pid").and_then(Value::as_i64);
+            if supervisor.is_some() && !registry::pid_alive(supervisor) {
+                return true;
+            }
+            self.meta_pid = meta.get("pid").and_then(Value::as_i64).or(self.meta_pid);
             return !registry::pid_alive(self.meta_pid);
         }
         self.poll_exit().is_some()
@@ -732,6 +999,17 @@ impl DeployRun {
         if self.attached {
             if !self.finished() {
                 return None;
+            }
+            if let Some(meta) = self.events_dir.as_deref().map(registry::read_meta)
+                && let Some(rc) = meta.get("rc").and_then(Value::as_i64)
+            {
+                return Some(rc);
+            }
+            if let Some(meta) = self.events_dir.as_deref().map(registry::read_meta)
+                && let Some(supervisor) = meta.get("supervisor_pid").and_then(Value::as_i64)
+                && !registry::pid_alive(Some(supervisor))
+            {
+                return Some(1);
             }
             let bad = self.tailer.as_ref().is_some_and(|t| {
                 t.hosts
@@ -750,7 +1028,17 @@ impl DeployRun {
         if self.attached || self.poll_exit().is_some() {
             return;
         }
-        if let Some(child) = self.child.as_ref()
+        let deployed_pid = self
+            .events_dir
+            .as_deref()
+            .map(registry::read_meta)
+            .and_then(|meta| meta.get("pid").and_then(Value::as_i64));
+        if let Some(pid) = deployed_pid.and_then(|pid| i32::try_from(pid).ok()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        } else if let Some(child) = self.child.as_ref()
             && let Some(pid) = child.id()
         {
             let _ = nix::sys::signal::kill(
@@ -1379,5 +1667,17 @@ mod write_tests {
         let _dead = registry::test_hooks::install(|_| false);
         assert!(ok.finished());
         assert_eq!(ok.returncode(), Some(0));
+
+        // A supervisor that died before settling metadata is a failed run,
+        // even when no host event had time to arrive.
+        let (orphan_id, orphan_dir) = registry::new_run_dir().unwrap();
+        let mut orphan_meta = Meta::new();
+        orphan_meta.insert("run_id".into(), Value::from(orphan_id.clone()));
+        orphan_meta.insert("limit".into(), Value::from("web"));
+        orphan_meta.insert("supervisor_pid".into(), Value::from(4244));
+        registry::write_meta(&orphan_dir, &orphan_meta).unwrap();
+        let mut orphan = DeployRun::attach(&orphan_id).unwrap();
+        assert!(orphan.finished());
+        assert_eq!(orphan.returncode(), Some(1));
     }
 }

@@ -439,17 +439,26 @@ impl MandalaHandler {
         let inv = self.inventory().await?;
         let nodes = inv.deploy_nodes();
 
-        let mut result = json!({"refreshed": false, "expected_source": "none"});
+        let mut result = json!({"ok": true, "refreshed": false, "expected_source": "none"});
 
         if t.refresh.unwrap_or(false) {
-            let rc = self
+            let survey = self
                 .state
                 .effects
                 .refresh_snapshots()
                 .await
                 .map_err(|e| tool_error(e.to_string()))?;
-            result["refreshed"] = Value::Bool(true);
-            result["survey_rc"] = Value::from(rc);
+            result["survey_rc"] = Value::from(survey.code);
+            if survey.code == 0 {
+                result["refreshed"] = Value::Bool(true);
+            } else {
+                result["ok"] = Value::Bool(false);
+                result["refresh_error"] = json!({
+                    "exit_code": survey.code,
+                    "stdout": survey.stdout,
+                    "stderr": survey.stderr,
+                });
+            }
         }
 
         let state_dir = drift::state_dir();
@@ -538,6 +547,11 @@ impl MandalaHandler {
 
     async fn tool_deploy_status(&self, t: DeployStatusTool) -> Result<Value, CallToolError> {
         if let Some(run_id) = &t.run_id {
+            if !registry::is_valid_run_id(run_id) {
+                return Err(tool_error(format!(
+                    "invalid run id {run_id:?}: expected a Mandala-generated run id"
+                )));
+            }
             let Some(mut obs) = registry::open_run(run_id) else {
                 return Err(tool_error(format!("no such run: {run_id}")));
             };
@@ -577,8 +591,9 @@ impl MandalaHandler {
             "--no-warn-dirty".to_string(),
         ];
         argv.extend(targets.iter().map(|m| {
+            let attr = serde_json::to_string(m).expect("member name is JSON serializable");
             format!(
-                "{}#nixosConfigurations.{m}.config.system.build.toplevel",
+                "{}#nixosConfigurations.{attr}.config.system.build.toplevel",
                 self.state.flake
             )
         }));

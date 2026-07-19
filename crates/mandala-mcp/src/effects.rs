@@ -32,6 +32,15 @@ pub struct AdhocOutput {
     pub code: i64,
 }
 
+/// A completed read-only state survey, including the diagnostics needed to
+/// distinguish a failed refresh from a successful fresh snapshot set.
+#[derive(Debug, Clone)]
+pub struct SurveyOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i64,
+}
+
 /// Why an ad-hoc command could not run at all (as opposed to running and
 /// failing, which is an [`AdhocOutput`] with a non-zero code).
 #[derive(Debug, Clone)]
@@ -91,8 +100,8 @@ pub trait Effects: Send + Sync {
     /// The contract's git rev (`-dirty`-suffixed), `None` on any git failure.
     async fn repo_rev(&self, flake: &str) -> Option<String>;
 
-    /// Run the read-only state survey playbook; returns its exit code.
-    async fn refresh_snapshots(&self) -> io::Result<i32>;
+    /// Run the read-only state survey playbook, capturing its complete result.
+    async fn refresh_snapshots(&self) -> io::Result<SurveyOutput>;
 
     /// Run an ad-hoc argv (ansible ping / systemd restart) in the shared
     /// ansible working directory with deprecation chatter silenced, capturing
@@ -122,12 +131,6 @@ pub trait Effects: Send + Sync {
 /// blocking pool so a slow eval never wedges the server's message loop.
 pub struct RealEffects {
     evaluator: Arc<Mutex<Evaluator>>,
-    /// Quiet mode (the TUI-as-leader shape): every child's output is
-    /// captured/nulled — the eval worker's stderr (dirty-tree warnings, copy
-    /// progress) and the survey playbook's inherited output would otherwise
-    /// scribble over the alternate screen (the section-4 quiet rule, extended
-    /// to the leader the TUI hosts).
-    quiet: bool,
 }
 
 impl RealEffects {
@@ -135,7 +138,6 @@ impl RealEffects {
     pub fn new() -> Self {
         Self {
             evaluator: Arc::new(Mutex::new(Evaluator::from_env())),
-            quiet: false,
         }
     }
 
@@ -147,7 +149,6 @@ impl RealEffects {
     pub fn quiet() -> Self {
         Self {
             evaluator: Arc::new(Mutex::new(Evaluator::from_env().quiet())),
-            quiet: true,
         }
     }
 }
@@ -235,25 +236,21 @@ impl Effects for RealEffects {
             .flatten()
     }
 
-    async fn refresh_snapshots(&self) -> io::Result<i32> {
-        if self.quiet {
-            // The TUI-as-leader shape: the survey's output must never write
-            // through the alternate screen (the Python survey lesson) — run
-            // the same playbook line with every stream nulled.
-            let status = tokio::process::Command::new("ansible-playbook")
-                .arg("mandala.fleet.state")
-                .current_dir(ansible_dir())
-                .env("MANDALA_FLEET_STATE", drift::state_dir())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await?;
-            return Ok(status.code().unwrap_or(-1));
-        }
-        tokio::task::spawn_blocking(|| drift::refresh_snapshots(&ansible_dir(), None, None))
-            .await
-            .map_err(io::Error::other)?
+    async fn refresh_snapshots(&self) -> io::Result<SurveyOutput> {
+        // `output()` captures both streams for MCP diagnostics and also keeps
+        // the TUI leader's alternate screen quiet.
+        let output = tokio::process::Command::new("ansible-playbook")
+            .arg("mandala.fleet.state")
+            .current_dir(ansible_dir())
+            .env("MANDALA_FLEET_STATE", drift::state_dir())
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        Ok(SurveyOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            code: status_code(output.status),
+        })
     }
 
     async fn run_adhoc(&self, argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {

@@ -78,6 +78,30 @@ fn now_id() -> String {
     format!("{ts}-{}", std::process::id())
 }
 
+/// Whether `run_id` has Mandala's generated `%Y%m%dT%H%M%S_%6f-<pid>`
+/// shape. Registry attachment treats the id as untrusted input: accepting
+/// only this basename grammar prevents absolute-path replacement and `..`
+/// traversal when it is joined beneath [`runs_dir`].
+#[must_use]
+pub fn is_valid_run_id(run_id: &str) -> bool {
+    let bytes = run_id.as_bytes();
+    if bytes.len() < 24
+        || bytes.get(8) != Some(&b'T')
+        || bytes.get(15) != Some(&b'_')
+        || bytes.get(22) != Some(&b'-')
+    {
+        return false;
+    }
+    let timestamp_digits = bytes[..8].iter().chain(&bytes[9..15]).chain(&bytes[16..22]);
+    timestamp_digits.cloned().all(|b| b.is_ascii_digit())
+        && chrono::NaiveDateTime::parse_from_str(&run_id[..22], "%Y%m%dT%H%M%S_%6f").is_ok()
+        && bytes[23..].iter().all(u8::is_ascii_digit)
+        && bytes[23..]
+            .iter()
+            .fold(0_u64, |n, b| n.saturating_mul(10) + u64::from(b - b'0'))
+            > 0
+}
+
 /// Whether a recorded run pid is still running. Signal 0 probes existence
 /// without delivering anything: `ESRCH` → gone, `EPERM` → exists (owned by
 /// another user). A `None`/zero pid is never alive.
@@ -225,18 +249,21 @@ fn list_runs_in(base: &Path) -> Vec<RunInfo> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.is_dir())
-        .map(|p| {
+        .filter_map(|p| {
             let run_id = p
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
+            if !is_valid_run_id(&run_id) {
+                return None;
+            }
             let meta = read_meta(&p);
-            RunInfo {
+            Some(RunInfo {
                 run_id,
                 path: p,
                 meta,
-            }
+            })
         })
         .collect();
     // Reverse-sort by run-id: later id == more recent.
@@ -317,6 +344,10 @@ impl ObservedRun {
     /// (build done, rc ∉ {0, None}, no host events) → failed; else unknown.
     pub fn liveness(&mut self) -> RunLiveness {
         self.info.meta = read_meta(&self.info.path);
+        let supervisor = self.info.meta.get("supervisor_pid").and_then(Value::as_i64);
+        if self.info.meta.get("rc").is_none() && supervisor.is_some() && !pid_alive(supervisor) {
+            return RunLiveness::Failed;
+        }
         // A live pid means the fan-out is still going, even if one host has
         // already reached a sticky terminal state.
         if pid_alive(self.info.pid()) {
@@ -358,6 +389,9 @@ pub fn open_run(run_id: &str) -> Option<ObservedRun> {
 }
 
 fn open_run_in(base: &Path, run_id: &str) -> Option<ObservedRun> {
+    if !is_valid_run_id(run_id) {
+        return None;
+    }
     let path = base.join(run_id);
     if !path.is_dir() {
         return None;
@@ -537,6 +571,33 @@ mod tests {
     }
 
     #[test]
+    fn run_id_validation_accepts_generated_ids_only() {
+        assert!(is_valid_run_id("20260719T012345_123456-42"));
+        for invalid in [
+            "",
+            "nonesuch",
+            "/tmp/20260719T012345_123456-42",
+            "../20260719T012345_123456-42",
+            "20260719T012345_123456-0",
+            "20261319T012345_123456-42",
+            "20260719T012345_12345x-42",
+            "20260719T012345_123456-42/child",
+        ] {
+            assert!(!is_valid_run_id(invalid), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn open_run_rejects_paths_outside_registry() {
+        let base = tmp().join("runs");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = tmp().join("20260719T012345_123456-42");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(open_run_in(&base, outside.to_str().unwrap()).is_none());
+        assert!(open_run_in(&base, "../20260719T012345_123456-42").is_none());
+    }
+
+    #[test]
     fn list_runs_sorts_most_recent_first() {
         let base = tmp().join("runs");
         std::fs::create_dir_all(&base).unwrap();
@@ -672,6 +733,24 @@ mod tests {
 
         update_meta(&path, meta(&[("rc", Value::from(2))])).unwrap();
         assert_eq!(obs.liveness(), RunLiveness::Failed);
+    }
+
+    #[test]
+    fn dead_unsettled_supervisor_is_failed_even_if_child_pid_lingers() {
+        let base = tmp().join("runs");
+        let (run_id, path) = new_run_dir_in(&base).unwrap();
+        write_meta(
+            &path,
+            &meta(&[
+                ("run_id", Value::from(run_id.clone())),
+                ("pid", Value::from(2222)),
+                ("supervisor_pid", Value::from(1111)),
+            ]),
+        )
+        .unwrap();
+        let _guard = test_hooks::install(|pid| pid == Some(2222));
+        let mut observed = open_run_in(&base, &run_id).unwrap();
+        assert_eq!(observed.liveness(), RunLiveness::Failed);
     }
 
     /// The batch-build-death path: a deploy that died in the batch build

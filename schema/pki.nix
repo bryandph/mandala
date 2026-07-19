@@ -11,6 +11,14 @@
   inherit (lib) mkOption types;
 
   caNames = builtins.attrNames config.pki.cas;
+  rootsWithSigner = lib.filter (name: let ca = config.pki.cas.${name}; in ca.kind == "root" && ca.signedBy != null) caNames;
+  unsignedIntermediates = lib.filter (name: let ca = config.pki.cas.${name}; in ca.kind == "intermediate" && ca.signedBy == null) caNames;
+  unknownSigners = lib.filter (name: let signer = config.pki.cas.${name}.signedBy; in signer != null && !(config.pki.cas ? ${signer})) caNames;
+  hasCycle = current: visited:
+    if lib.elem current visited
+    then true
+    else let signer = config.pki.cas.${current}.signedBy; in signer != null && config.pki.cas ? ${signer} && hasCycle signer (visited ++ [current]);
+  cyclicCas = lib.filter (name: hasCycle name []) caNames;
 
   caType = types.submodule {
     options = {
@@ -40,4 +48,23 @@ in {
     default = {};
     description = "Certificate authorities keyed by name.";
   };
+
+  config.assertions = [
+    {
+      assertion = rootsWithSigner == [];
+      message = "PKI roots must not declare signedBy: ${lib.concatStringsSep ", " rootsWithSigner}";
+    }
+    {
+      assertion = unsignedIntermediates == [];
+      message = "PKI intermediates must declare signedBy: ${lib.concatStringsSep ", " unsignedIntermediates}";
+    }
+    {
+      assertion = unknownSigners == [];
+      message = "PKI CAs reference unknown signers: ${lib.concatStringsSep ", " unknownSigners}";
+    }
+    {
+      assertion = cyclicCas == [];
+      message = "PKI signer graph contains a cycle involving: ${lib.concatStringsSep ", " cyclicCas}";
+    }
+  ];
 }

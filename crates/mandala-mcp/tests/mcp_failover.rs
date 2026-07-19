@@ -28,7 +28,7 @@ use mandala_core::inventory::{Inventory, InventoryError};
 use mandala_core::registry::{self, Meta, RunLiveness};
 use mandala_core::runner::CommandRun;
 use mandala_mcp::effects::{
-    AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure,
+    AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure, SurveyOutput,
 };
 use mandala_mcp::{MandalaHandler, handler_dispatch, tool_is_idempotent};
 use serde_json::{Value, json};
@@ -61,7 +61,7 @@ impl Effects for OrphanEffects {
     async fn repo_rev(&self, _flake: &str) -> Option<String> {
         None
     }
-    async fn refresh_snapshots(&self) -> io::Result<i32> {
+    async fn refresh_snapshots(&self) -> io::Result<SurveyOutput> {
         panic!("unexpected refresh_snapshots call")
     }
     async fn run_adhoc(&self, _argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {

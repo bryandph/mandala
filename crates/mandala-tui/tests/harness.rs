@@ -28,6 +28,7 @@ fn aggregate() -> serde_json::Value {
         "schemaVersion": 1,
         "members": {
             "web": {
+                "name": "web",
                 "platform": "metal",
                 "architecture": "x86_64-linux",
                 "category": "server",
@@ -35,8 +36,8 @@ fn aggregate() -> serde_json::Value {
                 "tags": ["edge"],
                 "deployment": {"ansible": {"enable": true}, "deployRs": {"enable": true}},
             },
-            "cache": {"platform": "metal", "architecture": "x86_64-linux"},
-            "router": {"platform": "opnsense"},
+            "cache": {"name": "cache", "platform": "metal", "architecture": "x86_64-linux"},
+            "router": {"name": "router", "platform": "opnsense"},
         },
         "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
         "projections": {"deploy": {"nodes": ["cache", "web"]}},

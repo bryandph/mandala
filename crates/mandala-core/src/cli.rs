@@ -698,16 +698,18 @@ mod tests {
             "schemaVersion": 1,
             "members": {
                 "web": {
+                    "name": "web",
                     "platform": "nixos", "architecture": "x86_64",
                     "category": "server", "role": "web", "tags": ["edge", "public"],
                     "deployment": {"ansible": {"enable": true}, "deployRs": {"enable": true}, "sops": {"recipient": "age1web"}},
                 },
                 "cache": {
+                    "name": "cache",
                     "platform": "nixos", "architecture": "aarch64",
                     "category": "server", "role": "cache", "tags": [],
                     "deployment": {"ansible": {"enable": true}},
                 },
-                "router": {"platform": "vyos", "architecture": "aarch64", "category": "network"},
+                "router": {"name": "router", "platform": "vyos", "architecture": "aarch64", "category": "network"},
             },
             "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
             "projections": {
@@ -852,7 +854,7 @@ mod tests {
     fn members_json_is_python_byte_parity() {
         // python3 -c 'import json,sys; ...json.dumps(members, indent=2,
         // sort_keys=True)' over the fixture's members dict.
-        let expected = "{\n  \"cache\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      }\n    },\n    \"platform\": \"nixos\",\n    \"role\": \"cache\",\n    \"tags\": []\n  },\n  \"router\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"network\",\n    \"platform\": \"vyos\"\n  },\n  \"web\": {\n    \"architecture\": \"x86_64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      },\n      \"deployRs\": {\n        \"enable\": true\n      },\n      \"sops\": {\n        \"recipient\": \"age1web\"\n      }\n    },\n    \"platform\": \"nixos\",\n    \"role\": \"web\",\n    \"tags\": [\n      \"edge\",\n      \"public\"\n    ]\n  }\n}";
+        let expected = "{\n  \"cache\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      }\n    },\n    \"name\": \"cache\",\n    \"platform\": \"nixos\",\n    \"role\": \"cache\",\n    \"tags\": []\n  },\n  \"router\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"network\",\n    \"name\": \"router\",\n    \"platform\": \"vyos\"\n  },\n  \"web\": {\n    \"architecture\": \"x86_64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      },\n      \"deployRs\": {\n        \"enable\": true\n      },\n      \"sops\": {\n        \"recipient\": \"age1web\"\n      }\n    },\n    \"name\": \"web\",\n    \"platform\": \"nixos\",\n    \"role\": \"web\",\n    \"tags\": [\n      \"edge\",\n      \"public\"\n    ]\n  }\n}";
         assert_eq!(to_pretty_2space(fixture().members()), expected);
     }
 

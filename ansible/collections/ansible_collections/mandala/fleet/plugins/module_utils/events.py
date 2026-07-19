@@ -45,6 +45,7 @@ import time
 
 PROTOCOL_VERSION = 2
 ENV_VAR = "MANDALA_FLEET_EVENTS"
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 _PROGRESS_INTERVAL_S = 0.5
 
@@ -69,6 +70,8 @@ class Emitter:
 
     def __init__(self, directory, host, plugin):
         self._host = host or "controller"
+        if not _HOST_LABEL.fullmatch(self._host) or self._host.lower() == "all":
+            raise ValueError("event host must be a bare RFC 1123 hostname")
         self._plugin = plugin
         self._path = os.path.join(directory, "%s.jsonl" % self._host)
         self._fh = None

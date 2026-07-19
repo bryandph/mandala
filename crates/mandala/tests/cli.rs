@@ -15,9 +15,9 @@ use std::process::Command;
 const FIXTURE: &str = r#"{
   "schemaVersion": 1,
   "members": {
-    "web": {"platform": "nixos", "architecture": "x86_64", "category": "server", "role": "web", "tags": ["edge", "public"], "deployment": {"ansible": {"enable": true}, "deployRs": {"enable": true}, "sops": {"recipient": "age1web"}}},
-    "cache": {"platform": "nixos", "architecture": "aarch64", "category": "server", "role": "cache", "tags": [], "deployment": {"ansible": {"enable": true}}},
-    "router": {"platform": "vyos", "architecture": "aarch64", "category": "network"}
+    "web": {"name": "web", "platform": "nixos", "architecture": "x86_64", "category": "server", "role": "web", "tags": ["edge", "public"], "deployment": {"ansible": {"enable": true}, "deployRs": {"enable": true}, "sops": {"recipient": "age1web"}}},
+    "cache": {"name": "cache", "platform": "nixos", "architecture": "aarch64", "category": "server", "role": "cache", "tags": [], "deployment": {"ansible": {"enable": true}}},
+    "router": {"name": "router", "platform": "vyos", "architecture": "aarch64", "category": "network"}
   },
   "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
   "projections": {
@@ -69,7 +69,7 @@ fn members_json_byte_parity() {
     let (stdout, _stderr, code) = run(&fx, &["members", "--json"]);
     assert_eq!(code, 0);
     // json.dumps(members, indent=2, sort_keys=True) + the echo newline.
-    let expected = "{\n  \"cache\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      }\n    },\n    \"platform\": \"nixos\",\n    \"role\": \"cache\",\n    \"tags\": []\n  },\n  \"router\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"network\",\n    \"platform\": \"vyos\"\n  },\n  \"web\": {\n    \"architecture\": \"x86_64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      },\n      \"deployRs\": {\n        \"enable\": true\n      },\n      \"sops\": {\n        \"recipient\": \"age1web\"\n      }\n    },\n    \"platform\": \"nixos\",\n    \"role\": \"web\",\n    \"tags\": [\n      \"edge\",\n      \"public\"\n    ]\n  }\n}\n";
+    let expected = "{\n  \"cache\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      }\n    },\n    \"name\": \"cache\",\n    \"platform\": \"nixos\",\n    \"role\": \"cache\",\n    \"tags\": []\n  },\n  \"router\": {\n    \"architecture\": \"aarch64\",\n    \"category\": \"network\",\n    \"name\": \"router\",\n    \"platform\": \"vyos\"\n  },\n  \"web\": {\n    \"architecture\": \"x86_64\",\n    \"category\": \"server\",\n    \"deployment\": {\n      \"ansible\": {\n        \"enable\": true\n      },\n      \"deployRs\": {\n        \"enable\": true\n      },\n      \"sops\": {\n        \"recipient\": \"age1web\"\n      }\n    },\n    \"name\": \"web\",\n    \"platform\": \"nixos\",\n    \"role\": \"web\",\n    \"tags\": [\n      \"edge\",\n      \"public\"\n    ]\n  }\n}\n";
     assert_eq!(stdout, expected);
     let _ = std::fs::remove_file(&fx);
 }

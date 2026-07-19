@@ -282,6 +282,30 @@ async fn leader_and_follower_paths_are_byte_identical() {
         handler(
             FakeEffects {
                 rev: Some("deadbeef".to_string()),
+                refresh: Some(mandala_mcp::effects::SurveyOutput {
+                    stdout: "PLAY RECAP\nweb : failed=1\n".to_string(),
+                    stderr: "survey transport failed".to_string(),
+                    code: 2,
+                }),
+                ..FakeEffects::default()
+            },
+            &events,
+        ),
+    );
+    let failed_refresh = read_both(follower, local, "drift", &json!({"refresh": true})).await;
+    assert_eq!(failed_refresh["ok"], json!(false));
+    assert_eq!(failed_refresh["refreshed"], json!(false));
+    assert_eq!(failed_refresh["survey_rc"], json!(2));
+    assert_eq!(
+        failed_refresh["refresh_error"]["stderr"],
+        json!("survey transport failed")
+    );
+
+    install(
+        &slot,
+        handler(
+            FakeEffects {
+                rev: Some("deadbeef".to_string()),
                 eval: Some(Err(mandala_mcp::effects::EvalFailure {
                     command: Some(["nix", "eval", "--json"].map(String::from).to_vec()),
                     exit_code: Some(1),
@@ -301,7 +325,12 @@ async fn leader_and_follower_paths_are_byte_identical() {
             FakeEffects {
                 fresh: Some(json!({
                     "schemaVersion": 1,
-                    "members": {"web": {}, "cache": {}, "router": {}, "newbie": {}},
+                    "members": {
+                        "web": {"name": "web"},
+                        "cache": {"name": "cache"},
+                        "router": {"name": "router"},
+                        "newbie": {"name": "newbie"},
+                    },
                     "groups": {"k3s": ["cache", "web"]},
                     "projections": {"deploy": {"nodes": ["cache", "web"]}},
                 })),

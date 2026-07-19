@@ -194,7 +194,11 @@ mod tests {
     fn inv() -> Inventory {
         Inventory::from_value(json!({
             "schemaVersion": 1,
-            "members": {"web": {}, "cache": {}, "router": {}},
+            "members": {
+                "web": {"name": "web"},
+                "cache": {"name": "cache"},
+                "router": {"name": "router"},
+            },
             "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
             "projections": {"deploy": {"nodes": ["web", "cache"]}},
         }))

@@ -21,11 +21,13 @@
 }: let
   inherit (lib) mkOption types;
   cfg = config.host;
+  hostLabel = types.strMatching "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?";
+  withRole = role: lib.filter (network: lib.elem role network.roles) cfg.networks;
 in {
   options.host = {
     name = mkOption {
-      type = types.str;
-      description = "Short hostname (used as primary identifier)";
+      type = hostLabel;
+      description = "Bare RFC 1123 hostname label (the primary member selector; FQDN is derived separately)";
       example = "ntp";
     };
 
@@ -256,4 +258,22 @@ in {
       };
     };
   };
+
+  config.assertions = [
+    {
+      assertion = lib.toLower cfg.name != "all";
+      message = "member ${cfg.name}: 'all' is reserved by the selector language";
+    }
+    {
+      assertion =
+        lib.all
+        (role: lib.length (withRole role) <= 1)
+        ["dns" "reach" "gateway" "management"];
+      message = "member ${cfg.name}: at most one network may carry each address role";
+    }
+    {
+      assertion = lib.all (network: network.assignment != "reservation" || network.address != null) cfg.networks;
+      message = "member ${cfg.name}: assignment = \"reservation\" requires an address (it IS the reservation)";
+    }
+  ];
 }

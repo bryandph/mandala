@@ -77,7 +77,11 @@ async fn fleet_context_seam_is_byte_identical_and_origin_labeled() {
         &aggregate,
         json!({
             "schemaVersion": 1,
-            "members": {"web": {}, "cache": {}, "router": {}},
+            "members": {
+                "web": {"name": "web"},
+                "cache": {"name": "cache"},
+                "router": {"name": "router"},
+            },
             "groups": {"k3s": ["cache", "web"], "gateway": ["router"]},
             "projections": {"deploy": {"nodes": ["cache", "web"]}},
         })

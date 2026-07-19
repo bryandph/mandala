@@ -12,6 +12,10 @@ default-run = "mandala"
 name = "mandala"
 path = "src/main.rs"
 
+[[bin]]
+name = "mandala-run-supervisor"
+path = "src/supervisor.rs"
+
 [dependencies]
 mandala-core.workspace = true
 mandala-mcp.workspace = true

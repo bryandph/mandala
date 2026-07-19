@@ -143,6 +143,7 @@
         pki = self.lib.evalPki (import ./examples/fake-fleet/pki.nix);
         member = self.lib.evalMember (import ./examples/fake-fleet/member.nix);
         mesh = self.lib.evalMesh (import ./examples/fake-fleet/mesh.nix);
+        failsDeep = value: !(builtins.tryEval (builtins.deepSeq value true)).success;
 
         # Projection fixtures: the fake member with its management surfaces
         # flipped on (the factory's job in a real fleet), plus a facts-only
@@ -271,6 +272,19 @@
         assert topo.vlans.mgmt.prefixLength == 24;
         assert topo.vlans.storage.subnet == null;
         assert topo.vlans.storage.prefixLength == null;
+        assert failsDeep (self.lib.evalTopology {vlans.bad.id = 5000;});
+        assert failsDeep (self.lib.evalTopology {
+          vlans.bad = {
+            id = 10;
+            subnet = "999.1.2.0/24";
+          };
+        });
+        assert failsDeep (self.lib.evalTopology {
+          vlans.bad = {
+            id = 10;
+            ula = "not-an-ipv6-prefix";
+          };
+        });
         # lib.net: id → v4/ULA derivation (digit-mirror convention).
         assert (self.lib.net.forTopology topo).address "mgmt" 102 == "10.0.2.102";
         assert (self.lib.net.forTopology topo).ula "mgmt" 102 == "fd00:dead:beef:2::102";
@@ -316,9 +330,52 @@
         == "fd00:dead:beef:2::16";
         assert pki.cas.example-intermediate.signedBy == "example-root";
         assert builtins.length (builtins.attrNames pki.cas) == 2;
+        assert failsDeep (self.lib.evalPki {
+          cas.intermediate = {
+            kind = "intermediate";
+            pem = "-----BEGIN CERTIFICATE----- invalid";
+          };
+        });
+        assert failsDeep (self.lib.evalPki {
+          cas = {
+            one = {
+              kind = "intermediate";
+              signedBy = "two";
+              pem = "-----BEGIN CERTIFICATE----- invalid";
+            };
+            two = {
+              kind = "intermediate";
+              signedBy = "one";
+              pem = "-----BEGIN CERTIFICATE----- invalid";
+            };
+          };
+        });
         assert member.fqdn == "example-node.example.test";
         assert member.architecture == "armv7l"; # derived from build.system
         
+        assert failsDeep (self.lib.evalMember {name = "fqdn.example";});
+        assert failsDeep (self.lib.evalMember {
+          name = "duplicate-role";
+          networks = [
+            {
+              vlan = "one";
+              roles = ["dns"];
+            }
+            {
+              vlan = "two";
+              roles = ["dns"];
+            }
+          ];
+        });
+        assert failsDeep (self.lib.evalMember {
+          name = "bad-reservation";
+          networks = [
+            {
+              vlan = "one";
+              assignment = "reservation";
+            }
+          ];
+        });
         assert mesh.members.example-node-mesh.dnsName == "example-node.mesh";
         assert mesh.members.example-phone.name == null;
         assert mesh.members.example-phone.dnsName == null;
