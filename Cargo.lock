@@ -918,6 +918,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mandala-deploy"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "mandala-eval-worker"
 version = "0.1.0"
 dependencies = [

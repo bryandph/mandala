@@ -265,6 +265,68 @@
           secrets = secretsEval;
         };
         declRuleAt = n: lib.head (lib.elemAt sopsFromDecls.creation_rules n).key_groups;
+
+        deploySettingsGolden = self.lib.mergeDeploySettings {
+          knownGroups = ["alpha" "zeta"];
+          fleet = {
+            activationTimeout = 600;
+            confirmTimeout = 30;
+            sshOpts = ["-o" "Fleet=yes"];
+          };
+          groupSettings = {
+            alpha = {
+              confirmTimeout = 40;
+              magicRollback = false;
+              sshOpts = ["-o" "Alpha=yes"];
+            };
+            zeta = {
+              confirmTimeout = 50;
+              magicRollback = true;
+              sshOpts = ["-o" "Zeta=yes"];
+            };
+          };
+          # Deliberately unsorted input: the merge function owns ordering.
+          memberGroups = ["zeta" "alpha"];
+          member = {
+            confirmTimeout = 90;
+            sshOpts = ["-o" "Member=yes"];
+          };
+        };
+        deploySettingsExpected = {
+          activationTimeout = 600;
+          confirmTimeout = 90;
+          magicRollback = true;
+          sshOpts = [
+            "-o"
+            "Member=yes"
+            "-o"
+            "Alpha=yes"
+            "-o"
+            "Zeta=yes"
+            "-o"
+            "Fleet=yes"
+          ];
+        };
+        deploySettingsSiblingWinner = self.lib.mergeDeploySettings {
+          knownGroups = ["alpha" "zeta"];
+          groupSettings = {
+            alpha.confirmTimeout = 40;
+            zeta.confirmTimeout = 50;
+          };
+          memberGroups = ["zeta" "alpha"];
+        };
+        deploySettingsCompat = {
+          autoRollback = true;
+          fastConnection = true;
+          sshOpts = ["-p" "22"];
+        };
+        unknownDeployGroupFails =
+          !(builtins.tryEval (builtins.deepSeq (self.lib.mergeDeploySettings {
+              knownGroups = ["known"];
+              groupSettings.ghost.confirmTimeout = 30;
+              memberGroups = ["known"];
+            })
+            true)).success;
       in
         assert op.gpg.keyIdLong == "89ABCDEF01234567";
         assert op.gpg.keyIdShort == "01234567";
@@ -473,6 +535,18 @@
         
         assert (declRuleAt 1).age == ["age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node"];
         assert (declRuleAt 2).age == ["age1zzzfakefakefakefakefakefakefakefakefakefakefakefakefake0node"];
+        # Native-deploy 1.3: hand-written merge goldens. Member wins over
+        # sorted groups, later group wins over earlier, sshOpts append from
+        # inner to outer, unknown group keys fail, and member-only data is
+        # byte-shape compatible.
+        assert deploySettingsGolden == deploySettingsExpected;
+        assert deploySettingsSiblingWinner.confirmTimeout == 50;
+        assert unknownDeployGroupFails;
+        assert (self.lib.mergeDeploySettings {
+          knownGroups = [];
+          member = deploySettingsCompat;
+        })
+        == deploySettingsCompat;
           pkgs.runCommand "mandala-fake-fleet" {} "echo ok > $out";
     });
   };

@@ -190,6 +190,11 @@ in rec {
   # unique again: sanitization can merge two raw names into one key.
   ansibleGroupsFor = host: lib.unique (map sanitizeGroupName (groupsFor host));
 
+  # Full deploy settings flattening is consumed by the deploy projection and
+  # native engine in Stage A. Kept as one pure function so no consumer can
+  # reinterpret precedence or sshOpts ordering.
+  mergeDeploySettings = import ./deploy-settings.nix {inherit lib;};
+
   # The versioned aggregate contract output — the one eval surface for
   # porcelain (CLI/TUI, plugged engines): `nix eval --json .#mandala`
   # returns this shape, gated by schemaVersion, so no porcelain code

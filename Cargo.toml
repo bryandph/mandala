@@ -8,6 +8,7 @@ resolver = "3"
 members = [
   "crates/mandala-core",
   "crates/mandala-context",
+  "crates/mandala-deploy",
   "crates/mandala-mcp",
   "crates/mandala",
   "crates/mandala-eval-worker",
@@ -24,6 +25,7 @@ repository = "https://github.com/bryanhuff/mandala"
 [workspace.dependencies]
 mandala-core = { path = "crates/mandala-core" }
 mandala-context = { path = "crates/mandala-context" }
+mandala-deploy = { path = "crates/mandala-deploy" }
 mandala-mcp = { path = "crates/mandala-mcp" }
 mandala-tui = { path = "crates/mandala-tui" }
 
