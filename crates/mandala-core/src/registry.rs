@@ -339,9 +339,11 @@ impl ObservedRun {
     /// Meta is re-read each call (the launcher updates it — pid at start, rc
     /// when the reaper fires) so a long-attached observer sees the exit code
     /// land instead of judging from a stale snapshot. The decision tree: pid
-    /// alive → running; else a reaped rc → finished/failed; else host states →
-    /// rolled-back / failed / finished (all terminal); else a batch-build death
-    /// (build done, rc ∉ {0, None}, no host events) → failed; else unknown.
+    /// alive → running; else host rollback/failure → rolled-back/failed; else a
+    /// reaped rc → finished/failed; else all hosts terminal → finished; else a
+    /// batch-build death (build done, rc ∉ {0, None}, no host events) → failed;
+    /// else unknown. Host outcomes precede a zero process rc because deploy-rs
+    /// can safely roll back one host while the controller exits successfully.
     pub fn liveness(&mut self) -> RunLiveness {
         self.info.meta = read_meta(&self.info.path);
         let supervisor = self.info.meta.get("supervisor_pid").and_then(Value::as_i64);
@@ -353,6 +355,17 @@ impl ObservedRun {
         if pid_alive(self.info.pid()) {
             return RunLiveness::Running;
         }
+        // Always consume durable events before judging a settled deploy. This
+        // also corrects pre-fix registry records whose meta says rc=0 despite
+        // a failed or rolled-back host.
+        self.poll();
+        let states: Vec<HostState> = self.tailer.hosts.values().map(|h| h.state).collect();
+        if states.contains(&HostState::RolledBack) {
+            return RunLiveness::RolledBack;
+        }
+        if states.contains(&HostState::Failed) {
+            return RunLiveness::Failed;
+        }
         // A command run (reboot, …) has no host event streams; its launcher
         // records the exit code into meta when the subprocess exits.
         if let Some(rc) = self.info.meta.get("rc").and_then(Value::as_i64) {
@@ -361,13 +374,6 @@ impl ObservedRun {
             } else {
                 RunLiveness::Failed
             };
-        }
-        let states: Vec<HostState> = self.tailer.hosts.values().map(|h| h.state).collect();
-        if states.contains(&HostState::RolledBack) {
-            return RunLiveness::RolledBack;
-        }
-        if states.contains(&HostState::Failed) {
-            return RunLiveness::Failed;
         }
         if !states.is_empty() && states.iter().all(|s| is_terminal(*s)) {
             return RunLiveness::Finished;
@@ -680,7 +686,13 @@ mod tests {
         let _g = test_hooks::install(|_| false);
 
         let (rb_id, rb) = new_run_dir_in(&base).unwrap();
-        write_meta(&rb, &meta(&[("pid", Value::from(1))])).unwrap();
+        // Reproduce the live finding: the controller returned success after
+        // deploy-rs rolled the host back. Host outcome must win over rc=0.
+        write_meta(
+            &rb,
+            &meta(&[("pid", Value::from(1)), ("rc", Value::from(0))]),
+        )
+        .unwrap();
         write_events(
             &rb.join("beta.jsonl"),
             &milestones("beta", &["eval", "activate", "rollback"]),

@@ -519,7 +519,8 @@ async fn leader_and_follower_paths_are_byte_identical() {
     let mut meta = Meta::new();
     meta.insert("run_id".to_string(), Value::from(dep_run_id.clone()));
     meta.insert("pid".to_string(), Value::Null);
-    meta.insert("limit".to_string(), Value::from("cache"));
+    meta.insert("rc".to_string(), Value::from(0));
+    meta.insert("limit".to_string(), Value::from("cache,web"));
     registry::write_meta(&dep_path, &meta).unwrap();
     {
         use std::io::Write;
@@ -536,13 +537,43 @@ async fn leader_and_follower_paths_are_byte_identical() {
             .unwrap();
         }
     }
-    read_both(
+    {
+        use std::io::Write;
+        let mut fh = std::fs::File::create(dep_path.join("web.jsonl")).unwrap();
+        writeln!(
+            fh,
+            "{}",
+            json!({
+                "v": 1, "host": "web", "plugin": "deploy",
+                "event": "line", "line": "activation failed; rolling back",
+            })
+        )
+        .unwrap();
+        for m in ["eval", "activate", "rollback"] {
+            writeln!(
+                fh,
+                "{}",
+                json!({
+                    "v": 1, "host": "web", "plugin": "deploy",
+                    "event": "milestone", "milestone": m,
+                })
+            )
+            .unwrap();
+        }
+    }
+    let mixed = read_both(
         follower,
         local,
         "deploy_status",
         &json!({"run_id": dep_run_id}),
     )
     .await;
+    assert_eq!(mixed["liveness"], "rolled-back", "{mixed}");
+    assert_eq!(mixed["hosts"]["web"]["state"], "rolled-back");
+    assert_eq!(
+        mixed["hosts"]["web"]["raw"],
+        json!(["activation failed; rolling back"])
+    );
 
     let listing = read_both(follower, local, "deploy_status", &json!({"limit": 5})).await;
     assert!(

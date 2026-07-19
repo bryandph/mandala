@@ -234,6 +234,31 @@ async fn owned_finish_materializes_summary_with_recap() {
 }
 
 #[tokio::test]
+async fn owned_zero_exit_with_rollback_materializes_failed_summary() {
+    registry_env();
+    let cfg = stub_cfg(&[
+        "sh",
+        "-c",
+        r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_FLEET_EVENTS/web.jsonl"; exit 0"#,
+    ]);
+    let app = drive(
+        App::new(filled_state(), cfg),
+        vec![(0, KeyCode::Char('D')), (100, KeyCode::Char('y'))],
+        1400,
+    )
+    .await;
+    let Some(ScreenState::Deploy(view)) = &app.state.screen else {
+        panic!("deploy screen not up");
+    };
+    assert!(view.finished);
+    assert_eq!(view.returncode, Some(1));
+    assert_eq!(view.hosts[0].state, HostState::RolledBack);
+    let summary = view.summary.as_ref().expect("summary");
+    assert!(!summary.ok);
+    assert_eq!(summary.head, "deploy FAILED (exit 1)");
+}
+
+#[tokio::test]
 async fn owned_completed_dismissal_fires_the_drift_refresh() {
     registry_env();
     let cfg = stub_cfg(&["sh", "-c", "exit 0"]);
@@ -348,6 +373,7 @@ async fn attached_settled_run_dismisses_with_derived_rc() {
     let (run_id, path) = make_run(&[
         ("limit", Value::from("web")),
         ("pid", Value::from(999_999_999_i64)), // beyond pid_max: dead
+        ("rc", Value::from(0)),
     ]);
     write_events(
         &path.join("web.jsonl"),

@@ -288,6 +288,16 @@ impl EventTailer {
             .or_insert_with(|| HostRun::new(name))
     }
 
+    /// Whether any host reached a sticky unsuccessful terminal state. A
+    /// controller process can still exit zero after deploy-rs rolls a host
+    /// back, so deploy-level success must consult this independently.
+    #[must_use]
+    pub fn has_unsuccessful_host(&self) -> bool {
+        self.hosts
+            .values()
+            .any(|host| matches!(host.state, HostState::Failed | HostState::RolledBack))
+    }
+
     /// Consume newly appended events across every `*.jsonl` file (sorted, for
     /// deterministic cross-file ordering). Returns how many records were read.
     ///
@@ -367,6 +377,22 @@ impl EventTailer {
             self.host(host).feed(&event);
         }
     }
+}
+
+/// Combine the controller process result with sticky per-host outcomes.
+/// Preserve a real non-zero process code; synthesize `1` only when the
+/// process succeeded but a host failed or rolled back.
+fn effective_deploy_returncode(
+    process_rc: Option<i64>,
+    tailer: Option<&EventTailer>,
+) -> Option<i64> {
+    process_rc.map(|rc| {
+        if rc == 0 && tailer.is_some_and(EventTailer::has_unsuccessful_host) {
+            1
+        } else {
+            rc
+        }
+    })
 }
 
 // ==== write-side: subprocess-owning runners ==============================
@@ -564,8 +590,13 @@ pub fn run_deploy_supervisor(run_dir: &Path) -> std::io::Result<i64> {
     registry::update_meta(&run_dir, running)?;
 
     let status = child.wait()?;
-    let code = exit_code(status);
+    let process_code = exit_code(status);
+    let mut terminal_tailer = EventTailer::new(&run_dir);
+    terminal_tailer.poll();
+    let code = effective_deploy_returncode(Some(process_code), Some(&terminal_tailer))
+        .expect("a waited child has an exit code");
     let mut terminal = Meta::new();
+    terminal.insert("process_rc".into(), Value::from(process_code));
     terminal.insert("rc".into(), Value::from(code));
     terminal.insert("finished_at".into(), Value::from(now_epoch_f64()));
     registry::update_meta(&run_dir, terminal)?;
@@ -996,13 +1027,20 @@ impl DeployRun {
     /// `returncode` property: attached mode derives it from the sticky terminal
     /// host states (any failed/rolled-back ⇒ 1), owned mode from the child.
     pub fn returncode(&mut self) -> Option<i64> {
+        if !self.finished() {
+            return None;
+        }
+        self.poll();
         if self.attached {
-            if !self.finished() {
-                return None;
-            }
-            if let Some(meta) = self.events_dir.as_deref().map(registry::read_meta)
-                && let Some(rc) = meta.get("rc").and_then(Value::as_i64)
-            {
+            let meta = self
+                .events_dir
+                .as_deref()
+                .map(registry::read_meta)
+                .unwrap_or_default();
+            if let Some(rc) = effective_deploy_returncode(
+                meta.get("rc").and_then(Value::as_i64),
+                self.tailer.as_ref(),
+            ) {
                 return Some(rc);
             }
             if let Some(meta) = self.events_dir.as_deref().map(registry::read_meta)
@@ -1011,14 +1049,14 @@ impl DeployRun {
             {
                 return Some(1);
             }
-            let bad = self.tailer.as_ref().is_some_and(|t| {
-                t.hosts
-                    .values()
-                    .any(|h| matches!(h.state, HostState::Failed | HostState::RolledBack))
-            });
+            let bad = self
+                .tailer
+                .as_ref()
+                .is_some_and(EventTailer::has_unsuccessful_host);
             return Some(i64::from(bad));
         }
-        self.poll_exit().map(exit_code)
+        let process_rc = self.poll_exit().map(exit_code);
+        effective_deploy_returncode(process_rc, self.tailer.as_ref())
     }
 
     /// Signal the owned subprocess to terminate (SIGTERM, parity of
@@ -1609,6 +1647,61 @@ mod write_tests {
         run.terminate(); // reap the lingering stub
     }
 
+    #[tokio::test]
+    async fn deploy_run_zero_process_exit_with_rollback_returns_failure() {
+        let base = tmp_base();
+        let _g = registry::test_hooks::install_runs_base(base);
+        let mut run = DeployRun::new("web");
+        run.program = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_FLEET_EVENTS/web.jsonl"; exit 0"#.into(),
+        ]);
+        run.start().await.unwrap();
+
+        for _ in 0..200 {
+            run.poll();
+            if run.finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(run.finished());
+        assert_eq!(run.returncode(), Some(1));
+        assert_eq!(
+            run.tailer.as_ref().unwrap().hosts["web"].state,
+            HostState::RolledBack
+        );
+    }
+
+    #[test]
+    fn supervisor_persists_process_and_effective_rollback_results() {
+        let base = tmp_base();
+        let _g = registry::test_hooks::install_runs_base(base);
+        let (_run_id, run_dir) = registry::new_run_dir().unwrap();
+        std::fs::write(run_dir.join(COMMAND_LOG), "$ test deploy\n").unwrap();
+        let request = DeploySupervisorRequest {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_FLEET_EVENTS/web.jsonl"; exit 0"#.into(),
+            ],
+            cwd: run_dir.clone(),
+            events_dir: run_dir.clone(),
+        };
+        std::fs::write(
+            run_dir.join(DEPLOY_SUPERVISOR_REQUEST),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        registry::write_meta(&run_dir, &Meta::new()).unwrap();
+
+        assert_eq!(run_deploy_supervisor(&run_dir).unwrap(), 1);
+        let meta = registry::read_meta(&run_dir);
+        assert_eq!(meta.get("process_rc").and_then(Value::as_i64), Some(0));
+        assert_eq!(meta.get("rc").and_then(Value::as_i64), Some(1));
+    }
+
     /// `DeployRun::attach` owns no subprocess: `finished`/`returncode` derive
     /// from the registry pid then the sticky terminal host states (any
     /// failed/rolled-back ⇒ 1, else 0); `terminate` is a no-op.
@@ -1644,7 +1737,9 @@ mod write_tests {
         assert_eq!(run.returncode(), None);
         drop(g);
 
-        // pid gone → finished; a rolled-back host ⇒ returncode 1.
+        // Reproduce a pre-fix record: controller rc=0, but a host rolled back.
+        // Host outcome must still produce effective returncode 1.
+        registry::update_meta(&dir, Meta::from_iter([("rc".into(), Value::from(0))])).unwrap();
         let dead = registry::test_hooks::install(|_| false);
         assert!(run.finished());
         assert_eq!(run.returncode(), Some(1));
