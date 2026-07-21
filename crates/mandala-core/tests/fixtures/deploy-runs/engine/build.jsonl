@@ -1,0 +1,5 @@
+{"v":2,"ts":20.1,"host":"controller","plugin":"build","event":"status","cmd":["nix","build","--log-format","internal-json"],"state":"start"}
+{"v":2,"ts":20.2,"host":"controller","plugin":"build","event":"nixlog","line":"@nix {\"action\":\"start\",\"id\":7,\"type\":105}"}
+{"v":2,"ts":20.3,"host":"controller","plugin":"build","event":"line","line":"warning: synthetic build warning","stream":"nix"}
+{"v":2,"ts":20.4,"host":"controller","plugin":"build","event":"progress","built":2,"finished":2,"fetched":1,"fetched_done":1,"errors":0,"current":""}
+{"v":2,"ts":20.5,"host":"controller","plugin":"build","event":"status","rc":0,"state":"done"}

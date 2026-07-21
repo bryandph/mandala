@@ -58,7 +58,7 @@ pub struct ExplorerConfig {
     /// availability semantics live there); `None` = reboot unavailable.
     pub reboot_argv: fn(&str, &str, bool) -> Option<Vec<String>>,
     /// Test seam: override the deploy screen's launched argv verbatim
-    /// (`DeployRun::program`); `None` builds the real playbook line.
+    /// (`DeployRun::program`); `None` builds the real native-engine line.
     pub deploy_program: Option<Vec<String>>,
     /// `--debug-mcp`: render the context call-monitoring surface (activity
     /// panel, pending strip, status-bar `mcp <tool>` jobs, `m` toggle).

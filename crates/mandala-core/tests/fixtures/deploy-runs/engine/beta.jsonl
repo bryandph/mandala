@@ -1,0 +1,7 @@
+{"v":2,"ts":20.6,"host":"beta","plugin":"deploy","event":"status","cmd":["mandala-deploy","beta"],"state":"start"}
+{"v":2,"ts":20.7,"host":"beta","plugin":"deploy","event":"milestone","milestone":"copy"}
+{"v":2,"ts":20.8,"host":"beta","plugin":"deploy","event":"milestone","milestone":"activate"}
+{"v":2,"ts":20.9,"host":"beta","plugin":"deploy","event":"milestone","milestone":"wait"}
+{"v":2,"ts":21.0,"host":"beta","plugin":"deploy","event":"line","line":"confirmation failed; rolled back","stream":"deploy"}
+{"v":2,"ts":21.1,"host":"beta","plugin":"deploy","event":"milestone","milestone":"rollback"}
+{"v":2,"ts":21.2,"host":"beta","plugin":"deploy","event":"status","rc":1,"state":"done"}

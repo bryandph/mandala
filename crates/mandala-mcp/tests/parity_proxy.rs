@@ -369,17 +369,24 @@ async fn leader_and_follower_paths_are_byte_identical() {
 
     // ---- actions: refusal paths through BOTH seams (effect-free) ------------
     install(&slot, handler(FakeEffects::default(), &events));
+    let runs_before_refusal = registry::list_runs().len();
     let refused = structured(
         &refuse_both(
             follower,
             local,
             "deploy",
-            &json!({"selector": "@k3s", "dry_activate": false}),
+            &json!({"selector": "@k3s", "dry_activate": false, "confirm": "web"}),
         )
         .await
         .expect("deploy refusal is a structured result"),
     );
     assert_shaped("deploy", &refused);
+    assert_eq!(refused["required_confirm"], "cache,web");
+    assert_eq!(
+        registry::list_runs().len(),
+        runs_before_refusal,
+        "a refused deploy must not create a run"
+    );
 
     let refused = structured(
         &refuse_both(
@@ -422,6 +429,56 @@ async fn leader_and_follower_paths_are_byte_identical() {
             .expect("dry deploy ok"),
     );
     assert_shaped("deploy", &actual);
+    assert_eq!(actual["limit"], "cache,web");
+    assert_eq!(actual["dry_activate"], true);
+    let dry_run_id = actual["run_id"].as_str().expect("engine run id");
+    let dry_run = registry::open_run(dry_run_id).expect("engine-owned run is attachable");
+    assert_eq!(dry_run.info.meta["run_id"], dry_run_id);
+    assert_eq!(dry_run.info.meta["limit"], "cache,web");
+    assert_eq!(dry_run.info.meta["dry_activate"], true);
+    assert_eq!(dry_run.info.meta["throttle"], 4);
+    assert_eq!(
+        actual["events_dir"],
+        dry_run.info.path.display().to_string()
+    );
+    {
+        let events = events.lock().unwrap();
+        let settle = events
+            .iter()
+            .rev()
+            .find(|event| event["tool"] == "deploy" && event["status"] == "ok")
+            .expect("deploy settle activity");
+        assert_eq!(settle["result"]["run_id"], dry_run_id);
+    }
+    spacer().await;
+
+    install(
+        &slot,
+        handler(
+            FakeEffects {
+                fake_deploy: true,
+                ..FakeEffects::default()
+            },
+            &events,
+        ),
+    );
+    let activated = structured(
+        &fcall(
+            follower,
+            "deploy",
+            &json!({
+                "selector": "@k3s",
+                "dry_activate": false,
+                "confirm": "cache,web",
+            }),
+        )
+        .await
+        .expect("confirmed real deploy ok"),
+    );
+    assert_eq!(activated["ok"], true);
+    assert_eq!(activated["dry_activate"], false);
+    let activated_run = registry::open_run(activated["run_id"].as_str().unwrap()).unwrap();
+    assert_eq!(activated_run.info.meta["dry_activate"], false);
     spacer().await;
 
     install(
@@ -609,12 +666,12 @@ async fn leader_and_follower_paths_are_byte_identical() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
         .collect();
-    // Forwarded (origin-labeled): deploy ×2 (refused + dry), restart_service
+    // Forwarded (origin-labeled): deploy ×3 (refused + dry + real), restart_service
     // ×2 (refused + partial), reboot ×2 (refused + ok), reload ×2 (ok +
     // unavailable). Leader-local (no origin): the 4 seam-side refusal/error
     // replays (deploy, restart_service, reboot, reload-unavailable).
     let (forwarded, seam): (Vec<_>, Vec<_>) = audit.iter().partition(|l| l.get("origin").is_some());
-    assert_eq!(forwarded.len(), 8, "audit lines: {audit_text}");
+    assert_eq!(forwarded.len(), 9, "audit lines: {audit_text}");
     assert_eq!(seam.len(), 4, "audit lines: {audit_text}");
     for line in &forwarded {
         assert_eq!(

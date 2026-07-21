@@ -1,9 +1,10 @@
 fn main() {
-    let Some(run_dir) = std::env::args_os().nth(1) else {
-        eprintln!("usage: mandala-run-supervisor <run-dir>");
+    let Some(launch_dir) = std::env::args_os().nth(1) else {
+        eprintln!("usage: mandala-run-supervisor <deploy-coordination-dir>");
         std::process::exit(2);
     };
-    let code = match mandala_core::runner::run_deploy_supervisor(std::path::Path::new(&run_dir)) {
+    let code = match mandala_core::runner::run_deploy_supervisor(std::path::Path::new(&launch_dir))
+    {
         Ok(code) => code,
         Err(error) => {
             eprintln!("mandala deploy supervisor: {error}");

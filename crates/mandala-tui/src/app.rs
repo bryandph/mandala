@@ -608,6 +608,7 @@ impl App {
                     match confirm.action {
                         ConfirmAction::Deploy { target } => {
                             let mut run = DeployRun::new(target);
+                            run.flake = self.cfg.flake.clone();
                             if let Some(program) = self.cfg.deploy_program.clone() {
                                 run.program = Some(program);
                             }
@@ -929,6 +930,13 @@ impl App {
             .arm(TimerId::DeployPoll, Instant::now() + DEPLOY_POLL);
         self.dirty = true;
         true
+    }
+
+    /// Number of native build records delivered to the active deploy's nom
+    /// sink. Primarily useful to assert attach-before-first-poll ordering.
+    #[must_use]
+    pub fn deploy_nixlog_lines_seen(&self) -> usize {
+        self.deploy.as_ref().map_or(0, DeployJob::nixlog_lines_seen)
     }
 
     /// Arm the spinner tick when a job just started (never pushing an

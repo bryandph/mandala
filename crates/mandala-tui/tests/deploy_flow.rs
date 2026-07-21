@@ -31,6 +31,10 @@ use serde_json::{Value, json};
 fn registry_env() -> &'static PathBuf {
     static BASE: OnceLock<PathBuf> = OnceLock::new();
     BASE.get_or_init(|| {
+        // This suite exercises the real durable-supervisor boundary. The
+        // workspace build places that binary beside the test profile; use the
+        // same sibling lookup as production instead of recursively invoking
+        // Cargo (which also breaks target/profile selection in Nix checks).
         let dir = std::env::temp_dir().join(format!("mandala-deployflow-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: set once, under the OnceLock, before any concurrent read
@@ -38,6 +42,7 @@ fn registry_env() -> &'static PathBuf {
         unsafe {
             std::env::set_var("MANDALA_FLEET_STATE", &dir);
             std::env::set_var("MANDALA_FLEET_RUN_KEEP", "500");
+            std::env::remove_var("MANDALA_DEPLOY_SUPERVISOR_BIN");
         }
         dir
     })
@@ -80,9 +85,24 @@ fn filled_state() -> AppState {
 /// Survey stubbed to sleep so a fired after-mutation refresh stays
 /// observable; the deploy argv comes per-test via `deploy_program`.
 fn stub_cfg(deploy_program: &[&str]) -> ExplorerConfig {
+    assert_eq!(&deploy_program[..2], ["sh", "-c"]);
+    let body = deploy_program[2];
+    // Emulate the native engine boundary: the frontend/supervisor passes no
+    // events directory. The engine stub allocates its own registry run,
+    // publishes that id, then writes events there.
+    let native = format!(
+        r#"test -z "$MANDALA_FLEET_EVENTS" || exit 91
+rid="20260721T120000_000000-$$"
+events="$MANDALA_FLEET_STATE/runs/$rid"
+mkdir -p "$events"
+printf '{{"run_id":"%s","limit":"web","pid":%s,"started_at":0}}\n' "$rid" "$$" > "$events/meta.json"
+printf '%s\n' "$rid"
+export MANDALA_NATIVE_TEST_EVENTS="$events"
+{body}"#
+    );
     ExplorerConfig {
         survey_argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
-        deploy_program: Some(deploy_program.iter().map(|s| (*s).to_string()).collect()),
+        deploy_program: Some(vec!["sh".into(), "-c".into(), native]),
         ..ExplorerConfig::default()
     }
 }
@@ -149,16 +169,15 @@ fn milestones(host: &str, names: &[&str]) -> Vec<Value> {
 // ---- owned mode (confirm-gated launch from the explorer) --------------------
 
 /// The confirm-gated launch streams the run's own event files back into the
-/// screen: the stub playbook writes a milestone JSONL into the registry run
-/// dir (`$MANDALA_FLEET_EVENTS`) and the 250ms poll surfaces it as a host
-/// tab.
+/// screen: the native stub writes build + milestone JSONL into its own
+/// registry run and the 250ms poll surfaces them as nom input + a host tab.
 #[tokio::test]
 async fn owned_deploy_launches_and_renders_events_live() {
     registry_env();
     let cfg = stub_cfg(&[
         "sh",
         "-c",
-        r#"printf '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"activate"}\n' > "$MANDALA_FLEET_EVENTS/web.jsonl"; sleep 3"#,
+        r#"printf '%s\n' '{"v":2,"ts":0,"host":"build","plugin":"build","event":"nixlog","line":"@nix {\"action\":\"start\",\"type\":105}"}' > "$MANDALA_NATIVE_TEST_EVENTS/build.jsonl"; printf '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"activate"}\n' > "$MANDALA_NATIVE_TEST_EVENTS/web.jsonl"; sleep 3"#,
     ]);
     let app = drive(
         App::new(filled_state(), cfg),
@@ -178,7 +197,12 @@ async fn owned_deploy_launches_and_renders_events_live() {
     assert_eq!(view.hosts.len(), 1, "host tab missing: {view:?}");
     assert_eq!(view.hosts[0].name, "web");
     assert_eq!(view.hosts[0].state, HostState::Activating);
-    // The playbook mirror leads with the argv header.
+    assert_eq!(
+        app.deploy_nixlog_lines_seen(),
+        1,
+        "build record emitted before attach must reach nom's sink"
+    );
+    // The engine-output mirror leads with the argv header.
     assert!(view.playbook_lines[0].starts_with("$ sh -c "));
 }
 
@@ -200,6 +224,27 @@ async fn owned_esc_before_completion_cancels_without_refresh() {
     .await;
     assert!(app.state.screen.is_none());
     assert!(!app.state.surveying, "cancel must not refresh drift");
+}
+
+#[tokio::test]
+async fn dropping_frontend_leaves_supervised_native_child_alive() {
+    let base = registry_env();
+    let marker = base.join(format!(
+        "frontend-drop-survived-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let body = format!("sleep 0.4; printf survived > '{}'", marker.display());
+    let cfg = stub_cfg(&["sh", "-c", &body]);
+    let mut run = DeployRun::new("web");
+    run.program = cfg.deploy_program;
+    let mut app = App::new(AppState::new(), ExplorerConfig::default());
+    assert!(app.start_deploy(run, false, false, false, (100, 20)).await);
+    drop(app);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(marker.is_file(), "supervised engine died with its frontend");
 }
 
 #[tokio::test]
@@ -239,7 +284,7 @@ async fn owned_zero_exit_with_rollback_materializes_failed_summary() {
     let cfg = stub_cfg(&[
         "sh",
         "-c",
-        r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_FLEET_EVENTS/web.jsonl"; exit 0"#,
+        r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_NATIVE_TEST_EVENTS/web.jsonl"; exit 0"#,
     ]);
     let app = drive(
         App::new(filled_state(), cfg),

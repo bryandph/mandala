@@ -1,0 +1,6 @@
+{"v":2,"ts":20.6,"host":"alpha","plugin":"deploy","event":"status","cmd":["mandala-deploy","alpha"],"state":"start"}
+{"v":2,"ts":20.7,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"copy"}
+{"v":2,"ts":20.8,"host":"alpha","plugin":"deploy","event":"line","line":"profile copied","stream":"deploy"}
+{"v":2,"ts":20.9,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"activate"}
+{"v":2,"ts":21.0,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"confirm"}
+{"v":2,"ts":21.1,"host":"alpha","plugin":"deploy","event":"status","rc":0,"state":"done"}

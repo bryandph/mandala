@@ -1,0 +1,9 @@
+{
+ "dry_activate": false,
+ "kind": "deploy",
+ "limit": "alpha,beta",
+ "pid": null,
+ "rc": 1,
+ "run_id": "ansible-recording",
+ "started_at": 10.0
+}

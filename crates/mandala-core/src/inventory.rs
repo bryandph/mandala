@@ -413,6 +413,17 @@ impl Inventory {
             .unwrap_or_default()
     }
 
+    /// The flattened per-node deploy settings emitted by the deploy
+    /// projection. These are the settings the native deploy engine consumes;
+    /// callers must not re-merge member/group/fleet authoring tiers.
+    #[must_use]
+    pub fn deploy_settings(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.projections()
+            .and_then(|p| p.get("deploy"))
+            .and_then(|d| d.get("settings"))
+            .and_then(Value::as_object)
+    }
+
     /// The projected ansible dynamic-inventory value (`None` if the ansible
     /// flakeModule was not imported). Parity with the Python
     /// `aggregate["projections"]["ansibleInventory"]`.

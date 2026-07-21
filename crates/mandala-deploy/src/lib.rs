@@ -1,9 +1,9 @@
-//! Native Mandala deploy-controller spike.
+//! Native Mandala deploy controller.
 //!
 //! `data.rs`, `push.rs`, and `deploy.rs` are derived from the bottom half of
 //! serokell/deploy-rs at commit
 //! `6d3087eedff75a715b40c0e124ba15d2dd7bec28` and retain MPL-2.0 headers.
-//! The spike's intentional patch is sink injection: process-global `log`
+//! The intentional patch is sink injection: process-global `log`
 //! records and inherited child output are replaced by a caller-owned,
 //! per-host [`EventSink`]. No flake evaluation exists in this crate.
 
@@ -21,6 +21,10 @@ pub use event::{EventSink, JsonlSink, Level};
 #[derive(Debug, Clone, Default)]
 pub struct CmdOverrides {
     pub hostname: Option<String>,
+    /// Alternate `nix` executable used by effect-isolated tests.
+    pub nix_program: Option<PathBuf>,
+    /// Alternate `ssh` executable used by effect-isolated tests.
+    pub ssh_program: Option<PathBuf>,
 }
 
 pub struct DeployData<'a> {

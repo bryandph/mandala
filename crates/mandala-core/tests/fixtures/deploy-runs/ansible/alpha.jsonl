@@ -1,0 +1,11 @@
+{"v":2,"ts":10.1,"host":"alpha","plugin":"build","event":"status","cmd":["ansible-playbook","mandala.fleet.deploy"],"state":"start"}
+{"v":2,"ts":10.2,"host":"alpha","plugin":"build","event":"nixlog","line":"@nix {\"action\":\"start\",\"id\":7,\"type\":105}"}
+{"v":2,"ts":10.3,"host":"alpha","plugin":"build","event":"line","line":"warning: synthetic build warning","stream":"nix"}
+{"v":2,"ts":10.4,"host":"alpha","plugin":"build","event":"progress","built":2,"finished":2,"fetched":1,"fetched_done":1,"errors":0,"current":""}
+{"v":2,"ts":10.5,"host":"alpha","plugin":"build","event":"status","rc":0,"state":"done"}
+{"v":2,"ts":10.6,"host":"alpha","plugin":"deploy","event":"status","cmd":["deploy","-s",".#alpha"],"state":"start"}
+{"v":2,"ts":10.7,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"copy"}
+{"v":2,"ts":10.8,"host":"alpha","plugin":"deploy","event":"line","line":"profile copied","stream":"deploy"}
+{"v":2,"ts":10.9,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"activate"}
+{"v":2,"ts":11.0,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"confirm"}
+{"v":2,"ts":11.1,"host":"alpha","plugin":"deploy","event":"status","rc":0,"state":"done"}

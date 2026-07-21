@@ -62,6 +62,12 @@ fn tmp() -> PathBuf {
     dir
 }
 
+fn recorded_run(emitter: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../mandala-core/tests/fixtures/deploy-runs")
+        .join(emitter)
+}
+
 /// Append v1 events (defaulting `v`/`ts`) to a `.jsonl` file.
 fn write_events(path: &Path, events: &[Value]) {
     let mut fh = std::fs::OpenOptions::new()
@@ -614,6 +620,37 @@ fn snapshot_deploy_screen_running_and_summary() {
     state.screen = Some(ScreenState::Deploy(view));
     let terminal = draw(&state, 100, 16);
     insta::assert_snapshot!("deploy_screen_summary", terminal.backend());
+}
+
+/// The real TUI view and renderer are emitter-agnostic: the retired Ansible
+/// recording puts build events in `alpha.jsonl`, while the native engine uses
+/// `build.jsonl`, yet both must produce the same host tabs, build summary, and
+/// finished screen without any consumer-side special case.
+#[test]
+fn recorded_ansible_and_engine_runs_render_identically() {
+    let render_recording = |emitter: &str| {
+        let mut tailer = EventTailer::new(&recorded_run(emitter));
+        assert_eq!(tailer.poll(), 18);
+        let mut view = DeployViewState::new("alpha,beta", false, false, true, true);
+        view.sync(Some(&tailer), &[], true, Some(1), 11);
+        assert_eq!(view.hosts[0].state, HostState::Confirmed);
+        assert_eq!(view.hosts[1].state, HostState::RolledBack);
+        assert_eq!(view.hosts[1].rc, Some(1));
+        assert_eq!(
+            view.build_line,
+            "batch build  built 2/2  fetched 1/1  errors 0  —  done rc=0"
+        );
+        let mut state = AppState::new();
+        state.screen = Some(ScreenState::Deploy(view));
+        format!("{}", draw(&state, 100, 16).backend())
+    };
+
+    let ansible = render_recording("ansible");
+    let engine = render_recording("engine");
+    assert_eq!(engine, ansible);
+    assert!(engine.contains("deploy FAILED (exit 1)"));
+    assert!(engine.contains("alpha"));
+    assert!(engine.contains("rolled-back"));
 }
 
 /// Host tab labels carry the state style in the tab bar (snapshots can't

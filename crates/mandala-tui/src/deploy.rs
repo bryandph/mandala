@@ -5,11 +5,12 @@
 //! [`NomPane`]; the 250ms loop timer drives [`DeployJob::tick`], which polls
 //! the event tailer, finishes the nom pane exactly once on `build.done`, and
 //! refreshes the pure [`DeployViewState`] the render fns consume. The
-//! playbook stays the engine — the argv is built ONLY by
+//! native deploy stays the engine — the argv is built ONLY by
 //! `DeployRun`'s own construction (limit guard, throttle, magic rollback
 //! never bypassed), and every child's output is captured (the quiet rule).
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -36,6 +37,8 @@ pub struct DeployJob {
     /// lines fed before its pty child spawns).
     pub nom: Arc<Mutex<NomPane>>,
     nom_finished: bool,
+    nixlog_attached: bool,
+    nixlog_lines_seen: Arc<AtomicUsize>,
     /// Owned mode: when the run was launched, for the summary's elapsed
     /// clock. `None` in attached mode (elapsed renders 0 — Python parity).
     pub started_at: Option<Instant>,
@@ -48,6 +51,8 @@ impl DeployJob {
             run,
             nom: Arc::new(Mutex::new(NomPane::new())),
             nom_finished: false,
+            nixlog_attached: false,
+            nixlog_lines_seen: Arc::new(AtomicUsize::new(0)),
             started_at: None,
         }
     }
@@ -62,14 +67,26 @@ impl DeployJob {
     /// Live-wire the internal-json stream into the nom pane. Call after the
     /// tailer exists (post-`start`/`attach`) and BEFORE the first poll.
     pub fn attach_nixlog_sink(&mut self) {
+        if self.nixlog_attached {
+            return;
+        }
         if let Some(tailer) = self.run.tailer.as_mut() {
             let nom = Arc::clone(&self.nom);
+            let lines_seen = Arc::clone(&self.nixlog_lines_seen);
             tailer.nixlog_sink = Some(Box::new(move |line| {
+                lines_seen.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut nom) = nom.lock() {
                     nom.feed(&line);
                 }
             }));
+            self.nixlog_attached = true;
         }
+    }
+
+    /// Number of native build records delivered to the nom sink.
+    #[must_use]
+    pub fn nixlog_lines_seen(&self) -> usize {
+        self.nixlog_lines_seen.load(Ordering::Relaxed)
     }
 
     /// One 250ms poll (the `_tick` body): consume new events, EOF the nom
@@ -77,6 +94,11 @@ impl DeployJob {
     /// summary), then refresh the view state. Returns whether the pty screen
     /// changed (extra render cue beside the tick's own dirty).
     pub fn tick(&mut self, view: &mut DeployViewState) -> bool {
+        // Native owned runs do not have a frontend-allocated tailer. Discover
+        // the engine-owned run first, wire nom, and only then consume the first
+        // event batch so no early build record can bypass the sink.
+        let _ = self.run.discover_run();
+        self.attach_nixlog_sink();
         self.run.poll();
         if !self.nom_finished
             && self
@@ -118,7 +140,7 @@ pub struct DeployConfig {
     pub dry_activate: bool,
     pub throttle: i64,
     /// Test seam: override the launched argv verbatim (`DeployRun::program`)
-    /// — never real ansible in tests.
+    /// — never a real native deploy in tests.
     pub program: Option<Vec<String>>,
 }
 
@@ -145,6 +167,7 @@ pub async fn run_deploy(cfg: DeployConfig) -> io::Result<i64> {
     .map_err(io::Error::other)??;
 
     let mut run = DeployRun::new(limit);
+    run.flake = cfg.flake.clone();
     run.dry_activate = cfg.dry_activate;
     run.throttle = cfg.throttle;
     run.program = cfg.program.clone();

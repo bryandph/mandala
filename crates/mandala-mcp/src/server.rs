@@ -50,6 +50,9 @@ pub fn server_name() -> String {
 /// Blocking waits stay under typical MCP client timeouts.
 const MAX_WAIT_SECONDS: i64 = 570;
 
+/// Keep the CLI/TUI native-engine fan-out default at the MCP boundary.
+const DEPLOY_THROTTLE: i64 = 4;
+
 /// Lines of a command run's teed log surfaced in its snapshot.
 const OUTPUT_TAIL: usize = 120;
 
@@ -675,7 +678,7 @@ impl MandalaHandler {
         let launch = self
             .state
             .effects
-            .launch_deploy(&target, dry_activate)
+            .launch_deploy(&self.state.flake, &target, dry_activate, DEPLOY_THROTTLE)
             .await
             .map_err(|e| tool_error(e.to_string()))?;
         Ok(json!({
@@ -901,7 +904,7 @@ fn run_snapshot(obs: &mut ObservedRun) -> Value {
     let b = obs.tailer.build.clone();
     let liveness = obs.liveness();
     // A coarse phase so an early snapshot doesn't read as stalled: the
-    // deploy playbook batch-builds every profile FIRST (play 1, no host
+    // The native engine batch-builds every selected profile first (no host
     // events yet), then fans out per host.
     let phase = if liveness != RunLiveness::Running {
         "done"
@@ -972,6 +975,36 @@ impl ServerHandler for MandalaHandler {
 mod tests {
     use super::*;
 
+    fn recorded_run(emitter: &str) -> ObservedRun {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mandala-core/tests/fixtures/deploy-runs")
+            .join(emitter);
+        ObservedRun {
+            info: registry::RunInfo {
+                run_id: format!("{emitter}-recording"),
+                meta: registry::read_meta(&path),
+                path: path.clone(),
+            },
+            tailer: mandala_core::runner::EventTailer::new(&path),
+        }
+    }
+
+    fn normalize_emitter_fields(snapshot: &mut Value) {
+        snapshot.as_object_mut().unwrap().remove("run_id");
+        let meta = snapshot["meta"].as_object_mut().unwrap();
+        for field in [
+            "run_id",
+            "started_at",
+            "finished_at",
+            "build_rc",
+            "process_rc",
+            "profiles",
+            "summary",
+        ] {
+            meta.remove(field);
+        }
+    }
+
     #[test]
     fn unit_names_are_validated_to_plain_systemd_names() {
         for good in ["k3s", "nginx.service", "getty@tty1", "a:b_c-d.e"] {
@@ -998,5 +1031,45 @@ mod tests {
     fn round3_matches_python_round() {
         assert_eq!(round3(1.234_567), 1.235);
         assert_eq!(round3(0.0004), 0.0);
+    }
+
+    /// MCP observes the same durable build/host state from both emitter paths.
+    /// Native-only metadata is first pinned exactly, then only those explicit
+    /// emitter fields and dynamic run identity/times are removed for parity;
+    /// liveness, phase, rc, build counters, raw lines, and sticky states remain
+    /// in the equality assertion.
+    #[test]
+    fn recorded_ansible_and_engine_runs_have_identical_mcp_snapshots() {
+        let mut ansible = recorded_run("ansible");
+        let mut engine = recorded_run("engine");
+        let mut ansible_snapshot = run_snapshot(&mut ansible);
+        let mut engine_snapshot = run_snapshot(&mut engine);
+
+        assert_eq!(engine_snapshot["meta"]["build_rc"], 0);
+        assert_eq!(engine_snapshot["meta"]["process_rc"], 0);
+        assert_eq!(engine_snapshot["meta"]["rc"], 1);
+        assert_eq!(
+            engine_snapshot["meta"]["summary"],
+            json!({"confirmed":1,"failed":0,"rolled_back":1,"total":2})
+        );
+        assert_eq!(
+            engine_snapshot["meta"]["profiles"],
+            json!({
+                "alpha":"/nix/store/00000000000000000000000000000000-alpha-profile",
+                "beta":"/nix/store/11111111111111111111111111111111-beta-profile",
+            })
+        );
+
+        normalize_emitter_fields(&mut ansible_snapshot);
+        normalize_emitter_fields(&mut engine_snapshot);
+        assert_eq!(engine_snapshot, ansible_snapshot);
+        assert_eq!(engine_snapshot["liveness"], "rolled-back");
+        assert_eq!(engine_snapshot["phase"], "done");
+        assert_eq!(engine_snapshot["hosts"]["alpha"]["state"], "confirmed");
+        assert_eq!(engine_snapshot["hosts"]["beta"]["state"], "rolled-back");
+        assert_eq!(
+            engine_snapshot["hosts"]["beta"]["raw"],
+            json!(["confirmation failed; rolled back"])
+        );
     }
 }

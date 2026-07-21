@@ -1,4 +1,4 @@
-//! Deploy-runner: drive the fan-out playbook (and ad-hoc background commands)
+//! Deploy-runner: drive the native fan-out engine (and ad-hoc background commands)
 //! as subprocesses, and demux the per-host JSONL event streams a run writes
 //! into its registry dir, tailing them incrementally into host state machines
 //! and a build-progress model.
@@ -8,7 +8,7 @@
 //! a second TUI, the CLI, the fleet MCP server — uses to render an in-flight or
 //! finished run from the shared event files, without owning the subprocess that
 //! produced them. The WRITE half ([`DeployRun`], [`CommandRun`]) owns the
-//! subprocess: it launches the playbook / command on **tokio** (the design's
+//! subprocess: it launches the engine / command on **tokio** (the design's
 //! single-runtime mandate — the MCP server and phase-2 TUI drive these async),
 //! registers the run in the discoverable registry so other frontends can
 //! attach, and drains/reaps it in background tasks.
@@ -20,15 +20,16 @@
 //! a partial trailing line (a write in flight) is re-read on the next poll.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::AsyncBufReadExt;
 
 use crate::registry::{self, Meta};
 
@@ -37,9 +38,139 @@ use crate::registry::{self, Meta};
 /// (or none) is dropped, not misread.
 pub const SUPPORTED_EVENT_VERSIONS: [i64; 2] = [1, 2];
 
+/// The current event protocol emitted by native engine writers. Version 2 is
+/// v1 plus the verbatim `nixlog` record consumed by the nom pane.
+pub const EVENT_PROTOCOL_VERSION: i64 = 2;
+
 /// Whether an event's `v` field names a supported protocol version.
 fn version_supported(v: Option<i64>) -> bool {
     matches!(v, Some(v) if SUPPORTED_EVENT_VERSIONS.contains(&v))
+}
+
+/// Append-only writer for one registry JSONL stream.
+///
+/// Records use the compact bytes emitted by the retired Python plugin
+/// (`json.dumps(..., separators=(",", ":"))`) and are flushed after every
+/// line so another frontend can tail a live run immediately.
+#[derive(Debug)]
+pub struct EventWriter {
+    host: String,
+    plugin: String,
+    file: Mutex<std::fs::File>,
+}
+
+struct EventRecord<'a> {
+    v: i64,
+    ts: f64,
+    host: &'a str,
+    plugin: &'a str,
+    event: &'a str,
+    fields: serde_json::Map<String, Value>,
+}
+
+impl Serialize for EventRecord<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut record = serializer.serialize_map(Some(5 + self.fields.len()))?;
+        record.serialize_entry("v", &self.v)?;
+        record.serialize_entry("ts", &self.ts)?;
+        record.serialize_entry("host", self.host)?;
+        record.serialize_entry("plugin", self.plugin)?;
+        record.serialize_entry("event", self.event)?;
+
+        // Match the retired Python emitter's per-event insertion order even
+        // though serde_json::Map is key-sorted in this workspace.
+        let preferred: &[&str] = match self.event {
+            "status" if self.fields.contains_key("cmd") => &["cmd", "state"],
+            "status" => &["rc", "state"],
+            "line" => &["line", "stream"],
+            "progress" => &[
+                "built",
+                "finished",
+                "fetched",
+                "fetched_done",
+                "errors",
+                "current",
+            ],
+            "nixlog" => &["line"],
+            _ => &[],
+        };
+        for key in preferred {
+            if let Some(value) = self.fields.get(*key) {
+                record.serialize_entry(key, value)?;
+            }
+        }
+        for (key, value) in &self.fields {
+            if !preferred.contains(&key.as_str()) {
+                record.serialize_entry(key, value)?;
+            }
+        }
+        record.end()
+    }
+}
+
+impl EventWriter {
+    /// Open `<directory>/<stream>.jsonl` for append.
+    ///
+    /// # Errors
+    /// Invalid stream/host labels or any file-open failure.
+    pub fn new(directory: &Path, stream: &str, host: &str, plugin: &str) -> std::io::Result<Self> {
+        if !crate::inventory::is_valid_member_name(stream)
+            || !crate::inventory::is_valid_member_name(host)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "event stream and host must be bare RFC 1123 labels",
+            ));
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join(format!("{stream}.jsonl")))?;
+        Ok(Self {
+            host: host.to_string(),
+            plugin: plugin.to_string(),
+            file: Mutex::new(file),
+        })
+    }
+
+    /// Append one compact protocol-v2 record, with `fields` merged after the
+    /// common envelope just like Python's `record.update(fields)`.
+    ///
+    /// # Errors
+    /// JSON serialization, a poisoned writer lock, or file I/O failure.
+    pub fn emit(&self, event: &str, fields: serde_json::Map<String, Value>) -> std::io::Result<()> {
+        self.emit_at(event, fields, now_epoch_f64())
+    }
+
+    /// Serialize one record at a supplied timestamp. Production always enters
+    /// through [`Self::emit`]; the explicit clock keeps fleet-state-format
+    /// byte goldens deterministic without normalizing the bytes under test.
+    fn emit_at(
+        &self,
+        event: &str,
+        fields: serde_json::Map<String, Value>,
+        ts: f64,
+    ) -> std::io::Result<()> {
+        let record = EventRecord {
+            v: EVENT_PROTOCOL_VERSION,
+            ts,
+            host: &self.host,
+            plugin: &self.plugin,
+            event,
+            fields,
+        };
+
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("event writer lock poisoned"))?;
+        serde_json::to_writer(&mut *file, &record).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    }
 }
 
 /// Raw lines kept per host for the inspector view (`_MAX_LINES`).
@@ -397,7 +528,7 @@ fn effective_deploy_returncode(
 
 // ==== write-side: subprocess-owning runners ==============================
 //
-// `DeployRun` (fan-out playbook) launches a dedicated supervisor process;
+// `DeployRun` (native fan-out engine) launches a dedicated supervisor process;
 // `CommandRun` (ad-hoc background command, e.g. reboot) owns a tokio
 // subprocess directly. Both register the run in the discoverable registry so
 // other frontends can attach. Parity port of `runner.py` lines 35-62
@@ -492,7 +623,34 @@ const DEPLOY_SUPERVISOR_REQUEST: &str = "supervisor.json";
 struct DeploySupervisorRequest {
     argv: Vec<String>,
     cwd: PathBuf,
-    events_dir: PathBuf,
+}
+
+fn deploy_launches_dir() -> PathBuf {
+    registry::runs_dir()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("deploy-launches")
+}
+
+fn new_deploy_launch_dir() -> std::io::Result<PathBuf> {
+    let base = deploy_launches_dir();
+    std::fs::create_dir_all(&base)?;
+    for attempt in 0..100_u32 {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = base.join(format!("{stamp}-{}-{attempt}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate deploy coordination directory",
+    ))
 }
 
 fn supervisor_binary() -> Option<PathBuf> {
@@ -515,141 +673,83 @@ fn supervisor_binary() -> Option<PathBuf> {
 }
 
 /// Run one deploy request from a dedicated process. The supervisor owns the
-/// actual playbook child, durable log descriptors, reaping, and terminal
+/// actual native-engine child, durable log descriptors, and reaping,
 /// metadata, so none of those depend on the frontend's Tokio runtime.
 ///
 /// # Errors
 /// Invalid registry paths, request decoding, log setup, spawn, wait, or meta
 /// settlement failures.
-pub fn run_deploy_supervisor(run_dir: &Path) -> std::io::Result<i64> {
-    let run_dir = run_dir.canonicalize()?;
-    let run_id = run_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| std::io::Error::other("run directory has no UTF-8 basename"))?;
-    if !registry::is_valid_run_id(run_id) {
-        return Err(std::io::Error::other("invalid run directory identifier"));
-    }
-    let registry_root = registry::runs_dir().canonicalize()?;
-    if run_dir.parent() != Some(registry_root.as_path()) {
+pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
+    let launch_dir = launch_dir.canonicalize()?;
+    let launch_root = deploy_launches_dir().canonicalize()?;
+    if launch_dir.parent() != Some(launch_root.as_path()) {
         return Err(std::io::Error::other(
-            "run directory is outside the registry",
+            "deploy coordination directory is outside the launch root",
         ));
     }
 
-    let request_path = run_dir.join(DEPLOY_SUPERVISOR_REQUEST);
+    let request_path = launch_dir.join(DEPLOY_SUPERVISOR_REQUEST);
     let request: DeploySupervisorRequest =
         serde_json::from_slice(&std::fs::read(&request_path)?).map_err(std::io::Error::other)?;
     let _ = std::fs::remove_file(&request_path);
-    if request.argv.is_empty() || request.events_dir.canonicalize()? != run_dir {
+    if request.argv.is_empty() {
         return Err(std::io::Error::other("invalid deploy supervisor request"));
     }
 
-    let log_path = run_dir.join(COMMAND_LOG);
+    let log_path = launch_dir.join(COMMAND_LOG);
     let out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
     let err = out.try_clone()?;
     let mut command = std::process::Command::new(&request.argv[0]);
     command
         .args(&request.argv[1..])
         .current_dir(&request.cwd)
-        .env("MANDALA_FLEET_EVENTS", &run_dir)
-        .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    if std::env::var_os("ANSIBLE_FORCE_COLOR").is_none() {
-        command.env("ANSIBLE_FORCE_COLOR", "0");
-    }
-
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
                 let _ = writeln!(log, "failed to launch {}: {error}", request.argv[0]);
             }
-            let mut fields = Meta::new();
-            fields.insert(
-                "supervisor_pid".into(),
-                Value::from(i64::from(std::process::id())),
-            );
-            fields.insert("pid".into(), Value::Null);
-            fields.insert("rc".into(), Value::from(127));
-            fields.insert("error".into(), Value::from(error.to_string()));
-            fields.insert("finished_at".into(), Value::from(now_epoch_f64()));
-            registry::update_meta(&run_dir, fields)?;
             return Ok(127);
         }
     };
-
-    let mut running = Meta::new();
-    running.insert(
-        "supervisor_pid".into(),
-        Value::from(i64::from(std::process::id())),
-    );
-    running.insert("pid".into(), Value::from(i64::from(child.id())));
-    registry::update_meta(&run_dir, running)?;
-
     let status = child.wait()?;
-    let process_code = exit_code(status);
-    let mut terminal_tailer = EventTailer::new(&run_dir);
-    terminal_tailer.poll();
-    let code = effective_deploy_returncode(Some(process_code), Some(&terminal_tailer))
-        .expect("a waited child has an exit code");
-    let mut terminal = Meta::new();
-    terminal.insert("process_rc".into(), Value::from(process_code));
-    terminal.insert("rc".into(), Value::from(code));
-    terminal.insert("finished_at".into(), Value::from(now_epoch_f64()));
-    registry::update_meta(&run_dir, terminal)?;
-    Ok(code)
+    Ok(exit_code(status))
 }
 
 /// Lines kept in a [`DeployRun`]'s stdout mirror (Python `deque(maxlen=4000)`).
 const DEPLOY_OUTPUT_MAX: usize = 4000;
 
-/// Spawn a background task draining `reader`'s lines into the shared bounded
-/// buffer. Used for a [`DeployRun`]'s piped stdout and stderr.
-fn spawn_line_drain<R>(reader: R, buf: Arc<Mutex<VecDeque<String>>>)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut lines = tokio::io::BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(mut o) = buf.lock() {
-                push_capped(&mut o, line, DEPLOY_OUTPUT_MAX);
-            }
-        }
-    });
-}
-
 /// One fan-out deploy: an owned supervisor process plus the [`EventTailer`]
-/// over the run dir the supervised playbook streams into — or, in *attached*
+/// over the engine-owned run dir — or, in *attached*
 /// mode, a read-only observer of a run another process launched (a
 /// Claude-triggered deploy), owning no subprocess. Parity port of the Python
 /// `DeployRun`.
 ///
-/// The playbook stays the engine: the `--limit` guard, throttle, and deploy-rs
-/// magic rollback are never bypassed; this only launches it (with
-/// `MANDALA_FLEET_EVENTS` pointed at a run dir) and tails the event files the
-/// `mandala.fleet` plugins append.
+/// The native engine stays the sole registry owner. An owned frontend creates
+/// only a non-registry coordination/log directory, launches the engine through
+/// the durable supervisor, and attaches after discovering the first run-id line.
 pub struct DeployRun {
     pub limit: String,
+    /// Fleet flake passed to the native engine.
+    pub flake: String,
     pub dry_activate: bool,
     pub throttle: i64,
-    pub ansible_dir: Option<PathBuf>,
-    pub playbook: Option<String>,
     pub events_dir: Option<PathBuf>,
     pub run_id: Option<String>,
     pub tailer: Option<EventTailer>,
-    /// Override the launched argv verbatim (tests, and phase-4 native
-    /// launchers); `None` builds the `ansible-playbook …` line exactly as the
-    /// Python porcelain. Never enters `meta.json` (deploy meta records no argv).
+    /// Override the launched native-engine argv verbatim (tests only).
     pub program: Option<Vec<String>>,
     /// The bounded stdout+stderr mirror the reader tasks fill; shared with them,
     /// snapshot via [`DeployRun::output`].
     output: Arc<Mutex<VecDeque<String>>>,
     /// Byte offset already copied from the supervisor-owned durable log.
     output_offset: Mutex<u64>,
+    /// Non-registry supervisor coordination/log directory.
+    launch_dir: Option<PathBuf>,
+    discovery_error: Option<String>,
     /// Owned-mode supervisor; `None` in attached mode / before `start`.
     child: Option<tokio::process::Child>,
     /// Cached exit status once reaped (tokio's `try_wait` yields it once).
@@ -666,16 +766,17 @@ impl DeployRun {
     pub fn new(limit: impl Into<String>) -> Self {
         DeployRun {
             limit: limit.into(),
+            flake: ".".to_string(),
             dry_activate: false,
             throttle: 4,
-            ansible_dir: None,
-            playbook: None,
             events_dir: None,
             run_id: None,
             tailer: None,
             program: None,
             output: Arc::new(Mutex::new(VecDeque::new())),
             output_offset: Mutex::new(0),
+            launch_dir: None,
+            discovery_error: None,
             child: None,
             exited: None,
             attached: false,
@@ -707,48 +808,28 @@ impl DeployRun {
         Some(run)
     }
 
-    /// Resolve `ansible_dir` / `playbook` / `events_dir` defaults (the last by
-    /// allocating a registry run dir). Parity of `resolve_paths`.
-    ///
-    /// # Errors
-    /// Any filesystem error allocating the registry run dir.
-    pub fn resolve_paths(&mut self) -> std::io::Result<()> {
-        if self.ansible_dir.is_none() {
-            self.ansible_dir = Some(ansible_dir());
-        }
-        if self.playbook.is_none() {
-            let dir = self.ansible_dir.as_ref().expect("ansible_dir just set");
-            self.playbook = Some(if dir.join("playbooks/deploy.yaml").is_file() {
-                "playbooks/deploy.yaml".to_string()
-            } else {
-                "mandala.fleet.deploy".to_string()
-            });
-        }
-        if self.events_dir.is_none() {
-            let (run_id, dir) = registry::new_run_dir()?;
-            self.run_id = Some(run_id);
-            self.events_dir = Some(dir);
-        }
-        Ok(())
-    }
-
-    /// The launched argv: the `program` override, else the `ansible-playbook`
-    /// line (parity of the Python argv construction).
+    /// The launched argv: the `program` test override, else the native engine.
     fn argv(&self) -> Vec<String> {
         if let Some(p) = &self.program {
             return p.clone();
         }
+        let engine = std::env::var_os("MANDALA_DEPLOY_ENGINE_BIN")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| PathBuf::from("mandala"));
         let mut argv = vec![
-            "ansible-playbook".to_string(),
-            self.playbook.clone().unwrap_or_default(),
-            "-l".to_string(),
+            engine.to_string_lossy().into_owned(),
+            "--flake".to_string(),
+            self.flake.clone(),
+            "deploy".to_string(),
+            "run".to_string(),
+            "--limit".to_string(),
             self.limit.clone(),
-            "-e".to_string(),
-            format!("deploy_throttle={}", self.throttle),
+            "--throttle".to_string(),
+            self.throttle.to_string(),
         ];
         if self.dry_activate {
-            argv.push("-e".to_string());
-            argv.push("deploy_dry_activate=true".to_string());
+            argv.push("--dry-activate".to_string());
         }
         argv
     }
@@ -778,68 +859,31 @@ impl DeployRun {
     }
 
     async fn start_supervised(&mut self, supervisor: PathBuf) -> std::io::Result<()> {
-        self.resolve_paths()?;
-        let events_dir = self.events_dir.clone().expect("events_dir resolved");
-        self.tailer = Some(EventTailer::new(&events_dir));
+        let launch_dir = new_deploy_launch_dir()?;
+        self.launch_dir = Some(launch_dir.clone());
         let argv = self.argv();
-        let ansible_dir = self
-            .ansible_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let log_path = events_dir.join(COMMAND_LOG);
+        let cwd = std::env::current_dir()?;
+        let log_path = launch_dir.join(COMMAND_LOG);
         {
             let mut log = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&log_path)?;
-            writeln!(
-                log,
-                "$ {}  (cwd={}, events={})",
-                argv.join(" "),
-                ansible_dir.display(),
-                events_dir.display()
-            )?;
+            writeln!(log, "$ {}  (cwd={})", argv.join(" "), cwd.display())?;
             log.flush()?;
         }
-        let request = DeploySupervisorRequest {
-            argv,
-            cwd: ansible_dir,
-            events_dir: events_dir.clone(),
-        };
-        let request_tmp = events_dir.join(format!("{DEPLOY_SUPERVISOR_REQUEST}.tmp"));
+        let request = DeploySupervisorRequest { argv, cwd };
+        let request_tmp = launch_dir.join(format!("{DEPLOY_SUPERVISOR_REQUEST}.tmp"));
         std::fs::write(
             &request_tmp,
             serde_json::to_vec(&request).map_err(std::io::Error::other)?,
         )?;
-        std::fs::rename(&request_tmp, events_dir.join(DEPLOY_SUPERVISOR_REQUEST))?;
-
-        let mut meta = Meta::new();
-        meta.insert(
-            "run_id".into(),
-            Value::from(self.run_id.clone().unwrap_or_default()),
-        );
-        meta.insert("limit".into(), Value::from(self.limit.clone()));
-        meta.insert("dry_activate".into(), Value::from(self.dry_activate));
-        meta.insert("throttle".into(), Value::from(self.throttle));
-        meta.insert(
-            "playbook".into(),
-            Value::from(self.playbook.clone().unwrap_or_default()),
-        );
-        meta.insert("pid".into(), Value::Null);
-        // The launcher owns this short initialization window. Recording it as
-        // the lifecycle owner prevents another frontend from seeing the run as
-        // finished before the dedicated supervisor is spawned and takes over.
-        meta.insert(
-            "supervisor_pid".into(),
-            Value::from(i64::from(std::process::id())),
-        );
-        meta.insert("started_at".into(), Value::from(now_epoch_f64()));
-        registry::write_meta(&events_dir, &meta)?;
+        std::fs::rename(&request_tmp, launch_dir.join(DEPLOY_SUPERVISOR_REQUEST))?;
 
         let supervisor_out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
         let supervisor_err = supervisor_out.try_clone()?;
         let child = match tokio::process::Command::new(supervisor)
-            .arg(&events_dir)
+            .arg(&launch_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(supervisor_out))
             .stderr(Stdio::from(supervisor_err))
@@ -847,103 +891,52 @@ impl DeployRun {
         {
             Ok(child) => child,
             Err(error) => {
-                let _ = std::fs::remove_file(events_dir.join(DEPLOY_SUPERVISOR_REQUEST));
+                let _ = std::fs::remove_file(launch_dir.join(DEPLOY_SUPERVISOR_REQUEST));
                 if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
                     let _ = writeln!(log, "failed to launch deploy supervisor: {error}");
                 }
-                let mut terminal = Meta::new();
-                terminal.insert("rc".into(), Value::from(127));
-                terminal.insert("error".into(), Value::from(error.to_string()));
-                terminal.insert("finished_at".into(), Value::from(now_epoch_f64()));
-                registry::update_meta(&events_dir, terminal)?;
                 return Err(error);
             }
         };
-        let supervisor_pid = i64::from(child.id().expect("newly spawned supervisor has a pid"));
-        let mut running = Meta::new();
-        running.insert("supervisor_pid".into(), Value::from(supervisor_pid));
-        registry::update_meta(&events_dir, running)?;
         self.child = Some(child);
         Ok(())
     }
 
     async fn start_inline(&mut self) -> std::io::Result<()> {
-        self.resolve_paths()?;
-        let events_dir = self.events_dir.clone().expect("events_dir resolved");
-        self.tailer = Some(EventTailer::new(&events_dir));
-
+        let launch_dir = new_deploy_launch_dir()?;
+        self.launch_dir = Some(launch_dir.clone());
         let argv = self.argv();
-        let ansible_dir = self
-            .ansible_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        self.push_output(format!(
-            "$ {}  (cwd={}, events={})",
-            argv.join(" "),
-            ansible_dir.display(),
-            events_dir.display(),
-        ));
+        let cwd = std::env::current_dir()?;
+        let log_path = launch_dir.join(COMMAND_LOG);
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        writeln!(log, "$ {}  (cwd={})", argv.join(" "), cwd.display())?;
+        log.flush()?;
+        let err = log.try_clone()?;
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
-            .current_dir(&ansible_dir)
-            .env("MANDALA_FLEET_EVENTS", &events_dir)
-            // ansible block-buffers stdout when piped — without this, output
-            // arrives in late multi-KB chunks and the view looks dead.
-            .env("PYTHONUNBUFFERED", "1")
+            .current_dir(&cwd)
             // NEVER inherit stdin: an interactive prompt (ssh, vault, become)
             // would wedge the run silently.
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if std::env::var_os("ANSIBLE_FORCE_COLOR").is_none() {
-            cmd.env("ANSIBLE_FORCE_COLOR", "0"); // setdefault
-        }
-        let mut child = cmd.spawn()?;
-
-        // Register so other frontends discover + tail the same events, keyed on
-        // the live pid. A write failure must never sink the run itself.
-        let pid = child.id();
-        let mut meta = Meta::new();
-        meta.insert(
-            "run_id".into(),
-            Value::from(self.run_id.clone().unwrap_or_default()),
-        );
-        meta.insert("limit".into(), Value::from(self.limit.clone()));
-        meta.insert("dry_activate".into(), Value::from(self.dry_activate));
-        meta.insert("throttle".into(), Value::from(self.throttle));
-        meta.insert(
-            "playbook".into(),
-            Value::from(self.playbook.clone().unwrap_or_default()),
-        );
-        meta.insert(
-            "pid".into(),
-            pid.map_or(Value::Null, |p| Value::from(i64::from(p))),
-        );
-        meta.insert("started_at".into(), Value::from(now_epoch_f64()));
-        let _ = registry::write_meta(&events_dir, &meta);
-
-        // Reader tasks: drain stdout AND stderr into the shared bounded buffer.
-        // (Python merges stderr into stdout at the OS level; two tasks over one
-        // buffer is the tokio-idiomatic equivalent — every line still lands.)
-        if let Some(out) = child.stdout.take() {
-            spawn_line_drain(out, Arc::clone(&self.output));
-        }
-        if let Some(err) = child.stderr.take() {
-            spawn_line_drain(err, Arc::clone(&self.output));
-        }
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err));
+        let child = cmd.spawn()?;
         self.child = Some(child);
         Ok(())
     }
 
     fn push_output(&self, line: String) {
-        if let Ok(mut o) = self.output.lock() {
-            push_capped(&mut o, line, DEPLOY_OUTPUT_MAX);
+        if let Ok(mut output) = self.output.lock() {
+            push_capped(&mut output, line, DEPLOY_OUTPUT_MAX);
         }
     }
 
     fn sync_output_log(&self) {
-        let Some(path) = self.events_dir.as_ref().map(|dir| dir.join(COMMAND_LOG)) else {
+        let Some(path) = self.launch_dir.as_ref().map(|dir| dir.join(COMMAND_LOG)) else {
             return;
         };
         let Ok(mut file) = std::fs::File::open(path) else {
@@ -961,6 +954,12 @@ impl DeployRun {
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
+                    // A regular file can reach its current EOF in the middle
+                    // of a writer's line. Leave that suffix unconsumed so the
+                    // next tick rereads the complete publication/event line.
+                    if !line.ends_with('\n') {
+                        break;
+                    }
                     *offset += read as u64;
                     let clean = line.trim_end_matches(['\r', '\n']).to_string();
                     if let Ok(mut output) = self.output.lock() {
@@ -980,6 +979,49 @@ impl DeployRun {
             .lock()
             .map(|o| o.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Discover the native engine's published id and attach its registry
+    /// stream. Returns `Ok(true)` once attached, `Ok(false)` while the engine
+    /// is still in preflight, and an error if the supervised process exits
+    /// without publishing a discoverable engine-owned run.
+    pub fn discover_run(&mut self) -> std::io::Result<bool> {
+        if self.tailer.is_some() {
+            return Ok(true);
+        }
+        if let Some(error) = &self.discovery_error {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        self.sync_output_log();
+        let candidate = self.output.lock().ok().and_then(|output| {
+            output
+                .iter()
+                .find(|line| registry::is_valid_run_id(line.trim()))
+                .map(|line| line.trim().to_string())
+        });
+        if let Some(run_id) = candidate.as_ref()
+            && let Some(observed) = registry::open_run(run_id)
+        {
+            self.meta_pid = observed.info.meta.get("pid").and_then(Value::as_i64);
+            self.events_dir = Some(observed.info.path.clone());
+            self.run_id = Some(run_id.clone());
+            self.tailer = Some(observed.tailer);
+            return Ok(true);
+        }
+        if self.poll_exit().is_none() {
+            return Ok(false);
+        }
+        let message = candidate.map_or_else(
+            || "native deploy exited without publishing a run id".to_string(),
+            |run_id| {
+                format!(
+                    "native deploy published {run_id}, but its registry run was not discoverable"
+                )
+            },
+        );
+        self.push_output(format!("mandala: {message}"));
+        self.discovery_error = Some(message.clone());
+        Err(std::io::Error::other(message))
     }
 
     /// Consume newly appended events into the tailer; returns how many were
@@ -1286,6 +1328,84 @@ mod tests {
             .collect()
     }
 
+    fn fields(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().cloned().unwrap()
+    }
+
+    /// Native writers must preserve the retired protocol-v2 emitter's exact
+    /// compact bytes: envelope and per-event field order, escaping, and one
+    /// flushed newline per record. The supplied clock means this is a byte
+    /// golden, not a parsed-JSON comparison with timestamps stripped.
+    #[test]
+    fn native_event_writer_protocol_v2_bytes_are_golden() {
+        let dir = tmp();
+        let writer = EventWriter::new(&dir, "alpha", "alpha", "deploy").unwrap();
+        let ts = 1_234.5;
+        writer
+            .emit_at(
+                "status",
+                fields(serde_json::json!({"state":"start","cmd":["deploy","alpha"]})),
+                ts,
+            )
+            .unwrap();
+        writer
+            .emit_at(
+                "line",
+                fields(serde_json::json!({"stream":"deploy","line":"copy \"ok\""})),
+                ts,
+            )
+            .unwrap();
+        writer
+            .emit_at(
+                "progress",
+                fields(serde_json::json!({
+                    "current":"system-path","errors":0,"fetched_done":1,
+                    "fetched":2,"finished":3,"built":4
+                })),
+                ts,
+            )
+            .unwrap();
+        writer
+            .emit_at(
+                "nixlog",
+                fields(serde_json::json!({"line":"@nix {\"action\":\"stop\"}"})),
+                ts,
+            )
+            .unwrap();
+        writer
+            .emit_at(
+                "milestone",
+                fields(serde_json::json!({"milestone":"confirm"})),
+                ts,
+            )
+            .unwrap();
+        writer
+            .emit_at(
+                "status",
+                fields(serde_json::json!({"state":"done","rc":0})),
+                ts,
+            )
+            .unwrap();
+
+        let bytes = std::fs::read_to_string(dir.join("alpha.jsonl")).unwrap();
+        let expected = concat!(
+            r#"{"v":2,"ts":1234.5,"host":"alpha","plugin":"deploy","event":"status","cmd":["deploy","alpha"],"state":"start"}"#,
+            "\n",
+            r#"{"v":2,"ts":1234.5,"host":"alpha","plugin":"deploy","event":"line","line":"copy \"ok\"","stream":"deploy"}"#,
+            "\n",
+            r#"{"v":2,"ts":1234.5,"host":"alpha","plugin":"deploy","event":"progress","built":4,"finished":3,"fetched":2,"fetched_done":1,"errors":0,"current":"system-path"}"#,
+            "\n",
+            r#"{"v":2,"ts":1234.5,"host":"alpha","plugin":"deploy","event":"nixlog","line":"@nix {\"action\":\"stop\"}"}"#,
+            "\n",
+            r#"{"v":2,"ts":1234.5,"host":"alpha","plugin":"deploy","event":"milestone","milestone":"confirm"}"#,
+            "\n",
+            r#"{"v":2,"ts":1234.5,"host":"alpha","plugin":"deploy","event":"status","rc":0,"state":"done"}"#,
+            "\n",
+        );
+        assert_eq!(bytes, expected);
+        assert!(!bytes.contains(": "), "native JSONL must stay compact");
+    }
+
     /// Port of `test_multi_host_demux_with_rollback`: a fan-out where one host
     /// rolls back must flag that host (stickily, despite a later rc=1) without
     /// disturbing the others; and an incremental poll advances only the touched
@@ -1584,51 +1704,35 @@ mod write_tests {
         assert!(log.contains("failed to launch"));
     }
 
-    /// A `DeployRun` over a stub program: creates the registry run dir, writes
-    /// meta with the live pid + the deploy field set (run_id/limit/dry_activate/
-    /// throttle/playbook/pid/started_at, and NO argv), and the reader drains the
-    /// stub's stdout into the bounded mirror behind the argv header.
+    /// A native stub publishes its own registry id. The frontend attaches that
+    /// exact run and never creates a second (phantom) registry entry.
     #[tokio::test]
     async fn deploy_run_registers_meta_and_drains_output() {
         let base = tmp_base();
         let _g = registry::test_hooks::install_runs_base(base);
+        let (run_id, events_dir) = registry::new_run_dir().unwrap();
+        registry::write_meta(
+            &events_dir,
+            &Meta::from_iter([
+                ("run_id".into(), Value::from(run_id.clone())),
+                ("limit".into(), Value::from("web,cache")),
+            ]),
+        )
+        .unwrap();
         let mut run = DeployRun::new("web,cache");
         run.throttle = 7;
         run.dry_activate = true;
-        // Stub in place of ansible-playbook: emit two lines, then linger so the
-        // recorded pid is verifiably alive.
         run.program = Some(vec![
             "sh".into(),
             "-c".into(),
-            "printf 'line-one\\nline-two\\n'; sleep 1".into(),
+            format!("printf '%s\\nline-one\\nline-two\\n' '{run_id}'; sleep 1"),
         ]);
         run.start().await.unwrap();
-
-        let events_dir = run.events_dir.clone().unwrap();
-        assert!(events_dir.is_dir());
-
-        let meta = registry::read_meta(&events_dir);
-        assert_eq!(meta.get("limit").and_then(Value::as_str), Some("web,cache"));
-        assert_eq!(
-            meta.get("dry_activate").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(meta.get("throttle").and_then(Value::as_i64), Some(7));
-        assert!(meta.get("playbook").and_then(Value::as_str).is_some());
-        assert!(meta.get("run_id").and_then(Value::as_str).is_some());
-        assert!(meta.get("started_at").is_some());
-        // Deploy meta records NO argv (parity — the `program` override never
-        // leaks into meta).
-        assert!(meta.get("argv").is_none());
-
-        // The recorded pid is the live subprocess pid (still sleeping).
-        let pid = meta.get("pid").and_then(Value::as_i64);
-        assert!(matches!(pid, Some(p) if p > 0));
-        assert!(registry::pid_alive(pid), "recorded pid should be alive");
 
         // The reader drains stdout lines into the bounded mirror.
         let mut drained = false;
         for _ in 0..200 {
+            let _ = run.discover_run();
             let out = run.output();
             if out.iter().any(|l| l == "line-one") && out.iter().any(|l| l == "line-two") {
                 drained = true;
@@ -1643,6 +1747,13 @@ mod write_tests {
         );
         // The argv header leads the mirror.
         assert!(run.output().iter().any(|l| l.starts_with("$ ")));
+        assert_eq!(run.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(run.events_dir.as_deref(), Some(events_dir.as_path()));
+        assert_eq!(
+            registry::list_runs().len(),
+            1,
+            "frontend created a phantom run"
+        );
 
         run.terminate(); // reap the lingering stub
     }
@@ -1651,15 +1762,25 @@ mod write_tests {
     async fn deploy_run_zero_process_exit_with_rollback_returns_failure() {
         let base = tmp_base();
         let _g = registry::test_hooks::install_runs_base(base);
+        let (run_id, events_dir) = registry::new_run_dir().unwrap();
+        registry::write_meta(
+            &events_dir,
+            &Meta::from_iter([
+                ("run_id".into(), Value::from(run_id.clone())),
+                ("limit".into(), Value::from("web")),
+            ]),
+        )
+        .unwrap();
+        write_events(
+            &events_dir.join("web.jsonl"),
+            &milestones("web", &["rollback"]),
+        );
         let mut run = DeployRun::new("web");
-        run.program = Some(vec![
-            "sh".into(),
-            "-c".into(),
-            r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_FLEET_EVENTS/web.jsonl"; exit 0"#.into(),
-        ]);
+        run.program = Some(vec!["printf".into(), format!("{run_id}\n")]);
         run.start().await.unwrap();
 
         for _ in 0..200 {
+            let _ = run.discover_run();
             run.poll();
             if run.finished() {
                 break;
@@ -1674,32 +1795,119 @@ mod write_tests {
         );
     }
 
-    #[test]
-    fn supervisor_persists_process_and_effective_rollback_results() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn deploy_run_reports_missing_or_undiscoverable_published_id() {
         let base = tmp_base();
         let _g = registry::test_hooks::install_runs_base(base);
-        let (_run_id, run_dir) = registry::new_run_dir().unwrap();
-        std::fs::write(run_dir.join(COMMAND_LOG), "$ test deploy\n").unwrap();
+
+        let mut missing = DeployRun::new("web");
+        missing.program = Some(vec!["printf".into(), "not-a-run-id\n".into()]);
+        missing.start().await.unwrap();
+        while !missing.finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            missing
+                .discover_run()
+                .unwrap_err()
+                .to_string()
+                .contains("without publishing")
+        );
+
+        let unpublished = "20260721T120000_123456-4242";
+        let mut race = DeployRun::new("web");
+        race.program = Some(vec!["printf".into(), format!("{unpublished}\n")]);
+        race.start().await.unwrap();
+        while !race.finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            race.discover_run()
+                .unwrap_err()
+                .to_string()
+                .contains("not discoverable")
+        );
+        assert!(registry::list_runs().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deploy_run_retries_a_partial_run_id_line() {
+        let base = tmp_base();
+        let _g = registry::test_hooks::install_runs_base(base);
+        let (run_id, events_dir) = registry::new_run_dir().unwrap();
+        registry::write_meta(
+            &events_dir,
+            &Meta::from_iter([("run_id".into(), Value::from(run_id.clone()))]),
+        )
+        .unwrap();
+        let (prefix, suffix) = run_id.split_at(10);
+        let mut run = DeployRun::new("web");
+        run.program = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf '%s' '{prefix}'; sleep 0.05; printf '%s\\n' '{suffix}'"),
+        ]);
+        run.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!run.discover_run().unwrap());
+        for _ in 0..100 {
+            if run.discover_run().unwrap() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(run.run_id.as_deref(), Some(run_id.as_str()));
+    }
+
+    #[test]
+    fn deploy_run_default_argv_is_native_and_carries_policy_flags() {
+        let mut run = DeployRun::new("web,cache");
+        run.flake = "github:example/fleet".into();
+        run.throttle = 7;
+        run.dry_activate = true;
+        let argv = run.argv();
+        assert_eq!(
+            &argv[1..],
+            [
+                "--flake",
+                "github:example/fleet",
+                "deploy",
+                "run",
+                "--limit",
+                "web,cache",
+                "--throttle",
+                "7",
+                "--dry-activate",
+            ]
+        );
+    }
+
+    #[test]
+    fn supervisor_runs_native_child_without_touching_registry() {
+        let base = tmp_base();
+        let _g = registry::test_hooks::install_runs_base(base);
+        let launch_dir = new_deploy_launch_dir().unwrap();
+        std::fs::write(launch_dir.join(COMMAND_LOG), "$ test deploy\n").unwrap();
         let request = DeploySupervisorRequest {
             argv: vec![
                 "sh".into(),
                 "-c".into(),
-                r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_FLEET_EVENTS/web.jsonl"; exit 0"#.into(),
+                r#"test -z "$MANDALA_FLEET_EVENTS"; printf 'native-output\n'; exit 0"#.into(),
             ],
-            cwd: run_dir.clone(),
-            events_dir: run_dir.clone(),
+            cwd: launch_dir.clone(),
         };
         std::fs::write(
-            run_dir.join(DEPLOY_SUPERVISOR_REQUEST),
+            launch_dir.join(DEPLOY_SUPERVISOR_REQUEST),
             serde_json::to_vec(&request).unwrap(),
         )
         .unwrap();
-        registry::write_meta(&run_dir, &Meta::new()).unwrap();
-
-        assert_eq!(run_deploy_supervisor(&run_dir).unwrap(), 1);
-        let meta = registry::read_meta(&run_dir);
-        assert_eq!(meta.get("process_rc").and_then(Value::as_i64), Some(0));
-        assert_eq!(meta.get("rc").and_then(Value::as_i64), Some(1));
+        assert_eq!(run_deploy_supervisor(&launch_dir).unwrap(), 0);
+        assert!(registry::list_runs().is_empty());
+        assert!(
+            std::fs::read_to_string(launch_dir.join(COMMAND_LOG))
+                .unwrap()
+                .contains("native-output")
+        );
     }
 
     /// `DeployRun::attach` owns no subprocess: `finished`/`returncode` derive

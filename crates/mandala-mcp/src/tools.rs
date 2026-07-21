@@ -214,13 +214,13 @@ pub struct BuildTool {
 #[mcp_tool(
     name = "deploy",
     description = concat!(
-        "Deploy the resolved members through the deploy playbook — the\n",
-        "engine: `--limit`, throttle, and deploy-rs magic rollback are never\n",
+        "Deploy the resolved members through the native deploy engine; its\n",
+        "`--limit`, throttle, and deploy-rs magic rollback are never\n",
         "bypassed. Defaults to dry-activate (build + copy, no switch). A REAL\n",
         "activation (`dry_activate=false`) requires `confirm` to equal the\n",
         "resolved `--limit` target — take it from `resolve`'s `limit` field, a\n",
         "prior run's `limit`, or this tool's refusal (`required_confirm`) —\n",
-        "else it refuses WITHOUT launching. Returns the run id; follow with\n",
+        "else it refuses WITHOUT launching. Returns the engine-owned run id; follow with\n",
         "`deploy_status` (its `wait_seconds` blocks until the run settles)."
     )
 )]
@@ -361,5 +361,17 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn deploy_schema_documents_native_default_and_confirmation() {
+        let tool = DeployTool::tool();
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(description.contains("native deploy engine"));
+        assert!(!description.contains("deploy playbook"));
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        assert_eq!(schema["properties"]["dry_activate"]["default"], true);
+        assert!(schema["properties"].get("confirm").is_some());
+        assert_eq!(schema["required"], serde_json::json!(["selector"]));
     }
 }

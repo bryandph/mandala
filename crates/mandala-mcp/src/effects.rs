@@ -108,8 +108,14 @@ pub trait Effects: Send + Sync {
     /// stdout + stderr separately.
     async fn run_adhoc(&self, argv: Vec<String>) -> Result<AdhocOutput, AdhocError>;
 
-    /// Launch a deploy run (the fan-out playbook) into the shared registry.
-    async fn launch_deploy(&self, limit: &str, dry_activate: bool) -> io::Result<DeployLaunch>;
+    /// Launch the native deploy engine and attach its engine-owned registry run.
+    async fn launch_deploy(
+        &self,
+        flake: &str,
+        limit: &str,
+        dry_activate: bool,
+        throttle: i64,
+    ) -> io::Result<DeployLaunch>;
 
     /// Launch a registered background command run (build / reboot) into the
     /// shared registry, output teed to its `output.log`.
@@ -273,14 +279,34 @@ impl Effects for RealEffects {
         }
     }
 
-    async fn launch_deploy(&self, limit: &str, dry_activate: bool) -> io::Result<DeployLaunch> {
+    async fn launch_deploy(
+        &self,
+        flake: &str,
+        limit: &str,
+        dry_activate: bool,
+        throttle: i64,
+    ) -> io::Result<DeployLaunch> {
         let mut run = DeployRun::new(limit);
+        run.flake = flake.to_string();
         run.dry_activate = dry_activate;
+        run.throttle = throttle;
         run.start().await?;
-        Ok(DeployLaunch {
-            run_id: run.run_id.clone().unwrap_or_default(),
-            events_dir: run.events_dir.clone().unwrap_or_default(),
-        })
+        loop {
+            match run.discover_run() {
+                Ok(true) => break,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Err(error) => return Err(error),
+            }
+        }
+        let run_id = run
+            .run_id
+            .clone()
+            .ok_or_else(|| io::Error::other("native deploy attached without a run id"))?;
+        let events_dir = run
+            .events_dir
+            .clone()
+            .ok_or_else(|| io::Error::other("native deploy attached without a registry path"))?;
+        Ok(DeployLaunch { run_id, events_dir })
     }
 
     async fn launch_command(

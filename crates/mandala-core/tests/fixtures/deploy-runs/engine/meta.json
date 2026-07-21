@@ -1,0 +1,22 @@
+{
+ "build_rc": 0,
+ "dry_activate": false,
+ "finished_at": 21.0,
+ "kind": "deploy",
+ "limit": "alpha,beta",
+ "pid": null,
+ "process_rc": 0,
+ "profiles": {
+  "alpha": "/nix/store/00000000000000000000000000000000-alpha-profile",
+  "beta": "/nix/store/11111111111111111111111111111111-beta-profile"
+ },
+ "rc": 1,
+ "run_id": "engine-recording",
+ "started_at": 20.0,
+ "summary": {
+  "confirmed": 1,
+  "failed": 0,
+  "rolled_back": 1,
+  "total": 2
+ }
+}

@@ -1,0 +1,7 @@
+{"v":2,"ts":10.6,"host":"beta","plugin":"deploy","event":"status","cmd":["deploy","-s",".#beta"],"state":"start"}
+{"v":2,"ts":10.7,"host":"beta","plugin":"deploy","event":"milestone","milestone":"copy"}
+{"v":2,"ts":10.8,"host":"beta","plugin":"deploy","event":"milestone","milestone":"activate"}
+{"v":2,"ts":10.9,"host":"beta","plugin":"deploy","event":"milestone","milestone":"wait"}
+{"v":2,"ts":11.0,"host":"beta","plugin":"deploy","event":"line","line":"confirmation failed; rolled back","stream":"deploy"}
+{"v":2,"ts":11.1,"host":"beta","plugin":"deploy","event":"milestone","milestone":"rollback"}
+{"v":2,"ts":11.2,"host":"beta","plugin":"deploy","event":"status","rc":1,"state":"done"}

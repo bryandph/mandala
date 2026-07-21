@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 //
 // Vendored from serokell/deploy-rs@6d3087eedff75a715b40c0e124ba15d2dd7bec28.
-// Spike patch: accept a prebuilt profile and emit through DeployData::sink.
+// Mandala patch: accept a prebuilt profile, use caller-selected process
+// programs for effect-isolated tests, and emit through DeployData::sink.
 
+use std::path::Path;
 use std::process::Stdio;
 
 use thiserror::Error;
@@ -46,7 +48,13 @@ pub async fn push_profile(
         .hostname
         .as_ref()
         .unwrap_or(&deploy_data.node.node_settings.hostname);
-    let mut command = Command::new("nix");
+    let mut command = Command::new(
+        deploy_data
+            .cmd_overrides
+            .nix_program
+            .as_deref()
+            .unwrap_or_else(|| Path::new("nix")),
+    );
     command.arg("copy");
     if deploy_data.merged_settings.fast_connection != Some(true) {
         command.arg("--substitute-on-destination");

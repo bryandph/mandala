@@ -491,7 +491,13 @@ impl Effects for StubEffects {
     async fn run_adhoc(&self, _argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {
         panic!("unexpected run_adhoc call")
     }
-    async fn launch_deploy(&self, _limit: &str, _dry_activate: bool) -> io::Result<DeployLaunch> {
+    async fn launch_deploy(
+        &self,
+        _flake: &str,
+        _limit: &str,
+        _dry_activate: bool,
+        _throttle: i64,
+    ) -> io::Result<DeployLaunch> {
         panic!("unexpected launch_deploy call")
     }
     async fn launch_command(

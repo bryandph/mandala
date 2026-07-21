@@ -216,6 +216,14 @@ fn stdio_handshake_lists_and_calls_resolve() {
     let body = &refusal["result"]["structuredContent"];
     assert_eq!(body["refused"], true, "deploy refusal: {refusal}");
     assert_eq!(body["required_confirm"], "cache,web");
+    assert!(
+        !state.join("runs").is_dir()
+            || std::fs::read_dir(state.join("runs"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "a refused call must create no registry run"
+    );
 
     // 6. clean exit: closing stdin (EOF) must let the server shut down 0 —
     // and, as the context leader, release its discovery claim on the way out
@@ -320,32 +328,100 @@ fn second_instance_proxies_and_promotes_when_the_leader_exits() {
     );
 }
 
-/// A real process-boundary failover: MCP launches a deploy, its leader is
-/// SIGKILLed, the independent supervisor keeps the playbook/log/event stream
-/// alive and settles meta, then a new leader attaches to the same run.
+/// D9.4 local-process drill: a follower forwards one mutation to the context
+/// leader, the real native engine runs over shell-only Nix/SSH effects, and the
+/// follower promotes + attaches the exact live run after the leader is killed.
 #[test]
-fn deploy_supervisor_survives_launcher_process_death() {
+fn native_deploy_survives_leader_death_and_attaches_after_promotion() {
     use std::os::unix::fs::PermissionsExt;
 
     let (flake, state, aggregate) = scratch_tree("deploy-orphan");
+    let setting = serde_json::json!({
+        "activation": "switch",
+        "hostname": "stub.invalid",
+        "sshUser": "deployer",
+        "sshOpts": [],
+        "autoRollback": true,
+        "fastConnection": false,
+        "magicRollback": true,
+        "confirmTimeout": 30,
+        "activationTimeout": 60,
+        "tempPath": "/tmp/mandala-drill",
+        "sudo": null,
+        "user": "root",
+    });
+    std::fs::write(
+        &aggregate,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "members": {
+                "cache": {
+                    "name": "cache",
+                    "deployment": {"deployRs": {"enable": true}},
+                },
+                "web": {
+                    "name": "web",
+                    "deployment": {"deployRs": {"enable": true}},
+                },
+            },
+            "groups": {"k3s": ["cache", "web"]},
+            "projections": {
+                "deploy": {
+                    "nodes": ["cache", "web"],
+                    "settings": {"cache": setting, "web": setting},
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+
     let fake_bin = state.join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
-    let playbook = fake_bin.join("ansible-playbook");
+    let effects = state.join("effects.log");
+    let nix = fake_bin.join("nix");
     std::fs::write(
-        &playbook,
+        &nix,
         r#"#!/bin/sh
 set -eu
-printf 'deploy-started\n'
-printf '{"v":2,"ts":1,"host":"web","plugin":"deploy","event":"milestone","milestone":"eval"}\n' >> "$MANDALA_FLEET_EVENTS/web.jsonl"
-sleep 2
-printf 'deploy-finished\n'
-printf '{"v":2,"ts":2,"host":"web","plugin":"deploy","event":"milestone","milestone":"confirm"}\n' >> "$MANDALA_FLEET_EVENTS/web.jsonl"
+case "$1" in
+  build)
+    printf 'build %s\n' "$*" >> "$MANDALA_FLEET_STATE/effects.log"
+    out_link=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--out-link" ]; then out_link=$2; shift 2; else shift; fi
+    done
+    ln -s /nix/store/00000000000000000000000000000000-cache-profile "$out_link"
+    ln -s /nix/store/11111111111111111111111111111111-web-profile "$out_link-1"
+    printf '%s\n' '@nix {"action":"start","id":1,"type":105,"fields":["/nix/store/drill.drv"]}' >&2
+    sleep 4
+    printf '%s\n' '@nix {"action":"stop","id":1}' >&2
+    ;;
+  copy)
+    printf 'copy %s\n' "$*" >> "$MANDALA_FLEET_STATE/effects.log"
+    printf 'copied %s\n' "$*"
+    sleep 1
+    ;;
+  *) exit 90 ;;
+esac
 "#,
     )
     .unwrap();
-    let mut permissions = std::fs::metadata(&playbook).unwrap().permissions();
+    let ssh = fake_bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        r#"#!/bin/sh
+set -eu
+printf 'ssh %s\n' "$*" >> "$MANDALA_FLEET_STATE/effects.log"
+printf 'activated %s\n' "$*"
+sleep 1
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&nix).unwrap().permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&playbook, permissions).unwrap();
+    std::fs::set_permissions(&nix, permissions.clone()).unwrap();
+    std::fs::set_permissions(&ssh, permissions).unwrap();
     let path = std::env::join_paths(
         std::iter::once(fake_bin.clone())
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -353,99 +429,237 @@ printf '{"v":2,"ts":2,"host":"web","plugin":"deploy","event":"milestone","milest
     .unwrap();
 
     let spawn = || {
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.join("context.stderr"))
+            .unwrap();
         Command::new(env!("CARGO_BIN_EXE_mandala"))
+            .arg("--flake")
+            .arg(&flake)
             .arg("mcp")
             .current_dir(&flake)
             .env("PATH", &path)
             .env("MANDALA_AGGREGATE_FILE", &aggregate)
             .env("MANDALA_FLEET_STATE", &state)
+            .env_remove("MANDALA_DEPLOY_ENGINE_BIN")
             .env(
                 "MANDALA_DEPLOY_SUPERVISOR_BIN",
                 env!("CARGO_BIN_EXE_mandala-run-supervisor"),
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn mandala mcp")
     };
 
-    let mut launcher = spawn();
-    let mut launcher_in = launcher.stdin.take().unwrap();
-    let mut launcher_out = BufReader::new(launcher.stdout.take().unwrap());
-    handshake(&mut launcher_in, &mut launcher_out);
+    let mut leader = spawn();
+    let mut leader_in = leader.stdin.take().unwrap();
+    let mut leader_out = BufReader::new(leader.stdout.take().unwrap());
+    handshake(&mut leader_in, &mut leader_out);
+    let elected = read_discovery(&state).expect("leader published discovery");
+    assert_eq!(elected["pid"].as_u64(), Some(u64::from(leader.id())));
+
+    let mut follower = spawn();
+    let mut follower_in = follower.stdin.take().unwrap();
+    let mut follower_out = BufReader::new(follower.stdout.take().unwrap());
+    handshake(&mut follower_in, &mut follower_out);
+    let still_elected = read_discovery(&state).expect("leader discovery remains published");
+    assert_eq!(
+        still_elected["pid"].as_u64(),
+        Some(u64::from(leader.id())),
+        "the second MCP process must enter as a follower: {still_elected}"
+    );
+
+    // The mutation enters through the follower and executes once at the leader.
     send(
-        &mut launcher_in,
+        &mut follower_in,
         &serde_json::json!({
             "jsonrpc": "2.0",
             "id": 10,
             "method": "tools/call",
             "params": {
                 "name": "deploy",
-                "arguments": {"selector": "web", "dry_activate": true}
+                "arguments": {"selector": "@k3s"}
             }
         }),
     );
-    let launch = read_response(&mut launcher_out, 10);
+    let launch = read_response(&mut follower_out, 10);
     let launched = &launch["result"]["structuredContent"];
     assert_eq!(launched["ok"], true, "deploy launch: {launch}");
     let run_id = launched["run_id"].as_str().expect("run id").to_string();
     let run_dir =
         std::path::PathBuf::from(launched["events_dir"].as_str().expect("events directory"));
-
-    launcher.kill().expect("SIGKILL launcher");
-    launcher.wait().expect("reap killed launcher");
-    drop(launcher_in);
-    drop(launcher_out);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let terminal_meta = loop {
-        let meta = mandala_core::registry::read_meta(&run_dir);
-        if meta.get("rc").is_some() {
-            break meta;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "supervisor did not settle meta: {meta:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert_eq!(terminal_meta["rc"], 0);
-    assert!(terminal_meta["finished_at"].is_number());
-    let child_pid = terminal_meta["pid"].as_i64();
-    assert!(
-        !mandala_core::registry::pid_alive(child_pid),
-        "deploy child was not reaped"
+    assert_eq!(
+        run_dir.file_name().and_then(|name| name.to_str()),
+        Some(run_id.as_str()),
+        "MCP must return the engine-published run identity"
     );
-    let log = std::fs::read_to_string(run_dir.join("output.log")).unwrap();
-    assert!(
-        log.contains("deploy-started") && log.contains("deploy-finished"),
-        "{log}"
+    assert_eq!(
+        std::fs::read_dir(state.join("runs")).unwrap().count(),
+        1,
+        "one forwarded mutation must create exactly one engine-owned run"
     );
-    let events = std::fs::read_to_string(run_dir.join("web.jsonl")).unwrap();
-    assert!(events.contains("\"milestone\":\"confirm\""), "{events}");
+    let published_meta = mandala_core::registry::read_meta(&run_dir);
+    assert_eq!(published_meta["run_id"], run_id);
+    assert_eq!(published_meta["limit"], "cache,web");
+    assert_eq!(published_meta["dry_activate"], true);
+    assert_eq!(published_meta["throttle"], 4);
+    assert!(published_meta.get("rc").is_none(), "work must be in flight");
 
-    let mut promoted = spawn();
-    let mut promoted_in = promoted.stdin.take().unwrap();
-    let mut promoted_out = BufReader::new(promoted.stdout.take().unwrap());
-    handshake(&mut promoted_in, &mut promoted_out);
+    // Publication precedes build. Wait until the real engine has entered the
+    // shell-stub Nix effect before killing only the context leader.
+    let in_flight_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&effects)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("build "))
+    {
+        assert!(std::time::Instant::now() < in_flight_deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(mandala_core::registry::pid_alive(
+        published_meta
+            .get("pid")
+            .and_then(serde_json::Value::as_i64)
+    ));
+
+    leader.kill().expect("SIGKILL context leader");
+    leader.wait().expect("reap killed leader");
+    drop(leader_in);
+    drop(leader_out);
+
+    // This idempotent read crosses the dead connection, promotes the existing
+    // follower, retries once there, and attaches the exact live engine run.
     send(
-        &mut promoted_in,
+        &mut follower_in,
         &serde_json::json!({
             "jsonrpc": "2.0",
             "id": 11,
             "method": "tools/call",
-            "params": {"name": "deploy_status", "arguments": {"run_id": run_id}}
+            "params": {
+                "name": "deploy_status",
+                "arguments": {"run_id": run_id, "wait_seconds": 0}
+            }
         }),
     );
-    let status = read_response(&mut promoted_out, 11);
+    let live = read_response(&mut follower_out, 11);
+    let live = &live["result"]["structuredContent"];
+    assert_eq!(live["run_id"], run_id);
     assert_eq!(
-        status["result"]["structuredContent"]["liveness"], "finished",
-        "{status}"
+        live["liveness"], "running",
+        "attached after promotion: {live}"
     );
-    drop(promoted_in);
-    let exit = wait_with_timeout(&mut promoted, Duration::from_secs(10));
-    assert!(exit.success(), "promoted leader exit: {exit:?}");
+    let promotion_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let promoted = loop {
+        if let Some(record) = read_discovery(&state) {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < promotion_deadline,
+            "promoted follower did not publish discovery"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        promoted["pid"].as_u64(),
+        Some(u64::from(follower.id())),
+        "the attached read must be served by the promoted follower: {promoted}"
+    );
+
+    send(
+        &mut follower_in,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "deploy_status",
+                "arguments": {"run_id": run_id, "wait_seconds": 10}
+            }
+        }),
+    );
+    let settled = read_response(&mut follower_out, 12);
+    let settled = &settled["result"]["structuredContent"];
+    assert_eq!(settled["run_id"], run_id);
+    assert_eq!(settled["liveness"], "finished", "settled run: {settled}");
+    assert_eq!(settled["meta"]["rc"], 0);
+    assert_eq!(settled["meta"]["process_rc"], 0);
+    assert_eq!(
+        settled["meta"]["summary"],
+        serde_json::json!({"total": 2, "confirmed": 2, "failed": 0, "rolled_back": 0})
+    );
+    assert_eq!(settled["hosts"]["cache"]["state"], "confirmed");
+    assert_eq!(settled["hosts"]["web"]["state"], "confirmed");
+    assert_eq!(
+        std::fs::read_dir(state.join("runs")).unwrap().count(),
+        1,
+        "failover must neither replay the mutation nor allocate a frontend run"
+    );
+
+    let terminal_meta = mandala_core::registry::read_meta(&run_dir);
+    assert!(!mandala_core::registry::pid_alive(
+        terminal_meta.get("pid").and_then(serde_json::Value::as_i64)
+    ));
+    let launch_root = state.join("deploy-launches");
+    let launch = std::fs::read_dir(&launch_root)
+        .unwrap()
+        .next()
+        .expect("one deploy coordination directory")
+        .unwrap()
+        .path();
+    let log = std::fs::read_to_string(launch.join("output.log")).unwrap();
+    assert!(log.contains("deploy summary: total=2 confirmed=2"), "{log}");
+    let build = std::fs::read_to_string(run_dir.join("build.jsonl")).unwrap();
+    assert!(build.contains("\"event\":\"nixlog\""), "{build}");
+    for host in ["cache", "web"] {
+        let stream = std::fs::read_to_string(run_dir.join(format!("{host}.jsonl"))).unwrap();
+        assert!(stream.contains("\"milestone\":\"copy\""), "{stream}");
+        assert!(stream.contains("\"milestone\":\"confirm\""), "{stream}");
+    }
+
+    let effects = std::fs::read_to_string(&effects).unwrap();
+    assert_eq!(
+        effects
+            .lines()
+            .filter(|line| line.starts_with("build "))
+            .count(),
+        1,
+        "mutation must not retry its native build: {effects}"
+    );
+    assert_eq!(
+        effects
+            .lines()
+            .filter(|line| line.starts_with("copy "))
+            .count(),
+        2
+    );
+    assert_eq!(
+        effects
+            .lines()
+            .filter(|line| line.starts_with("ssh "))
+            .count(),
+        2
+    );
+    let audit = std::fs::read_to_string(state.join("mcp/audit.jsonl")).unwrap();
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|line| line.contains("\"tool\":\"deploy\""))
+            .count(),
+        1,
+        "forwarded mutation must settle exactly once: {audit}"
+    );
+    let context_stderr = std::fs::read_to_string(state.join("context.stderr")).unwrap();
+    assert!(
+        !context_stderr.contains("serving standalone"),
+        "the drill must use the production fleet context, not its fallback: {context_stderr}"
+    );
+
+    drop(follower_in);
+    let exit = wait_with_timeout(&mut follower, Duration::from_secs(10));
+    assert!(exit.success(), "promoted follower exit: {exit:?}");
 }
 
 /// Drive initialize + the initialized notification.

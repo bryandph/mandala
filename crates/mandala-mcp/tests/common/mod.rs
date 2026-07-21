@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use mandala_core::inventory::{Inventory, InventoryError};
 use mandala_core::registry::{self, Meta};
-use mandala_core::runner::{COMMAND_LOG, DeployRun};
+use mandala_core::runner::COMMAND_LOG;
 use mandala_mcp::MandalaHandler;
 use mandala_mcp::effects::{
     AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure, SurveyOutput,
@@ -74,7 +74,7 @@ pub struct FakeEffects {
     pub refresh: Option<SurveyOutput>,
     /// The fresh aggregate `reload` evaluates.
     pub fresh: Option<Value>,
-    /// `DeployRun.start` stubbed to `resolve_paths()` (no subprocess).
+    /// Native engine launch stand-in (engine-owned registry run, no process).
     pub fake_deploy: bool,
     /// `CommandRun` stand-in.
     pub fake_command: Option<CommandFake>,
@@ -126,21 +126,31 @@ impl Effects for FakeEffects {
             .expect("unexpected run_adhoc call (no fake configured)")
     }
 
-    async fn launch_deploy(&self, limit: &str, dry_activate: bool) -> io::Result<DeployLaunch> {
+    async fn launch_deploy(
+        &self,
+        flake: &str,
+        limit: &str,
+        dry_activate: bool,
+        throttle: i64,
+    ) -> io::Result<DeployLaunch> {
         assert!(self.fake_deploy, "unexpected launch_deploy call");
-        // The capture stubbed `DeployRun.start` to `resolve_paths()`: a
-        // registry run dir is allocated (meta stays `{}` — the `unknown` run
-        // in the `deploy_status.list` fixture) but nothing spawns.
-        let mut run = DeployRun::new(limit);
-        run.dry_activate = dry_activate;
-        run.resolve_paths()?;
-        Ok(DeployLaunch {
-            run_id: run.run_id.clone().expect("resolve_paths sets run_id"),
-            events_dir: run
-                .events_dir
-                .clone()
-                .expect("resolve_paths sets events_dir"),
-        })
+        assert_eq!(flake, ".");
+        assert_eq!(throttle, 4);
+        // This boundary stands in for the native ENGINE after preflight: it,
+        // not the frontend, owns the one registry allocation and metadata.
+        let (run_id, events_dir) = registry::new_run_dir()?;
+        registry::write_meta(
+            &events_dir,
+            &Meta::from_iter([
+                ("run_id".into(), Value::from(run_id.clone())),
+                ("limit".into(), Value::from(limit)),
+                ("dry_activate".into(), Value::from(dry_activate)),
+                ("throttle".into(), Value::from(throttle)),
+                ("pid".into(), Value::Null),
+                ("rc".into(), Value::from(0)),
+            ]),
+        )?;
+        Ok(DeployLaunch { run_id, events_dir })
     }
 
     async fn launch_command(

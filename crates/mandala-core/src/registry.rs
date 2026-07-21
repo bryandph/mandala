@@ -525,6 +525,41 @@ mod tests {
             .collect()
     }
 
+    fn copy_recorded_run(emitter: &str, destination: &Path) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/deploy-runs")
+            .join(emitter);
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
+
+    fn observed_state(obs: &mut ObservedRun) -> Value {
+        obs.poll();
+        let liveness = obs.liveness().as_str();
+        serde_json::json!({
+            "liveness": liveness,
+            "build": {
+                "built": obs.tailer.build.built,
+                "finished": obs.tailer.build.finished,
+                "fetched": obs.tailer.build.fetched,
+                "fetched_done": obs.tailer.build.fetched_done,
+                "errors": obs.tailer.build.errors,
+                "current": obs.tailer.build.current,
+                "lines": obs.tailer.build.lines,
+                "done": obs.tailer.build.done,
+                "rc": obs.tailer.build.rc,
+            },
+            "hosts": obs.tailer.hosts.iter().map(|(name, host)| (name.clone(), serde_json::json!({
+                "state": host.state.as_str(),
+                "lines": host.lines,
+                "milestones": host.milestones,
+                "rc": host.rc,
+            }))).collect::<serde_json::Map<String, Value>>(),
+        })
+    }
+
     // ---- meta round-trip + list ordering ------------------------------------
 
     /// Parallel same-process allocations must never share a run dir: the
@@ -877,5 +912,63 @@ mod tests {
         assert_eq!(obs.tailer.hosts["alpha"].state, HostState::Confirmed);
         let _g = test_hooks::install(|_| false);
         assert_eq!(obs.liveness(), RunLiveness::Finished);
+    }
+
+    /// Recorded Ansible- and native-engine runs differ in emitter placement
+    /// (`alpha.jsonl` versus `build.jsonl`) and metadata, but the real registry
+    /// reader must derive exactly the same durable state. The native-only meta
+    /// is asserted separately instead of erased by broad snapshot filtering.
+    #[test]
+    fn recorded_ansible_and_engine_runs_have_identical_registry_state() {
+        let base = tmp().join("runs");
+        let (ansible_id, ansible_path) = new_run_dir_in(&base).unwrap();
+        let (engine_id, engine_path) = new_run_dir_in(&base).unwrap();
+        copy_recorded_run("ansible", &ansible_path);
+        copy_recorded_run("engine", &engine_path);
+
+        let names = |path: &Path| {
+            let mut names = std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&ansible_path),
+            ["alpha.jsonl", "beta.jsonl", "meta.json"]
+        );
+        assert_eq!(
+            names(&engine_path),
+            ["alpha.jsonl", "beta.jsonl", "build.jsonl", "meta.json"]
+        );
+
+        let engine_meta = read_meta(&engine_path);
+        assert_eq!(engine_meta["build_rc"], 0);
+        assert_eq!(engine_meta["process_rc"], 0);
+        assert_eq!(
+            engine_meta["profiles"],
+            serde_json::json!({
+                "alpha": "/nix/store/00000000000000000000000000000000-alpha-profile",
+                "beta": "/nix/store/11111111111111111111111111111111-beta-profile",
+            })
+        );
+        assert_eq!(
+            engine_meta["summary"],
+            serde_json::json!({
+                "confirmed": 1, "failed": 0, "rolled_back": 1, "total": 2
+            })
+        );
+
+        let _guard = test_hooks::install(|_| false);
+        let mut ansible = open_run_in(&base, &ansible_id).unwrap();
+        let mut engine = open_run_in(&base, &engine_id).unwrap();
+        let ansible_state = observed_state(&mut ansible);
+        let engine_state = observed_state(&mut engine);
+        assert_eq!(engine_state, ansible_state);
+        assert_eq!(engine_state["liveness"], "rolled-back");
+        assert_eq!(engine_state["hosts"]["alpha"]["state"], "confirmed");
+        assert_eq!(engine_state["hosts"]["beta"]["state"], "rolled-back");
+        assert_eq!(engine_state["hosts"]["beta"]["rc"], 1);
     }
 }
