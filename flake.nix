@@ -153,6 +153,88 @@
           deployment.deployRs.enable = true;
         });
         factsOnly = self.lib.evalMember {name = "facts-only";};
+        fullDeploySettingsMember = self.lib.evalMember {
+          name = "full-deploy-settings";
+          deployment.deployRs = {
+            autoRollback = false;
+            fastConnection = false;
+            magicRollback = false;
+            confirmTimeout = 0;
+            activationTimeout = 65535;
+            tempPath = "/var/tmp/mandala";
+            sudo = "doas -u";
+            user = "deployer";
+            sshOpts = ["-o" "ControlMaster=auto"];
+          };
+        };
+        taxonomyMember = self.lib.evalMember {
+          name = "taxonomy-member";
+          tags = ["edge-compute"];
+          deployment = {
+            ssh.port = 2222;
+            deployRs = {
+              enable = true;
+              sshOpts = ["-o" "Member=yes"];
+            };
+          };
+        };
+        evalFleetModule = {
+          deployment ? {},
+          members ? {taxonomy-member = taxonomyMember;},
+        }:
+          lib.evalModules {
+            specialArgs.inputs.self.nixosConfigurations = {};
+            modules = [
+              ./flake-modules/fleet.nix
+              {
+                options.flake.mandala = lib.mkOption {
+                  type = lib.types.raw;
+                };
+                config.mandala = {
+                  extraMembers = members;
+                  inherit deployment;
+                };
+              }
+            ];
+          };
+        fleetModuleEval = evalFleetModule {
+          deployment = {
+            settings = {
+              autoRollback = false;
+              activationTimeout = 600;
+              sshOpts = ["-o" "Fleet=yes"];
+            };
+            groupSettings.edge_compute = {
+              confirmTimeout = 45;
+              fastConnection = false;
+              magicRollback = false;
+              sshOpts = ["-o" "Group=yes"];
+            };
+          };
+        };
+        fleetDeployment = fleetModuleEval.config.mandala.deployment;
+        fleetDeploySettings =
+          fleetModuleEval.config.flake.mandala.projections.deploy.settings."taxonomy-member";
+        fleetDeploySettingsExpected = {
+          activation = "switch";
+          activationTimeout = 600;
+          autoRollback = false;
+          confirmTimeout = 45;
+          fastConnection = false;
+          hostname = "taxonomy-member";
+          magicRollback = false;
+          sshOpts = [
+            "-p"
+            "2222"
+            "-o"
+            "Member=yes"
+            "-o"
+            "Group=yes"
+            "-o"
+            "Fleet=yes"
+          ];
+          sshUser = "root";
+        };
 
         # NixOS member on a cloud venue: platform names the VENUE, the
         # consumer-built closure (build != null) marks it NixOS.
@@ -294,7 +376,9 @@
         };
         deploySettingsExpected = {
           activationTimeout = 600;
+          autoRollback = true;
           confirmTimeout = 90;
+          fastConnection = true;
           magicRollback = true;
           sshOpts = [
             "-o"
@@ -314,6 +398,25 @@
             zeta.confirmTimeout = 50;
           };
           memberGroups = ["zeta" "alpha"];
+        };
+        deploySettingsAbsentValues = self.lib.mergeDeploySettings {
+          knownGroups = ["alpha"];
+          fleet = {
+            confirmTimeout = 30;
+            magicRollback = null;
+            sshOpts = [];
+          };
+          groupSettings.alpha = {
+            activationTimeout = 600;
+            confirmTimeout = null;
+            sshOpts = [];
+          };
+          memberGroups = ["alpha"];
+          member = {
+            confirmTimeout = null;
+            tempPath = null;
+            sshOpts = [];
+          };
         };
         deploySettingsCompat = {
           autoRollback = true;
@@ -444,6 +547,56 @@
         assert member.deployment.ssh.host == "example-node.example.test";
         assert !member.deployment.deployRs.enable; # facts-only by default
         
+        # Deploy-rs settings remain absent-equivalent until authored; the
+        # flattening merge restores legacy effective defaults where required.
+        assert member.deployment.deployRs.autoRollback == null;
+        assert member.deployment.deployRs.fastConnection == null;
+        assert member.deployment.deployRs.magicRollback == null;
+        assert member.deployment.deployRs.confirmTimeout == null;
+        assert member.deployment.deployRs.activationTimeout == null;
+        assert member.deployment.deployRs.tempPath == null;
+        assert member.deployment.deployRs.sudo == null;
+        assert member.deployment.deployRs.user == null;
+        assert member.deployment.deployRs.sshOpts == [];
+        assert fullDeploySettingsMember.deployment.deployRs.autoRollback == false;
+        assert fullDeploySettingsMember.deployment.deployRs.fastConnection == false;
+        assert fullDeploySettingsMember.deployment.deployRs.magicRollback == false;
+        assert fullDeploySettingsMember.deployment.deployRs.confirmTimeout == 0;
+        assert fullDeploySettingsMember.deployment.deployRs.activationTimeout == 65535;
+        assert fullDeploySettingsMember.deployment.deployRs.tempPath == "/var/tmp/mandala";
+        assert fullDeploySettingsMember.deployment.deployRs.sudo == "doas -u";
+        assert fullDeploySettingsMember.deployment.deployRs.user == "deployer";
+        assert fullDeploySettingsMember.deployment.deployRs.sshOpts == ["-o" "ControlMaster=auto"];
+        assert failsDeep (self.lib.evalMember {
+          name = "negative-deploy-timeout";
+          deployment.deployRs.confirmTimeout = -1;
+        });
+        assert failsDeep (self.lib.evalMember {
+          name = "remote-build-is-not-supported";
+          deployment.deployRs.remoteBuild = true;
+        });
+        # Fleet/group settings use the same optional deploy-rs vocabulary.
+        assert fleetDeployment.settings.autoRollback == false;
+        assert fleetDeployment.settings.activationTimeout == 600;
+        assert fleetDeployment.settings.magicRollback == null;
+        assert fleetDeployment.settings.sshOpts == ["-o" "Fleet=yes"];
+        assert fleetDeployment.groupSettings.edge_compute.confirmTimeout == 45;
+        assert fleetDeployment.groupSettings.edge_compute.fastConnection == false;
+        assert fleetDeployment.groupSettings.edge_compute.magicRollback == false;
+        assert fleetDeployment.groupSettings.edge_compute.sshOpts == ["-o" "Group=yes"];
+        assert fleetDeploySettings == fleetDeploySettingsExpected;
+        assert builtins.attrNames fleetModuleEval.config.flake.mandala.projections.deploy.settings
+        == ["taxonomy-member"];
+        assert failsDeep ((evalFleetModule {
+          deployment.groupSettings.ghost.confirmTimeout = 30;
+        }).config.mandala.members);
+        # The authored key must use the sanitized taxonomy spelling.
+        assert failsDeep ((evalFleetModule {
+          deployment.groupSettings."edge-compute".confirmTimeout = 30;
+        }).config.mandala.members);
+        assert failsDeep ((evalFleetModule {
+          deployment.settings.remoteBuild = true;
+        }).config.mandala.deployment.settings);
         assert self.lib.groupsFor member
         == ["nixos" "armv7l" "server" "cache" "edge" "fake" "fake_extra_group"];
         # ansibleInventory: membership, hostvars, groups, guard.
@@ -541,6 +694,13 @@
         # byte-shape compatible.
         assert deploySettingsGolden == deploySettingsExpected;
         assert deploySettingsSiblingWinner.confirmTimeout == 50;
+        assert deploySettingsAbsentValues
+        == {
+          activationTimeout = 600;
+          autoRollback = true;
+          confirmTimeout = 30;
+          fastConnection = true;
+        };
         assert unknownDeployGroupFails;
         assert (self.lib.mergeDeploySettings {
           knownGroups = [];

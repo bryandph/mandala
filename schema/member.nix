@@ -214,14 +214,49 @@ in {
           description = "Activation mode: 'switch' for live activation, 'boot' for first-time deploys where switching would break the running system";
         };
         autoRollback = mkOption {
-          type = types.bool;
-          default = true;
-          description = "Enable deploy-rs auto-rollback on failure";
+          type = types.nullOr types.bool;
+          default = null;
+          description = "Whether deploy-rs should reactivate the previous profile when activation fails; null inherits group/fleet settings and ultimately the legacy true default";
         };
         fastConnection = mkOption {
-          type = types.bool;
-          default = true;
-          description = "Hint to deploy-rs that the connection is fast (LAN)";
+          type = types.nullOr types.bool;
+          default = null;
+          description = "Whether deploy-rs should copy the full closure instead of allowing target substitution; null inherits group/fleet settings and ultimately the legacy true default";
+        };
+        magicRollback = mkOption {
+          type = types.nullOr types.bool;
+          default = null;
+          description = "Whether deploy-rs should require confirmation and roll back when the host cannot be reached";
+        };
+        confirmTimeout = mkOption {
+          type = types.nullOr types.ints.u16;
+          default = null;
+          description = "Seconds deploy-rs waits for activation confirmation before rolling back";
+        };
+        activationTimeout = mkOption {
+          type = types.nullOr types.ints.u16;
+          default = null;
+          description = "Seconds deploy-rs allows for profile activation";
+        };
+        tempPath = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Remote directory deploy-rs uses for temporary activation state";
+        };
+        sudo = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Command deploy-rs uses to execute activation as another user";
+        };
+        user = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Remote user whose profile deploy-rs activates";
+        };
+        sshOpts = mkOption {
+          type = types.listOf types.str;
+          default = [];
+          description = "Additional arguments passed to ssh by deploy-rs";
         };
       };
 

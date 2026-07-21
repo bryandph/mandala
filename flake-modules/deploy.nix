@@ -22,6 +22,7 @@ in {
     flake.deploy.nodes = engine.projections.deployNodes {
       inherit (inputs) deploy-rs nixpkgs;
       nixosConfigurations = inputs.self.nixosConfigurations or {};
+      deploySettings = config.mandala.projections.deploy.settings;
     };
 
     # The data view for the aggregate: node NAMES only — the nodes

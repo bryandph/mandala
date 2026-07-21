@@ -18,7 +18,16 @@
     ];
     deployment = {
       ansible.enable = true;
-      deployRs.enable = true;
+      deployRs = {
+        enable = true;
+        activationTimeout = 600;
+        autoRollback = false;
+        magicRollback = false;
+        tempPath = "/var/tmp/mandala";
+        sudo = "doas -u";
+        user = "deployer";
+        sshOpts = ["-o" "Member=yes"];
+      };
       sops.recipient = "age1showcaseshowcaseshowcaseshowcaseshowcaseshowcaseshowcasewb";
     };
   };

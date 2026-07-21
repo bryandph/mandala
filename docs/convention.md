@@ -78,7 +78,37 @@ consumption. Groups use the ansible-safe spelling everywhere, so
 `@k3s`, `ansible -l k3s`, and `.#deployBatch.k3s` are one name for one
 member set.
 
-## 6. Hooks, not forks
+## 6. Deploy settings are flattened once
+
+Deploy settings have three authoring tiers:
+
+- fleet defaults at `mandala.deployment.settings`;
+- group settings at `mandala.deployment.groupSettings.<group>`; and
+- member settings at `host.deployment.deployRs`, with the SSH target,
+  login, and port under `host.deployment.ssh`.
+
+For scalar values, the member tier wins over the group tier, which wins
+over the fleet tier. A member can belong to several configured groups;
+those group names are sorted lexicographically and folded in that order,
+so the later group wins a scalar conflict. `sshOpts` is additive instead:
+member options come first, followed by applicable groups in that same
+sorted order, then fleet options.
+
+`groupSettings` keys must use the sanitized canonical taxonomy spelling
+exposed by `flake.mandala.groups`. An unknown key, including an unsanitized
+spelling that does not exist there, fails evaluation. Member
+`autoRollback` and `fastConnection` values are nullable authoring choices;
+after all tiers merge, each still defaults effectively to `true` when no
+tier supplied it, preserving the historical deploy-node behavior.
+
+The resolved inspection surface is
+`flake.mandala.projections.deploy.settings.<member>`. Both the native
+engine and `flake.deploy.nodes` consume that flattened data; consumers
+must not repeat the merge. See `schema/member.nix`,
+`flake-modules/fleet.nix`, and `lib/deploy-settings.nix` for the source of
+truth, and `examples/showcase/` for an evaluated member/group example.
+
+## 7. Hooks, not forks
 
 Repo-specific values enter through hook options, never by patching the
 engine: `mandala.ansible.extraHostvars` (per-member vars, merged after —

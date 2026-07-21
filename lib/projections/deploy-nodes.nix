@@ -25,6 +25,8 @@
   nixpkgs,
   # Built configurations; members are read from .config.host.
   nixosConfigurations,
+  # name -> settings already flattened by the fleet module's single merge.
+  deploySettings,
 }: let
   deployable =
     lib.filterAttrs
@@ -37,7 +39,10 @@
 
   mkNode = name: cfg: let
     host = cfg.config.host;
-    d = host.deployment;
+    settings = assert lib.assertMsg (deploySettings ? ${name})
+    "mandala deploy-nodes: ${name}: flattened deploy settings are missing";
+      deploySettings.${name};
+    nodeSettings = removeAttrs settings ["activation"];
     hostSystem = cfg.pkgs.stdenv.hostPlatform.system;
     cross =
       host.build
@@ -69,7 +74,7 @@
     };
 
     rawActivate =
-      if d.deployRs.activation == "boot"
+      if settings.activation == "boot"
       then deployPkgs.deploy-rs.lib.activate.custom cfg.config.system.build.toplevel "./bin/switch-to-configuration boot"
       else deployPkgs.deploy-rs.lib.activate.nixos cfg;
     activate =
@@ -83,12 +88,10 @@
             sed -i "1c#!${cfg.pkgs.runtimeShell}" "$f"
           done
         '';
-  in {
-    hostname = d.ssh.host;
-    sshUser = d.ssh.user;
-    sshOpts = ["-p" (toString d.ssh.port)];
-    inherit (d.deployRs) autoRollback fastConnection;
-    profiles.system.path = activate;
-  };
+  in
+    nodeSettings
+    // {
+      profiles.system.path = activate;
+    };
 in
   lib.mapAttrs mkNode deployable

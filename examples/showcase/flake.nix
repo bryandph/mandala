@@ -63,6 +63,12 @@
           router = mandala.lib.evalMember (import ./members/router.nix);
         };
 
+        deployment.groupSettings.web = {
+          confirmTimeout = 45;
+          fastConnection = false;
+          sshOpts = ["-o" "Group=yes"];
+        };
+
         # Consumer hook: repo-specific hostvars merge after the engine
         # defaults (and could override them).
         ansible.extraHostvars = name: {showcase_dir = "hosts/${name}";};
@@ -131,9 +137,42 @@
           # sops: keys = anchor + one recipient per keyed member; admin rule pgp-only
           assert lib.length sops.keys == 3;
           assert !(lib.head (lib.head sops.creation_rules).key_groups ? age);
-          # deploy: nodes + batch keys (eval-only — nothing is built)
+          # deploy: exact flattened settings + profile path. Cache authors
+          # nothing and preserves the legacy output; web exercises member +
+          # group layers without a second merge in the projection.
           assert builtins.attrNames nodes == ["cache" "web"];
-          assert nodes.web.hostname == "web.fleet.example";
+          assert removeAttrs nodes.cache ["profiles"]
+          == {
+            autoRollback = true;
+            fastConnection = true;
+            hostname = "cache.fleet.example";
+            sshOpts = ["-p" "22"];
+            sshUser = "root";
+          };
+          assert removeAttrs nodes.web ["profiles"]
+          == {
+            activationTimeout = 600;
+            autoRollback = false;
+            confirmTimeout = 45;
+            fastConnection = false;
+            hostname = "web.fleet.example";
+            magicRollback = false;
+            sshOpts = [
+              "-p"
+              "22"
+              "-o"
+              "Member=yes"
+              "-o"
+              "Group=yes"
+            ];
+            sshUser = "root";
+            sudo = "doas -u";
+            tempPath = "/var/tmp/mandala";
+            user = "deployer";
+          };
+          assert removeAttrs agg.projections.deploy.settings.web ["activation"]
+          == removeAttrs nodes.web ["profiles"];
+          assert nodes.web.profiles.system ? path;
           assert lib.elem "cache" (builtins.attrNames inputs.self.legacyPackages.${system}.deployBatch);
           assert lib.elem "all" (builtins.attrNames inputs.self.legacyPackages.${system}.deployBatch);
           # mesh: the overlay table validates and derives dns names

@@ -11,21 +11,34 @@
   unknownGroups = lib.filter (name: !(lib.elem name knownGroups)) (lib.attrNames groupSettings);
   sortedMemberGroups = lib.sort (a: b: a < b) (lib.unique memberGroups);
   applicableGroups = lib.filter (name: groupSettings ? ${name}) sortedMemberGroups;
-  withoutSshOpts = attrs: builtins.removeAttrs attrs ["sshOpts"];
+  presentScalars = attrs:
+    lib.filterAttrs
+    (_: value: value != null)
+    (removeAttrs attrs ["sshOpts"]);
+  sshOptsOf = attrs:
+    if (attrs.sshOpts or null) == null
+    then []
+    else attrs.sshOpts;
   groupScalars =
     lib.foldl'
-    (acc: name: lib.recursiveUpdate acc (withoutSshOpts groupSettings.${name}))
+    (acc: name: lib.recursiveUpdate acc (presentScalars groupSettings.${name}))
     {}
     applicableGroups;
   scalars =
     lib.recursiveUpdate
-    (lib.recursiveUpdate (withoutSshOpts fleet) groupScalars)
-    (withoutSshOpts member);
+    (lib.recursiveUpdate (presentScalars fleet) groupScalars)
+    (presentScalars member);
+  effectiveScalars =
+    {
+      autoRollback = true;
+      fastConnection = true;
+    }
+    // scalars;
   sshOpts =
-    (member.sshOpts or [])
-    ++ lib.concatMap (name: groupSettings.${name}.sshOpts or []) applicableGroups
-    ++ (fleet.sshOpts or []);
+    (sshOptsOf member)
+    ++ lib.concatMap (name: sshOptsOf groupSettings.${name}) applicableGroups
+    ++ (sshOptsOf fleet);
 in
   assert lib.assertMsg (unknownGroups == [])
   "mandala deploy settings: unknown groupSettings keys: ${lib.concatStringsSep ", " unknownGroups}";
-    scalars // lib.optionalAttrs (sshOpts != []) {inherit sshOpts;}
+    effectiveScalars // lib.optionalAttrs (sshOpts != []) {inherit sshOpts;}
