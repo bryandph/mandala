@@ -119,6 +119,25 @@ fn target_is_selection_else_cursor_on_the_active_tab() {
     assert_eq!(AppState::new().target(), None);
 }
 
+#[test]
+fn deploy_target_marks_group_rows_as_mandala_group_selectors() {
+    let mut state = filled_state();
+    assert_eq!(state.deploy_target().as_deref(), Some("cache"));
+
+    state.tab = Tab::Groups;
+    assert_eq!(state.target().as_deref(), Some("gateway"));
+    assert_eq!(state.deploy_target().as_deref(), Some("@gateway"));
+
+    state.groups_table.toggle(); // gateway
+    state.groups_table.move_cursor(1);
+    state.groups_table.toggle(); // k3s
+    assert_eq!(state.target().as_deref(), Some("gateway,k3s"));
+    assert_eq!(state.deploy_target().as_deref(), Some("@gateway,@k3s"));
+
+    state.tab = Tab::Drift;
+    assert_eq!(state.deploy_target().as_deref(), Some("cache"));
+}
+
 // ---- status machinery -------------------------------------------------------
 
 #[test]

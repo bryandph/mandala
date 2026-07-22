@@ -808,7 +808,11 @@ impl App {
     /// Action dispatch: compute the target (selection-else-cursor) and push
     /// the action's screen. No target → no-op.
     fn dispatch(&mut self, action: Action) {
-        let Some(target) = self.state.target() else {
+        let target = match action {
+            Action::Deploy => self.state.deploy_target(),
+            Action::Ping | Action::Reboot => self.state.target(),
+        };
+        let Some(target) = target else {
             return;
         };
         match action {

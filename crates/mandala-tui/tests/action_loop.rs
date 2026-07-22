@@ -17,7 +17,7 @@ use mandala_core::inventory::Inventory;
 use mandala_tui::app::App;
 use mandala_tui::explorer::ExplorerConfig;
 use mandala_tui::screen::{REBOOT_UNAVAILABLE, ScreenState};
-use mandala_tui::state::{AppState, LoadedInventory};
+use mandala_tui::state::{AppState, LoadedInventory, Tab};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serde_json::json;
@@ -358,6 +358,24 @@ async fn deploy_confirm_gate_message_and_cancel() {
     .await;
     assert!(app.state.screen.is_none());
     assert!(!app.state.surveying && !app.state.busy);
+}
+
+#[tokio::test]
+async fn deploy_from_groups_tab_uses_mandala_group_selectors() {
+    let mut state = filled_state();
+    state.tab = Tab::Groups;
+    state.groups_table.toggle(); // gateway
+    state.groups_table.move_cursor(1);
+    state.groups_table.toggle(); // k3s
+
+    let app = run_keys(state, stub_cfg(), vec![key(KeyCode::Char('D'))]).await;
+    let Some(ScreenState::Confirm(confirm)) = &app.state.screen else {
+        panic!("confirm modal not up: {:?}", app.state.screen);
+    };
+    assert_eq!(
+        confirm.message,
+        "Deploy '@gateway,@k3s'?\n(eval-once batch build, then deploy-rs per host with magic rollback)"
+    );
 }
 
 #[tokio::test]

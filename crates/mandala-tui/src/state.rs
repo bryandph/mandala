@@ -352,6 +352,26 @@ impl AppState {
         table.cursor_name().map(str::to_string)
     }
 
+    /// The action target expressed in Mandala's selector algebra. Ansible
+    /// accepts taxonomy group names directly, while Mandala deliberately
+    /// reserves the `@group` spelling so a group cannot be mistaken for a
+    /// member. Member and drift rows already contain member names; only the
+    /// groups tab needs translating before a native deploy is launched.
+    #[must_use]
+    pub fn deploy_target(&self) -> Option<String> {
+        let target = self.target()?;
+        if self.tab != Tab::Groups {
+            return Some(target);
+        }
+        Some(
+            target
+                .split(',')
+                .map(|group| format!("@{group}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+
     // -- status machinery ------------------------------------------------
     //
     // eval and survey run CONCURRENTLY (refresh_drift fires both) and the
