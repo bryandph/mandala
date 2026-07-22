@@ -147,6 +147,7 @@ pub struct BuildForest {
     ignored_lines: u64,
     completed_downloads: u64,
     completed_substitutions: u64,
+    duration_estimates_ms: BTreeMap<String, u64>,
 }
 
 impl Default for BuildForest {
@@ -174,6 +175,15 @@ impl BuildForest {
             ignored_lines: 0,
             completed_downloads: 0,
             completed_substitutions: 0,
+            duration_estimates_ms: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_duration_estimates(duration_estimates_ms: BTreeMap<String, u64>) -> Self {
+        Self {
+            duration_estimates_ms,
+            ..Self::new()
         }
     }
 
@@ -458,21 +468,38 @@ impl BuildForest {
             .filter(|path| !parents.contains(*path))
             .cloned()
             .collect();
+        let elapsed_ms = self.elapsed_ms();
         let nodes: Vec<DerivationNode> = self
             .nodes
             .iter()
-            .map(|(path, node)| DerivationNode {
-                path: path.clone(),
-                name: derivation_name(path),
-                status: node.status,
-                inputs: node.inputs.iter().cloned().collect(),
-                outputs: node.outputs.clone(),
-                host: node.host.clone(),
-                last_activity: node.last_activity.clone(),
-                note: node.note.clone(),
-                started_ms: node.started_ms,
-                finished_ms: node.finished_ms,
-                eta_seconds: None,
+            .map(|(path, node)| {
+                let name = derivation_name(path);
+                let eta_seconds = if matches!(
+                    node.status,
+                    DerivationStatus::Built | DerivationStatus::Failed
+                ) {
+                    None
+                } else {
+                    self.duration_estimates_ms.get(&name).map(|estimate| {
+                        let spent = node
+                            .started_ms
+                            .map_or(0, |started| elapsed_ms.saturating_sub(started));
+                        estimate.saturating_sub(spent).div_ceil(1_000)
+                    })
+                };
+                DerivationNode {
+                    path: path.clone(),
+                    name,
+                    status: node.status,
+                    inputs: node.inputs.iter().cloned().collect(),
+                    outputs: node.outputs.clone(),
+                    host: node.host.clone(),
+                    last_activity: node.last_activity.clone(),
+                    note: node.note.clone(),
+                    started_ms: node.started_ms,
+                    finished_ms: node.finished_ms,
+                    eta_seconds,
+                }
             })
             .collect();
         let counts = nodes
@@ -519,7 +546,7 @@ impl BuildForest {
             .collect();
         ForestSnapshot {
             version: self.version,
-            elapsed_ms: self.elapsed_ms(),
+            elapsed_ms,
             nodes,
             roots,
             counts,

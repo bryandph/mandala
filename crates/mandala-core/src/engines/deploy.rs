@@ -652,6 +652,18 @@ fn build_profiles_with(
     program: &OsStr,
 ) -> Result<BuiltProfiles, BuildError> {
     let out_link = run.path.join("profile");
+    let mut duration_cache = crate::runner::build_duration_cache_path(&run.path).and_then(|path| {
+        match nix_build_forest::DurationCache::load(&path) {
+            Ok(cache) => Some((path, cache)),
+            Err(error) => {
+                eprintln!("mandala: build duration cache ignored: {error}");
+                None
+            }
+        }
+    });
+    let duration_estimates = duration_cache
+        .as_ref()
+        .map_or_else(BTreeMap::new, |(_, cache)| cache.estimates_ms());
     let argv = build_run_argv(flake, &run.plan.targets, &out_link);
     let mut event_argv = argv.clone();
     event_argv[0] = program.to_string_lossy().into_owned();
@@ -693,7 +705,8 @@ fn build_profiles_with(
     let stream_writer = Arc::clone(&writer);
     let stderr_task = std::thread::spawn(move || -> (BuildTracker, nix_build_forest::BuildForest, Option<io::Error>) {
         let mut tracker = BuildTracker::default();
-        let mut forest = nix_build_forest::BuildForest::new();
+        let mut forest =
+            nix_build_forest::BuildForest::with_duration_estimates(duration_estimates);
         let mut event_error = None;
         for line in BufReader::new(stderr).lines() {
             let line = match line {
@@ -788,9 +801,16 @@ fn build_profiles_with(
         "mandala: build: done rc={rc} built={} fetched={} errors={}",
         tracker.built, tracker.fetched, tracker.errors
     );
+    let final_snapshot = forest.snapshot();
+    if let Some((path, cache)) = duration_cache.as_mut() {
+        cache.observe_snapshot(&final_snapshot);
+        if let Err(error) = cache.save(path) {
+            eprintln!("mandala: build duration cache not saved: {error}");
+        }
+    }
     eprintln!(
         "mandala: {}",
-        nix_build_forest::plain::render_final(&forest.snapshot())
+        nix_build_forest::plain::render_final(&final_snapshot)
     );
 
     match outcome {

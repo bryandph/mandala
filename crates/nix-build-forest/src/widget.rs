@@ -65,6 +65,10 @@ impl Widget for ForestWidget<'_> {
                 Span::raw("  ".repeat(row.depth)),
                 Span::styled(format!("{glyph} {}", row.node.name), style),
                 row.node
+                    .eta_seconds
+                    .map(|eta| Span::styled(format!(" · ETA ~{eta}s"), style))
+                    .unwrap_or_else(|| Span::raw("")),
+                row.node
                     .last_activity
                     .map(|text| Span::styled(format!(" — {text}"), style))
                     .unwrap_or_else(|| Span::raw("")),

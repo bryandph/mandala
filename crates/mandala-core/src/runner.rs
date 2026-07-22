@@ -376,6 +376,16 @@ impl BuildModel {
 
 type ForestRead = (String, Result<nix_build_forest::Derivation, String>);
 
+pub(crate) fn build_duration_cache_path(run_directory: &Path) -> Option<PathBuf> {
+    let runs_directory = run_directory.parent()?;
+    (runs_directory.file_name().is_some_and(|name| name == "runs")).then(|| {
+        runs_directory
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(nix_build_forest::DURATION_CACHE_RELATIVE_PATH)
+    })
+}
+
 struct ForestResolver {
     requests: mpsc::Sender<String>,
     results: mpsc::Receiver<ForestRead>,
@@ -444,12 +454,15 @@ impl std::fmt::Debug for EventTailer {
 impl EventTailer {
     #[must_use]
     pub fn new(directory: &Path) -> Self {
+        let duration_estimates = build_duration_cache_path(directory)
+            .and_then(|path| nix_build_forest::DurationCache::load(&path).ok())
+            .map_or_else(BTreeMap::new, |cache| cache.estimates_ms());
         EventTailer {
             directory: directory.to_path_buf(),
             offsets: BTreeMap::new(),
             hosts: BTreeMap::new(),
             build: BuildModel::default(),
-            forest: nix_build_forest::BuildForest::new(),
+            forest: nix_build_forest::BuildForest::with_duration_estimates(duration_estimates),
             forest_resolver: None,
             nixlog_sink: None,
         }
@@ -1399,6 +1412,17 @@ mod tests {
 
     fn fields(value: Value) -> serde_json::Map<String, Value> {
         value.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn build_duration_cache_stays_outside_snapshot_namespace() {
+        let state = tmp();
+        let run = state.join("runs").join("run-id");
+        assert_eq!(
+            build_duration_cache_path(&run),
+            Some(state.join("build").join("durations.json"))
+        );
+        assert_eq!(build_duration_cache_path(&state.join("fixture")), None);
     }
 
     /// Native writers must preserve the retired protocol-v2 emitter's exact

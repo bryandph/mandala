@@ -10,6 +10,7 @@
 //! versioned snapshots. Renderers are optional edge features.
 
 pub mod drv;
+pub mod duration;
 pub mod forest;
 pub mod msg;
 pub mod sort;
@@ -20,6 +21,7 @@ pub mod plain;
 pub mod widget;
 
 pub use drv::{Derivation, DrvReader, FsDrvReader, parse_derivation};
+pub use duration::{DURATION_CACHE_RELATIVE_PATH, DurationCache};
 pub use forest::{
     BuildForest, DerivationNode, DerivationStatus, FeedOutcome, ForestCounts, ForestSnapshot,
     Transfer,
