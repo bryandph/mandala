@@ -1075,6 +1075,10 @@ mod tests {
         assert!(engine_snapshot["build"]["forest"]["counts"].is_object());
         assert!(engine_snapshot["build"]["forest"]["failed_derivations"].is_array());
         assert!(engine_snapshot["build"]["forest"]["current_activity"].is_array());
+        assert!(engine_snapshot["build"]["forest"]["recent_logs"].is_array());
+        assert!(engine_snapshot["build"]["forest"]["transfers"].is_array());
+        assert!(engine_snapshot["build"]["forest"]["expectations"].is_array());
+        assert!(engine_snapshot["build"]["forest"]["activity"].is_object());
         assert_eq!(engine_snapshot["hosts"]["alpha"]["state"], "confirmed");
         assert_eq!(engine_snapshot["hosts"]["beta"]["state"], "rolled-back");
         assert_eq!(

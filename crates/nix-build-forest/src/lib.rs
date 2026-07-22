@@ -23,9 +23,14 @@ pub mod widget;
 pub use drv::{Derivation, DrvReader, FsDrvReader, parse_derivation};
 pub use duration::{DURATION_CACHE_RELATIVE_PATH, DurationCache};
 pub use forest::{
-    BuildForest, DerivationNode, DerivationStatus, FeedOutcome, ForestCounts, ForestSnapshot,
+    ActivityExpectation, ActivityProgress, BuildForest, BuildLogLine, DERIVATION_LOG_TAIL_LIMIT,
+    DerivationNode, DerivationStatus, FeedOutcome, ForestCounts, ForestSnapshot, RECENT_LOG_LIMIT,
     Transfer,
 };
 pub use msg::{ActivityType, NixMessage, ResultType, parse_nix_line};
+pub use sort::{
+    ActivityProjection, DEFAULT_ACTIVITY_ROW_BUDGET, DisplayRow, ElidedCounts, activity_projection,
+    display_rows,
+};
 #[cfg(feature = "ratatui")]
 pub use widget::{ForestStyles, ForestWidget};

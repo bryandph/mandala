@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -6,6 +6,10 @@ use serde_json::Value;
 
 use crate::drv::{Derivation, DrvReader, parse_derivation};
 use crate::msg::{ActivityType, NixMessage, ResultType, parse_nix_line};
+use crate::sort::{ActivityProjection, DEFAULT_ACTIVITY_ROW_BUDGET, activity_projection};
+
+pub const DERIVATION_LOG_TAIL_LIMIT: usize = 64;
+pub const RECENT_LOG_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -28,11 +32,33 @@ pub struct DerivationNode {
     pub outputs: BTreeMap<String, String>,
     pub host: Option<String>,
     pub last_activity: Option<String>,
+    pub log_tail: Vec<String>,
     pub note: Option<String>,
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
     /// Reserved for the optional duration-cache extension.
     pub eta_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ActivityProgress {
+    pub done: u64,
+    pub expected: u64,
+    pub running: u64,
+    pub failed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildLogLine {
+    pub derivation: String,
+    pub name: String,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ActivityExpectation {
+    pub kind: ActivityType,
+    pub expected: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -41,6 +67,9 @@ pub struct Transfer {
     pub kind: ActivityType,
     pub path: Option<String>,
     pub host: Option<String>,
+    pub source: Option<String>,
+    pub destination: Option<String>,
+    pub progress: Option<ActivityProgress>,
     pub text: String,
 }
 
@@ -75,9 +104,12 @@ pub struct ForestSnapshot {
     pub nodes: Vec<DerivationNode>,
     pub roots: Vec<String>,
     pub counts: ForestCounts,
+    pub activity: ActivityProjection,
     pub completed_downloads: u64,
     pub completed_substitutions: u64,
     pub transfers: Vec<Transfer>,
+    pub recent_logs: Vec<BuildLogLine>,
+    pub expectations: Vec<ActivityExpectation>,
     pub current_activity: Vec<String>,
     pub failed_derivations: Vec<String>,
     pub errors: Vec<String>,
@@ -102,6 +134,7 @@ struct NodeState {
     outputs: BTreeMap<String, String>,
     host: Option<String>,
     last_activity: Option<String>,
+    log_tail: VecDeque<String>,
     note: Option<String>,
     started_ms: Option<u64>,
     finished_ms: Option<u64>,
@@ -115,6 +148,7 @@ impl Default for NodeState {
             outputs: BTreeMap::new(),
             host: None,
             last_activity: None,
+            log_tail: VecDeque::new(),
             note: None,
             started_ms: None,
             finished_ms: None,
@@ -127,6 +161,10 @@ struct ActiveActivity {
     kind: ActivityType,
     path: Option<String>,
     host: Option<String>,
+    source: Option<String>,
+    destination: Option<String>,
+    progress: Option<ActivityProgress>,
+    expectations: BTreeMap<ActivityType, u64>,
     text: String,
 }
 
@@ -148,6 +186,8 @@ pub struct BuildForest {
     completed_downloads: u64,
     completed_substitutions: u64,
     duration_estimates_ms: BTreeMap<String, u64>,
+    recent_logs: VecDeque<BuildLogLine>,
+    log_sequence: u64,
 }
 
 impl Default for BuildForest {
@@ -176,6 +216,8 @@ impl BuildForest {
             completed_downloads: 0,
             completed_substitutions: 0,
             duration_estimates_ms: BTreeMap::new(),
+            recent_logs: VecDeque::new(),
+            log_sequence: 0,
         }
     }
 
@@ -235,6 +277,7 @@ impl BuildForest {
             .and_then(Value::as_str)
             .map(str::to_string);
         let host = activity_host(kind, &message.fields);
+        let (source, destination) = activity_endpoints(kind, &message.fields);
         let text = message.text.unwrap_or_default();
 
         match kind {
@@ -263,6 +306,10 @@ impl BuildForest {
                 kind,
                 path,
                 host,
+                source,
+                destination,
+                progress: None,
+                expectations: BTreeMap::new(),
                 text,
             },
         );
@@ -315,12 +362,23 @@ impl BuildForest {
             *self.unknown_result_types.entry(code).or_default() += 1;
         }
         let Some(id) = message.id else { return };
-        let Some(activity) = self.activities.get(&id) else {
+        let Some(activity_path) = self
+            .activities
+            .get(&id)
+            .map(|activity| activity.path.clone())
+        else {
             return;
         };
         match result {
             Some(ResultType::BuildLogLine | ResultType::PostBuildLogLine) => {
-                if let Some(path) = activity.path.as_deref()
+                if let Some(path) = activity_path.as_deref()
+                    && let Some(text) = message.fields.first().and_then(Value::as_str)
+                {
+                    self.push_log(path, text);
+                }
+            }
+            Some(ResultType::SetPhase | ResultType::FetchStatus) => {
+                if let Some(path) = activity_path.as_deref()
                     && let Some(text) = message.fields.first().and_then(Value::as_str)
                 {
                     self.nodes
@@ -329,18 +387,52 @@ impl BuildForest {
                         .last_activity = Some(text.to_string());
                 }
             }
-            Some(ResultType::SetPhase | ResultType::FetchStatus) => {
-                if let Some(path) = activity.path.as_deref()
-                    && let Some(text) = message.fields.first().and_then(Value::as_str)
+            Some(ResultType::Progress) => {
+                if let Some(progress) = activity_progress(&message.fields)
+                    && let Some(activity) = self.activities.get_mut(&id)
                 {
-                    self.nodes
-                        .entry(path.to_string())
-                        .or_default()
-                        .last_activity = Some(text.to_string());
+                    activity.progress = Some(progress);
+                }
+            }
+            Some(ResultType::SetExpected) => {
+                if let Some((kind, expected)) = activity_expectation(&message.fields)
+                    && let Some(activity) = self.activities.get_mut(&id)
+                {
+                    activity.expectations.insert(kind, expected);
                 }
             }
             _ => {}
         }
+    }
+
+    fn push_log(&mut self, path: &str, text: &str) {
+        let node = self.nodes.entry(path.to_string()).or_default();
+        node.last_activity = Some(text.to_string());
+        push_bounded(
+            &mut node.log_tail,
+            text.to_string(),
+            DERIVATION_LOG_TAIL_LIMIT,
+        );
+        push_bounded(
+            &mut self.recent_logs,
+            BuildLogLine {
+                derivation: path.to_string(),
+                name: derivation_name(path),
+                line: text.to_string(),
+            },
+            RECENT_LOG_LIMIT,
+        );
+        self.log_sequence = self.log_sequence.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn log_sequence(&self) -> u64 {
+        self.log_sequence
+    }
+
+    #[must_use]
+    pub fn latest_log(&self) -> Option<&BuildLogLine> {
+        self.recent_logs.back()
     }
 
     fn message(&mut self, message: NixMessage) {
@@ -495,6 +587,7 @@ impl BuildForest {
                     outputs: node.outputs.clone(),
                     host: node.host.clone(),
                     last_activity: node.last_activity.clone(),
+                    log_tail: node.log_tail.iter().cloned().collect(),
                     note: node.note.clone(),
                     started_ms: node.started_ms,
                     finished_ms: node.finished_ms,
@@ -530,7 +623,23 @@ impl BuildForest {
                 kind: activity.kind,
                 path: activity.path.clone(),
                 host: activity.host.clone(),
+                source: activity.source.clone(),
+                destination: activity.destination.clone(),
+                progress: activity.progress,
                 text: activity.text.clone(),
+            })
+            .collect();
+        let expectations = self
+            .activities
+            .values()
+            .flat_map(|activity| {
+                activity
+                    .expectations
+                    .iter()
+                    .map(|(kind, expected)| ActivityExpectation {
+                        kind: *kind,
+                        expected: *expected,
+                    })
             })
             .collect();
         let current_activity = self
@@ -544,15 +653,18 @@ impl BuildForest {
             .filter(|node| node.status == DerivationStatus::Failed)
             .map(|node| node.name.clone())
             .collect();
-        ForestSnapshot {
+        let mut snapshot = ForestSnapshot {
             version: self.version,
             elapsed_ms,
             nodes,
             roots,
             counts,
+            activity: ActivityProjection::default(),
             completed_downloads: self.completed_downloads,
             completed_substitutions: self.completed_substitutions,
             transfers,
+            recent_logs: self.recent_logs.iter().cloned().collect(),
+            expectations,
             current_activity,
             failed_derivations,
             errors: self.errors.clone(),
@@ -561,7 +673,46 @@ impl BuildForest {
             unknown_actions: self.unknown_actions,
             malformed_messages: self.malformed_messages,
             ignored_lines: self.ignored_lines,
-        }
+        };
+        snapshot.activity = activity_projection(&snapshot, DEFAULT_ACTIVITY_ROW_BUDGET);
+        snapshot
+    }
+}
+
+fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, limit: usize) {
+    if queue.len() == limit {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
+fn activity_progress(fields: &[Value]) -> Option<ActivityProgress> {
+    Some(ActivityProgress {
+        done: fields.first()?.as_u64()?,
+        expected: fields.get(1)?.as_u64()?,
+        running: fields.get(2)?.as_u64()?,
+        failed: fields.get(3)?.as_u64()?,
+    })
+}
+
+fn activity_expectation(fields: &[Value]) -> Option<(ActivityType, u64)> {
+    let kind = ActivityType::from_code(fields.first()?.as_i64()?);
+    let expected = fields.get(1)?.as_u64()?;
+    Some((kind, expected))
+}
+
+fn activity_endpoints(kind: ActivityType, fields: &[Value]) -> (Option<String>, Option<String>) {
+    let value = |index| {
+        fields
+            .get(index)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    match kind {
+        ActivityType::CopyPath => (value(1).map(str::to_string), value(2).map(str::to_string)),
+        ActivityType::FileTransfer => (value(0).map(str::to_string), None),
+        ActivityType::Substitute => (value(1).map(str::to_string), None),
+        _ => (None, None),
     }
 }
 
@@ -687,5 +838,106 @@ mod tests {
         let snapshot = forest.snapshot();
         assert_eq!(snapshot.unknown_activity_types[&999], 1);
         assert_eq!(snapshot.unknown_actions, 1);
+    }
+
+    #[test]
+    fn build_logs_are_owned_and_bounded() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-chatty.drv";
+        let mut forest = BuildForest::new();
+        forest.feed_line(&format!(
+            r#"@nix {{"action":"start","id":1,"type":105,"fields":["{drv}","",1,1]}}"#
+        ));
+        for index in 0..100 {
+            forest.feed_line(&format!(
+                r#"@nix {{"action":"result","id":1,"type":101,"fields":["line-{index}"]}}"#
+            ));
+        }
+        let snapshot = forest.snapshot();
+        let node = snapshot.nodes.iter().find(|node| node.path == drv).unwrap();
+        assert_eq!(node.log_tail.len(), DERIVATION_LOG_TAIL_LIMIT);
+        assert_eq!(node.log_tail.first().map(String::as_str), Some("line-36"));
+        assert_eq!(node.log_tail.last().map(String::as_str), Some("line-99"));
+        assert_eq!(snapshot.recent_logs.len(), 100);
+        assert_eq!(forest.log_sequence(), 100);
+        assert_eq!(
+            forest.latest_log().map(|log| log.line.as_str()),
+            Some("line-99")
+        );
+    }
+
+    #[test]
+    fn concurrent_build_logs_preserve_interleaved_ownership() {
+        let first = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-first.drv";
+        let second = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-second.drv";
+        let mut forest = BuildForest::new();
+        for (id, drv) in [(1, first), (2, second)] {
+            forest.feed_line(&format!(
+                r#"@nix {{"action":"start","id":{id},"type":105,"fields":["{drv}","",1,1]}}"#
+            ));
+        }
+        forest.feed_line(
+            r#"@nix {"action":"result","id":1,"type":101,"fields":["first-a"]}"#,
+        );
+        forest.feed_line(
+            r#"@nix {"action":"result","id":2,"type":101,"fields":["second-a"]}"#,
+        );
+        forest.feed_line(
+            r#"@nix {"action":"result","id":1,"type":101,"fields":["first-b"]}"#,
+        );
+        let snapshot = forest.snapshot();
+        assert_eq!(
+            snapshot
+                .recent_logs
+                .iter()
+                .map(|log| (log.derivation.as_str(), log.line.as_str()))
+                .collect::<Vec<_>>(),
+            [(first, "first-a"), (second, "second-a"), (first, "first-b")]
+        );
+    }
+
+    #[test]
+    fn transfer_endpoints_progress_and_expectations_are_typed() {
+        let mut forest = BuildForest::new();
+        forest.feed_line(
+            r#"@nix {"action":"start","id":1,"type":100,"fields":["/nix/store/item","ssh://source","ssh://dest"],"text":"copying item"}"#,
+        );
+        forest.feed_line(r#"@nix {"action":"result","id":1,"type":105,"fields":[5,10,1,0]}"#);
+        forest.feed_line(
+            r#"@nix {"action":"start","id":2,"type":102,"fields":[],"text":"realising"}"#,
+        );
+        forest.feed_line(r#"@nix {"action":"result","id":2,"type":106,"fields":[100,3]}"#);
+        let snapshot = forest.snapshot();
+        let transfer = snapshot.transfers.first().unwrap();
+        assert_eq!(transfer.source.as_deref(), Some("ssh://source"));
+        assert_eq!(transfer.destination.as_deref(), Some("ssh://dest"));
+        assert_eq!(
+            transfer.progress,
+            Some(ActivityProgress {
+                done: 5,
+                expected: 10,
+                running: 1,
+                failed: 0,
+            })
+        );
+        assert_eq!(
+            snapshot.expectations,
+            [ActivityExpectation {
+                kind: ActivityType::CopyPath,
+                expected: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn incomplete_progress_and_endpoints_remain_absent() {
+        let mut forest = BuildForest::new();
+        forest.feed_line(
+            r#"@nix {"action":"start","id":1,"type":101,"fields":[],"text":"transfer"}"#,
+        );
+        forest.feed_line(r#"@nix {"action":"result","id":1,"type":105,"fields":[1]}"#);
+        let transfer = forest.snapshot().transfers.into_iter().next().unwrap();
+        assert_eq!(transfer.source, None);
+        assert_eq!(transfer.destination, None);
+        assert_eq!(transfer.progress, None);
     }
 }

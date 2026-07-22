@@ -717,7 +717,16 @@ fn build_profiles_with(
                 }
             };
             if line.starts_with(NIX_JSON_PREFIX) {
+                let log_sequence = forest.log_sequence();
                 forest.feed_line(&line);
+                if forest.log_sequence() != log_sequence
+                    && let Some(log) = forest.latest_log()
+                {
+                    eprintln!(
+                        "mandala: nix: {}",
+                        nix_build_forest::plain::render_log(log)
+                    );
+                }
                 if event_error.is_none()
                     && let Err(error) = stream_writer.emit(
                         "nixlog",

@@ -577,9 +577,10 @@ impl DeployViewState {
     ) {
         if let Some(tailer) = tailer {
             self.forest = Some(Box::new(tailer.forest.snapshot()));
-            let forest_len = self.forest.as_deref().map_or(0, |snapshot| {
-                nix_build_forest::sort::display_rows(snapshot).len() + 1
-            });
+            let forest_len = self
+                .forest
+                .as_deref()
+                .map_or(0, ForestWidget::activity_line_count);
             self.build_scroll.update_content(forest_len);
             let b = &tailer.build;
             let mut head = format!(
