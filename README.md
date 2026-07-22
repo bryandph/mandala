@@ -62,6 +62,12 @@ secrets schema, a native CLI/TUI deploy engine, and a minimal
 signatures may change without notice; aggregate outputs carry a
 `schemaVersion` so porcelain can keep up.
 
+The native deploy porcelain folds Nix's structured build events into one
+dependency forest shared by the TUI, headless CLI output, and MCP status.
+The build tab renders that state directly; it does not launch `nom` or host a
+terminal emulator, so the same counts, current activity, and failed derivation
+attribution remain available in non-interactive and CI runs.
+
 ## Design
 
 Configs author the inventory; projections flow outward. The engine never

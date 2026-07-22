@@ -1,5 +1,5 @@
 //! The runtime half of the `AppState`/`App` split: terminal, channels,
-//! timers, subprocess/pty handles, and the single `tokio::select!` loop.
+//! timers, subprocess handles, and the single `tokio::select!` loop.
 //!
 //! Loop shape (design decision, herdr-style hand-rolled):
 //! one select over the terminal event stream, the internal channel, and the
@@ -11,7 +11,7 @@
 //! The [`AppState`] transitions stay pure (state.rs / screen.rs); this
 //! module maps keys and settle events onto them and owns everything with a
 //! handle: the background explorer jobs, the task screens' subprocesses, and
-//! the deploy screen's run + nom pane. Screen dismissal continuations are
+//! the deploy screen's run. Screen dismissal continuations are
 //! DATA on the screen states (`ConfirmAction`, `after_mutation`) — the
 //! runtime reads them here, so there is no callback plumbing.
 
@@ -28,7 +28,6 @@ use mandala_core::registry;
 use mandala_core::runner::{DeployRun, ansible_dir};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::layout::Rect;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -40,13 +39,14 @@ use crate::context::{
 use crate::deploy::DeployJob;
 use crate::event::{AppEvent, Deadlines, LoopEvent, TimerId};
 use crate::explorer::{ExplorerConfig, pump_lines, spawn_eval_expected, spawn_load, spawn_survey};
-use crate::render::render;
+use crate::render::render_with_theme;
 use crate::screen::{
     self, AttachedLogState, ConfirmAction, ConfirmState, DeployTab, RebootState, ScreenState,
     TaskState,
 };
 use crate::state::{AppState, ContextRole, LoadRequest, McpFollowUp, Tab};
 use crate::term::TerminalGuard;
+use crate::theme::Theme;
 
 /// How many already-queued INTERNAL events one wake may consume before the
 /// loop gets a chance to render — a flood (subprocess output, activity
@@ -97,6 +97,7 @@ struct TaskJob {
 /// [`AppState`].
 pub struct App {
     pub state: AppState,
+    pub theme: Theme,
     /// Present when the app owns a real terminal; `None` under tests.
     /// Enables ctrl-z suspend-to-shell.
     pub guard: Option<TerminalGuard>,
@@ -123,6 +124,7 @@ impl App {
         let (tx, rx) = mpsc::channel(256);
         Self {
             state,
+            theme: Theme::default(),
             guard: None,
             exit_code: None,
             cfg,
@@ -191,22 +193,9 @@ impl App {
         while !self.quit {
             if self.dirty {
                 let state = &self.state;
-                let deploy = self.deploy.as_ref();
+                let theme = &self.theme;
                 terminal
-                    .draw(|frame| {
-                        render(state, frame);
-                        // The nom pane is runtime state (a pty emulator) —
-                        // the pure render leaves the build tab empty and the
-                        // runtime blits the pane over it.
-                        if let (Some(ScreenState::Deploy(view)), Some(job)) =
-                            (state.screen.as_ref(), deploy)
-                            && view.active == DeployTab::Build
-                            && let Ok(nom) = job.nom.lock()
-                        {
-                            let area = screen::deploy_content_area(frame.area());
-                            frame.render_widget(&*nom, area);
-                        }
-                    })
+                    .draw(|frame| render_with_theme(state, frame, theme))
                     .map_err(io::Error::other)?;
                 self.dirty = false;
             }
@@ -275,14 +264,7 @@ impl App {
             LoopEvent::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 self.on_key(key.code, key.modifiers, terminal).await?;
             }
-            LoopEvent::Term(Event::Resize(width, height)) => {
-                // Propagate a resize to the deploy screen's pty pane.
-                if let Some(job) = self.deploy.as_ref()
-                    && let Ok(mut nom) = job.nom.lock()
-                {
-                    let area = screen::deploy_content_area(Rect::new(0, 0, width, height));
-                    nom.resize(area.height, area.width);
-                }
+            LoopEvent::Term(Event::Resize(_, _)) => {
                 self.dirty = true;
             }
             LoopEvent::Term(_) => {}
@@ -493,7 +475,9 @@ impl App {
 
         if self.state.screen.is_some() {
             let size = terminal.size().map_err(io::Error::other)?;
-            return self.on_screen_key(code, (size.width, size.height)).await;
+            return self
+                .on_screen_key(code, modifiers, (size.width, size.height))
+                .await;
         }
 
         match code {
@@ -596,7 +580,12 @@ impl App {
     /// Keys while a screen is up. Modals are keyboard-driven exactly like
     /// the Python bindings; task/attached/deploy close on esc/q with their
     /// per-screen dismissal semantics.
-    async fn on_screen_key(&mut self, code: KeyCode, size: (u16, u16)) -> io::Result<()> {
+    async fn on_screen_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        size: (u16, u16),
+    ) -> io::Result<()> {
         match self.state.screen.as_mut().expect("screen present") {
             // ConfirmScreen: y confirm, esc/n cancel.
             ScreenState::Confirm(_) => match code {
@@ -693,6 +682,59 @@ impl App {
             // DeployScreen: b/p/s + tab cycling; esc terminates (owned) or
             // detaches (attached), standalone exits the app with the rc.
             ScreenState::Deploy(view) => match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.scroll_up(1, size.1.saturating_sub(5) as usize);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.scroll_down(1);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.scroll_up(
+                            size.1.saturating_sub(5) as usize,
+                            size.1.saturating_sub(5) as usize,
+                        );
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.scroll_down(size.1.saturating_sub(5) as usize);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    let page = size.1.saturating_sub(5) as usize;
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.scroll_up((page / 2).max(1), page);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    let page = size.1.saturating_sub(5) as usize;
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.scroll_down((page / 2).max(1));
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.to_top(size.1.saturating_sub(5) as usize);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if let Some(scroll) = view.active_scroll_mut() {
+                        scroll.to_bottom();
+                        self.dirty = true;
+                    }
+                }
                 KeyCode::Char('b') => {
                     view.active = DeployTab::Build;
                     self.dirty = true;
@@ -728,7 +770,7 @@ impl App {
                         }
                         None => None,
                     };
-                    self.deploy = None; // Drop reaps the nom pane's pty child
+                    self.deploy = None;
                     if view.standalone {
                         // returncode is None if the operator bailed before
                         // it finished (`DeployApp(run).run() or 0`).
@@ -892,8 +934,7 @@ impl App {
 
     /// Push the deploy screen. Owned mode (`attached == false`) starts the
     /// run; attached mode never does (the run was launched elsewhere — this
-    /// only tails it). The nixlog sink is wired BEFORE the first poll so
-    /// nom sees the build from line one. Returns whether the screen pushed
+    /// only tails it). Returns whether the screen pushed
     /// (an owned launch failure surfaces in the status bar instead).
     pub async fn start_deploy(
         &mut self,
@@ -901,11 +942,9 @@ impl App {
         standalone: bool,
         after_mutation: bool,
         attached: bool,
-        size: (u16, u16),
+        _size: (u16, u16),
     ) -> bool {
         let mut job = DeployJob::new(run);
-        let pane = screen::deploy_content_area(Rect::new(0, 0, size.0, size.1));
-        job.spawn_nom(pane.height, pane.width);
         if !attached {
             job.started_at = Some(std::time::Instant::now());
             if let Err(e) = job.run.start().await {
@@ -915,7 +954,6 @@ impl App {
                 return false;
             }
         }
-        job.attach_nixlog_sink();
         let mut view = screen::DeployViewState::new(
             job.run.limit.clone(),
             job.run.dry_activate,
@@ -923,8 +961,8 @@ impl App {
             attached,
             after_mutation,
         );
-        job.tick(&mut view); // first poll AFTER the sink is attached
-        self.state.screen = Some(ScreenState::Deploy(view));
+        job.tick(&mut view);
+        self.state.screen = Some(ScreenState::Deploy(Box::new(view)));
         self.deploy = Some(job);
         self.deadlines
             .arm(TimerId::DeployPoll, Instant::now() + DEPLOY_POLL);
@@ -932,8 +970,8 @@ impl App {
         true
     }
 
-    /// Number of native build records delivered to the active deploy's nom
-    /// sink. Primarily useful to assert attach-before-first-poll ordering.
+    /// Number of structured Nix records accepted by the active deploy's
+    /// native build forest.
     #[must_use]
     pub fn deploy_nixlog_lines_seen(&self) -> usize {
         self.deploy.as_ref().map_or(0, DeployJob::nixlog_lines_seen)

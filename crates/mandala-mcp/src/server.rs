@@ -902,6 +902,7 @@ fn run_snapshot(obs: &mut ObservedRun) -> Value {
         hosts.insert(name.clone(), entry);
     }
     let b = obs.tailer.build.clone();
+    let forest = obs.tailer.forest.snapshot();
     let liveness = obs.liveness();
     // A coarse phase so an early snapshot doesn't read as stalled: the
     // The native engine batch-builds every selected profile first (no host
@@ -927,6 +928,7 @@ fn run_snapshot(obs: &mut ObservedRun) -> Value {
             "errors": b.errors,
             "done": b.done,
             "rc": b.rc,
+            "forest": forest,
         },
     })
 }
@@ -991,6 +993,10 @@ mod tests {
 
     fn normalize_emitter_fields(snapshot: &mut Value) {
         snapshot.as_object_mut().unwrap().remove("run_id");
+        snapshot["build"]["forest"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elapsed_ms");
         let meta = snapshot["meta"].as_object_mut().unwrap();
         for field in [
             "run_id",
@@ -1065,6 +1071,10 @@ mod tests {
         assert_eq!(engine_snapshot, ansible_snapshot);
         assert_eq!(engine_snapshot["liveness"], "rolled-back");
         assert_eq!(engine_snapshot["phase"], "done");
+        assert_eq!(engine_snapshot["build"]["forest"]["version"], 1);
+        assert!(engine_snapshot["build"]["forest"]["counts"].is_object());
+        assert!(engine_snapshot["build"]["forest"]["failed_derivations"].is_array());
+        assert!(engine_snapshot["build"]["forest"]["current_activity"].is_array());
         assert_eq!(engine_snapshot["hosts"]["alpha"]["state"], "confirmed");
         assert_eq!(engine_snapshot["hosts"]["beta"]["state"], "rolled-back");
         assert_eq!(

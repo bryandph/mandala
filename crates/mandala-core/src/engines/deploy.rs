@@ -691,8 +691,9 @@ fn build_profiles_with(
     });
     let stderr = child.stderr.take().expect("piped stderr");
     let stream_writer = Arc::clone(&writer);
-    let stderr_task = std::thread::spawn(move || -> (BuildTracker, Option<io::Error>) {
+    let stderr_task = std::thread::spawn(move || -> (BuildTracker, nix_build_forest::BuildForest, Option<io::Error>) {
         let mut tracker = BuildTracker::default();
+        let mut forest = nix_build_forest::BuildForest::new();
         let mut event_error = None;
         for line in BufReader::new(stderr).lines() {
             let line = match line {
@@ -703,6 +704,7 @@ fn build_profiles_with(
                 }
             };
             if line.starts_with(NIX_JSON_PREFIX) {
+                forest.feed_line(&line);
                 if event_error.is_none()
                     && let Err(error) = stream_writer.emit(
                         "nixlog",
@@ -712,6 +714,12 @@ fn build_profiles_with(
                     event_error = Some(error);
                 }
                 let changed = tracker.feed(&line);
+                if changed {
+                    eprintln!(
+                        "mandala: {}",
+                        nix_build_forest::plain::render_live(&forest.snapshot())
+                    );
+                }
                 if changed
                     && event_error.is_none()
                     && let Err(error) = stream_writer.emit("progress", tracker.fields())
@@ -730,7 +738,16 @@ fn build_profiles_with(
                 }
             }
         }
-        (tracker, event_error)
+        // Graph I/O stays off the process/UI event path. A final recursive
+        // backfill makes the no-TTY summary and persisted snapshot aware of
+        // derivations Nix did not build because they were already valid.
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            runtime.block_on(forest.resolve_pending(&nix_build_forest::FsDrvReader));
+        }
+        (tracker, forest, event_error)
     });
 
     let status = child.wait()?;
@@ -740,7 +757,7 @@ fn build_profiles_with(
     for line in stdout_lines.into_iter().filter(|line| !line.is_empty()) {
         eprintln!("mandala: nix: {line}");
     }
-    let (tracker, event_error) = stderr_task
+    let (tracker, forest, event_error) = stderr_task
         .join()
         .map_err(|_| io::Error::other("nix stderr reader panicked"))?;
     for message in &tracker.error_messages {
@@ -770,6 +787,10 @@ fn build_profiles_with(
     eprintln!(
         "mandala: build: done rc={rc} built={} fetched={} errors={}",
         tracker.built, tracker.fetched, tracker.errors
+    );
+    eprintln!(
+        "mandala: {}",
+        nix_build_forest::plain::render_final(&forest.snapshot())
     );
 
     match outcome {
@@ -1391,6 +1412,7 @@ printf '%s\n' '@nix {{"action":"start","id":7,"type":105,"fields":["/nix/store/0
 printf '%s\n' 'warning: stub diagnostic' >&2
 printf '%s\n' '@nix {{"action":"stop","id":7}}' >&2
 if [ {} -ne 0 ]; then
+  printf '%s\n' '@nix {{"action":"msg","level":0,"raw_msg":"Cannot build /nix/store/0123456789abcdfghijklmnpqrsvwxyz-profile.drv because the builder failed"}}' >&2
   exit {}
 fi
 out_link=
@@ -2060,6 +2082,12 @@ exit 0
         tailer.poll();
         assert!(tailer.build.done);
         assert_eq!(tailer.build.rc, Some(23));
+        let snapshot = tailer.forest.snapshot();
+        assert_eq!(snapshot.counts.failed, 1);
+        assert_eq!(snapshot.failed_derivations, ["profile"]);
+        let summary = nix_build_forest::plain::render_final(&snapshot);
+        assert!(summary.contains("1 failed"));
+        assert!(summary.contains("failed: profile"));
         assert!(run.plan.targets.iter().all(|host| {
             !profile_link(
                 &run.path.join("profile"),

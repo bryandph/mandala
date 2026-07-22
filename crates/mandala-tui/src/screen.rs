@@ -18,10 +18,11 @@
 //! Subprocess/pty handles never appear here — they live in `app.rs` /
 //! `deploy.rs` (the strict `AppState`/`App` split).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use mandala_core::registry::{self, RunLiveness};
 use mandala_core::runner::{COMMAND_LOG, EventTailer, HostState};
+use nix_build_forest::{ForestSnapshot, ForestWidget};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -29,7 +30,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::ansi;
+#[cfg(test)]
 use crate::render::rich_style;
+use crate::scroll::ScrollState;
+use crate::theme::Theme;
 
 /// Scrollback kept by the task/attached log screens (Python
 /// `deque(maxlen=8000)` / `RichLog(max_lines=8000)`).
@@ -64,7 +68,7 @@ pub enum ScreenState {
     /// Full screen: read-only tail of a registered run's `output.log`.
     AttachedLog(AttachedLogState),
     /// Full screen: the deploy runner.
-    Deploy(DeployViewState),
+    Deploy(Box<DeployViewState>),
 }
 
 // ==== ConfirmScreen ==========================================================
@@ -253,6 +257,7 @@ pub struct TaskState {
     /// lines must not leak into a newer one.
     pub task_id: u64,
     pub lines: VecDeque<String>,
+    pub scroll: ScrollState,
     /// The exit code once the subprocess settled; `None` while running or
     /// when the launch failed — exactly the dismissal payload (`None` = no
     /// completed run = no drift refresh).
@@ -271,6 +276,7 @@ impl TaskState {
             title: title.into(),
             task_id,
             lines: VecDeque::new(),
+            scroll: ScrollState::default(),
             rc: None,
             launched: false,
             after_mutation,
@@ -279,6 +285,7 @@ impl TaskState {
 
     pub fn push_line(&mut self, line: String) {
         push_capped(&mut self.lines, line, SCROLLBACK_MAX);
+        self.scroll.update_content(self.lines.len());
     }
 
     /// The subprocess settled: record the rc and append the exit trailer.
@@ -307,6 +314,7 @@ pub struct AttachedLogState {
     pub run_id: String,
     pub offset: u64,
     pub lines: VecDeque<LogLine>,
+    pub scroll: ScrollState,
     pub settled: bool,
     pub after_mutation: bool,
 }
@@ -319,6 +327,7 @@ impl AttachedLogState {
             run_id: run_id.into(),
             offset: 0,
             lines: VecDeque::new(),
+            scroll: ScrollState::default(),
             settled: false,
             after_mutation,
         }
@@ -340,6 +349,7 @@ pub fn attached_pump(state: &mut AttachedLogState) {
                 },
                 SCROLLBACK_MAX,
             );
+            state.scroll.update_content(state.lines.len());
         }
         return;
     };
@@ -368,6 +378,7 @@ pub fn attached_pump(state: &mut AttachedLogState) {
             SCROLLBACK_MAX,
         );
     }
+    state.scroll.update_content(state.lines.len());
 }
 
 /// The esc payload (the Python `action_close`): an observer never terminates
@@ -422,12 +433,7 @@ pub fn host_state_style_spec(state: HostState) -> &'static str {
 /// is covered by `rich_style`, gated by the exhaustiveness test).
 #[must_use]
 pub fn host_state_style(state: HostState) -> Style {
-    rich_style(host_state_style_spec(state)).unwrap_or_else(|| {
-        panic!(
-            "unmapped host-state style {:?}",
-            host_state_style_spec(state)
-        )
-    })
+    Theme::default().host_state(state)
 }
 
 /// The `_STATE_GLYPH` table verbatim.
@@ -449,7 +455,7 @@ pub fn host_state_glyph(state: HostState) -> &'static str {
 /// The deploy screen's tab identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployTab {
-    /// The nom build pane (`⚙ build`).
+    /// The native build-forest pane (`⚙ build`).
     Build,
     /// The playbook's own stdout/stderr mirror (`ansible`).
     Playbook,
@@ -502,9 +508,13 @@ pub struct DeployViewState {
     pub after_mutation: bool,
     pub active: DeployTab,
     pub build_line: String,
+    pub forest: Option<Box<ForestSnapshot>>,
+    pub build_scroll: ScrollState,
     pub playbook_lines: Vec<String>,
+    pub playbook_scroll: ScrollState,
     /// Sorted by name (the tailer's BTreeMap order).
     pub hosts: Vec<HostTabState>,
+    pub host_scrolls: BTreeMap<String, ScrollState>,
     pub finished: bool,
     pub returncode: Option<i64>,
     pub summary: Option<SummaryState>,
@@ -527,8 +537,12 @@ impl DeployViewState {
             after_mutation,
             active: DeployTab::Build,
             build_line: String::new(),
+            forest: None,
+            build_scroll: ScrollState::default(),
             playbook_lines: Vec::new(),
+            playbook_scroll: ScrollState::default(),
             hosts: Vec::new(),
+            host_scrolls: BTreeMap::new(),
             finished: false,
             returncode: None,
             summary: None,
@@ -562,6 +576,11 @@ impl DeployViewState {
         elapsed_secs: u64,
     ) {
         if let Some(tailer) = tailer {
+            self.forest = Some(Box::new(tailer.forest.snapshot()));
+            let forest_len = self.forest.as_deref().map_or(0, |snapshot| {
+                nix_build_forest::sort::display_rows(snapshot).len() + 1
+            });
+            self.build_scroll.update_content(forest_len);
             let b = &tailer.build;
             let mut head = format!(
                 "batch build  built {}/{}  fetched {}/{}  errors {}",
@@ -583,13 +602,30 @@ impl DeployViewState {
                     lines: h.lines.iter().cloned().collect(),
                 })
                 .collect();
+            for host in &self.hosts {
+                self.host_scrolls
+                    .entry(host.name.clone())
+                    .or_default()
+                    .update_content(host.lines.len());
+            }
         }
         self.playbook_lines = output.to_vec();
+        self.playbook_scroll
+            .update_content(self.playbook_lines.len());
         if finished && !self.finished {
             self.finished = true;
             self.returncode = returncode;
             self.summary = Some(self.make_summary(tailer, elapsed_secs));
             self.active = DeployTab::Summary;
+        }
+    }
+
+    pub fn active_scroll_mut(&mut self) -> Option<&mut ScrollState> {
+        match &self.active {
+            DeployTab::Build => Some(&mut self.build_scroll),
+            DeployTab::Playbook => Some(&mut self.playbook_scroll),
+            DeployTab::Host(name) => self.host_scrolls.get_mut(name),
+            DeployTab::Summary => None,
         }
     }
 
@@ -685,24 +721,27 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Render a modal box (bordered, cleared background) with its text lines.
-fn render_modal(frame: &mut Frame, lines: Vec<Line<'static>>, width: u16) {
+fn render_modal(frame: &mut Frame, lines: Vec<Line<'static>>, width: u16, theme: &Theme) {
     let area = frame.area();
     // +2 borders; width capped at 90% of the screen (the CSS max-width).
     let box_w = width.min(area.width * 9 / 10);
     let box_h = (lines.len() as u16 + 2).min(area.height);
     let rect = centered(area, box_w, box_h);
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(lines).block(Block::bordered()), rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_style(theme.modal)),
+        rect,
+    );
 }
 
 /// The confirm modal over whatever is behind it.
-pub fn render_confirm(state: &ConfirmState, frame: &mut Frame) {
-    render_modal(frame, confirm_lines(state), 70);
+pub fn render_confirm(state: &ConfirmState, frame: &mut Frame, theme: &Theme) {
+    render_modal(frame, confirm_lines(state), 70, theme);
 }
 
 /// The reboot options modal.
-pub fn render_reboot(state: &RebootState, frame: &mut Frame) {
-    render_modal(frame, reboot_lines(state), 76);
+pub fn render_reboot(state: &RebootState, frame: &mut Frame, theme: &Theme) {
+    render_modal(frame, reboot_lines(state), 76, theme);
 }
 
 /// Full-screen layout for the task/attached screens: header, log, footer.
@@ -715,37 +754,22 @@ fn screen_chrome(area: Rect) -> [Rect; 3] {
     .areas(area)
 }
 
-fn render_header(frame: &mut Frame, area: Rect, title: &str, sub: &str) {
-    let mut spans = vec![Span::styled(
-        format!("mandala — {title}"),
-        Style::new().add_modifier(Modifier::BOLD),
-    )];
+fn render_header(frame: &mut Frame, area: Rect, title: &str, sub: &str, theme: &Theme) {
+    let mut spans = vec![Span::styled(format!("mandala — {title}"), theme.header)];
     if !sub.is_empty() {
-        spans.push(Span::styled(
-            format!("   {sub}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled(format!("   {sub}"), theme.footer_label));
     }
     frame.render_widget(Line::from(spans), area);
 }
 
-fn render_footer_hint(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
+fn render_footer_hint(frame: &mut Frame, area: Rect, hints: &[(&str, &str)], theme: &Theme) {
     let mut spans = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(
-                "  ·  ",
-                Style::new().add_modifier(Modifier::DIM),
-            ));
+            spans.push(Span::styled("  ·  ", theme.footer_label));
         }
-        spans.push(Span::styled(
-            (*key).to_string(),
-            Style::new().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled((*key).to_string(), theme.footer_key));
+        spans.push(Span::styled(format!(" {label}"), theme.footer_label));
     }
     frame.render_widget(Line::from(spans), area);
 }
@@ -755,55 +779,66 @@ fn render_log_tail<'a>(
     frame: &mut Frame,
     area: Rect,
     lines: impl ExactSizeIterator<Item = &'a str>,
+    scroll: &ScrollState,
 ) {
     let height = area.height as usize;
-    let skip = lines.len().saturating_sub(height);
-    let visible: Vec<Line> = lines.skip(skip).map(ansi::to_line).collect();
+    let range = scroll.visible_range(height);
+    let visible: Vec<Line> = lines
+        .skip(range.start)
+        .take(range.len())
+        .map(ansi::to_line)
+        .collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
 
 /// The task screen: title, streamed log tail, close hint.
-pub fn render_task(state: &TaskState, frame: &mut Frame) {
+pub fn render_task(state: &TaskState, frame: &mut Frame, theme: &Theme) {
     let [header, log, footer] = screen_chrome(frame.area());
-    render_header(frame, header, &state.title, "");
-    render_log_tail(frame, log, state.lines.iter().map(String::as_str));
-    render_footer_hint(frame, footer, &[("esc", "back (terminates if running)")]);
+    render_header(frame, header, &state.title, "", theme);
+    render_log_tail(
+        frame,
+        log,
+        state.lines.iter().map(String::as_str),
+        &state.scroll,
+    );
+    render_footer_hint(
+        frame,
+        footer,
+        &[("esc", "back (terminates if running)")],
+        theme,
+    );
 }
 
 /// The attached-log screen: title, tailed log + liveness notices, detach
 /// hint (an observer never terminates the run).
-pub fn render_attached(state: &AttachedLogState, frame: &mut Frame) {
+pub fn render_attached(state: &AttachedLogState, frame: &mut Frame, theme: &Theme) {
     let [header, log, footer] = screen_chrome(frame.area());
-    render_header(frame, header, &state.title, "");
-    let height = log.height as usize;
-    let skip = state.lines.len().saturating_sub(height);
+    render_header(frame, header, &state.title, "", theme);
+    let range = state.scroll.visible_range(log.height as usize);
     let visible: Vec<Line> = state
         .lines
         .iter()
-        .skip(skip)
+        .skip(range.start)
+        .take(range.len())
         .map(|l| match l {
             LogLine::Raw(s) => ansi::to_line(s),
             LogLine::Notice { text, error } => {
                 let style = if *error {
-                    Style::new()
-                        .fg(ratatui::style::Color::Red)
-                        .add_modifier(Modifier::BOLD)
+                    theme.status_error
                 } else {
-                    Style::new()
-                        .fg(ratatui::style::Color::Green)
-                        .add_modifier(Modifier::BOLD)
+                    theme
+                        .rich_style("bold green")
+                        .expect("default theme maps green")
                 };
                 Line::from(Span::styled(text.clone(), style))
             }
         })
         .collect();
     frame.render_widget(Paragraph::new(visible), log);
-    render_footer_hint(frame, footer, &[("esc", "detach (run keeps going)")]);
+    render_footer_hint(frame, footer, &[("esc", "detach (run keeps going)")], theme);
 }
 
-/// The deploy screen's frame shape. Public so the runtime can blit the nom
-/// pane into the CONTENT area (the pty widget is runtime state — the pure
-/// render leaves the build tab's area empty).
+/// The deploy screen's content area.
 #[must_use]
 pub fn deploy_content_area(area: Rect) -> Rect {
     deploy_areas(area)[3]
@@ -823,7 +858,7 @@ fn deploy_areas(area: Rect) -> [Rect; 6] {
 }
 
 /// One deploy tab's bar label (`<glyph> <name>` styled by state for hosts).
-fn deploy_tab_label(view: &DeployViewState, tab: &DeployTab) -> Span<'static> {
+fn deploy_tab_label(view: &DeployViewState, tab: &DeployTab, theme: &Theme) -> Span<'static> {
     match tab {
         DeployTab::Build => Span::raw("⚙ build"),
         DeployTab::Playbook => Span::raw("ansible"),
@@ -836,16 +871,16 @@ fn deploy_tab_label(view: &DeployViewState, tab: &DeployTab) -> Span<'static> {
                 .map_or(HostState::Pending, |h| h.state);
             Span::styled(
                 format!("{} {name}", host_state_glyph(state)),
-                host_state_style(state),
+                theme.host_state(state),
             )
         }
     }
 }
 
-/// The full deploy screen (minus the nom pane, blitted by the runtime).
-pub fn render_deploy(view: &DeployViewState, frame: &mut Frame) {
+/// The full deploy screen, including the pure native build-forest widget.
+pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
     let [header, build, tab_bar, content, recap, footer] = deploy_areas(frame.area());
-    render_header(frame, header, "deploy runner", &view.sub_title());
+    render_header(frame, header, "deploy runner", &view.sub_title(), theme);
     frame.render_widget(Line::from(view.build_line.clone()), build);
 
     // Tab bar: active reversed on top of the label's own style.
@@ -854,7 +889,7 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame) {
         if i > 0 {
             spans.push(Span::raw("│"));
         }
-        let mut label = deploy_tab_label(view, &tab);
+        let mut label = deploy_tab_label(view, &tab, theme);
         label.content = format!(" {} ", label.content).into();
         if tab == view.active {
             label.style = label
@@ -868,22 +903,43 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame) {
     frame.render_widget(Line::from(spans), tab_bar);
 
     match &view.active {
-        DeployTab::Build => {} // the runtime blits the nom pane here
+        DeployTab::Build => {
+            if let Some(snapshot) = &view.forest {
+                frame.render_widget(
+                    ForestWidget::new(snapshot)
+                        .styles(theme.forest())
+                        .scroll(view.build_scroll.top_offset(content.height as usize)),
+                    content,
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new("waiting for Nix build activity…").style(theme.footer_label),
+                    content,
+                );
+            }
+        }
         DeployTab::Playbook => {
             render_log_tail(
                 frame,
                 content,
                 view.playbook_lines.iter().map(String::as_str),
+                &view.playbook_scroll,
             );
         }
         DeployTab::Host(name) => {
             if let Some(host) = view.hosts.iter().find(|h| h.name == *name) {
-                render_log_tail(frame, content, host.lines.iter().map(String::as_str));
+                let scroll = view.host_scrolls.get(name).copied().unwrap_or_default();
+                render_log_tail(
+                    frame,
+                    content,
+                    host.lines.iter().map(String::as_str),
+                    &scroll,
+                );
             }
         }
         DeployTab::Summary => {
             if let Some(summary) = &view.summary {
-                render_summary(summary, frame, content);
+                render_summary(summary, frame, content, theme);
             }
         }
     }
@@ -891,10 +947,7 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame) {
     // Recap strip: glyph name:state per host, waiting notice when none.
     let mut recap_spans = Vec::new();
     if view.hosts.is_empty() {
-        recap_spans.push(Span::styled(
-            "waiting for host events…",
-            Style::new().add_modifier(Modifier::DIM),
-        ));
+        recap_spans.push(Span::styled("waiting for host events…", theme.footer_label));
     }
     for host in &view.hosts {
         recap_spans.push(Span::styled(
@@ -904,7 +957,7 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame) {
                 host.name,
                 host.state.as_str()
             ),
-            host_state_style(host.state),
+            theme.host_state(host.state),
         ));
     }
     frame.render_widget(Line::from(recap_spans), recap);
@@ -918,30 +971,29 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame) {
         frame,
         footer,
         &[
-            ("b", "nom build tab"),
+            ("b", "build forest tab"),
             ("p", "playbook output tab"),
             ("s", "summary tab"),
             ("tab", "cycle tabs"),
             esc_hint,
         ],
+        theme,
     );
 }
 
 /// The summary tab body: head + build line, host table, PLAY RECAP verbatim.
-fn render_summary(summary: &SummaryState, frame: &mut Frame, area: Rect) {
+fn render_summary(summary: &SummaryState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let head_style = if summary.ok {
-        Style::new()
-            .fg(ratatui::style::Color::Green)
-            .add_modifier(Modifier::BOLD)
+        theme
+            .rich_style("bold green")
+            .expect("default theme maps green")
     } else {
-        Style::new()
-            .fg(ratatui::style::Color::Red)
-            .add_modifier(Modifier::BOLD)
+        theme.status_error
     };
     let build_style = if summary.build_bad {
-        Style::new().fg(ratatui::style::Color::Red)
+        theme.status_error
     } else {
-        Style::new().add_modifier(Modifier::DIM)
+        theme.footer_label
     };
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
@@ -959,7 +1011,7 @@ fn render_summary(summary: &SummaryState, frame: &mut Frame, area: Rect) {
         )),
     ];
     for (name, state, rc) in &summary.hosts {
-        let style = host_state_style(*state);
+        let style = theme.host_state(*state);
         lines.push(Line::from(Span::styled(
             format!(
                 "{:<24} {:<12} {:>4}",

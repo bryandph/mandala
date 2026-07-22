@@ -18,6 +18,7 @@ use mandala_core::inventory::Inventory;
 use serde_json::Value;
 
 use crate::screen::ScreenState;
+use crate::scroll::ScrollState;
 use crate::select::SelectTable;
 
 /// Retained settled-call lines in the mcp activity log (the Python RichLog
@@ -250,6 +251,7 @@ pub struct AppState {
     /// [`MCP_LOG_MAX`]. Recorded flag-independently (cheap), rendered only
     /// under `debug_mcp`.
     pub mcp_log: VecDeque<McpLogEntry>,
+    pub mcp_scroll: ScrollState,
     /// This session's role in the fleet context (`None` = no context — the
     /// local-eval fallback shape).
     pub context_role: Option<ContextRole>,
@@ -309,6 +311,7 @@ impl AppState {
             mcp_panel: true,
             mcp_pending: BTreeMap::new(),
             mcp_log: VecDeque::new(),
+            mcp_scroll: ScrollState::default(),
             context_role: None,
             mcp_client: None,
             attached_runs: BTreeSet::new(),
@@ -808,6 +811,7 @@ impl AppState {
         while self.mcp_log.len() > MCP_LOG_MAX {
             self.mcp_log.pop_front();
         }
+        self.mcp_scroll.update_content(self.mcp_log.len());
         if !ok {
             return None;
         }

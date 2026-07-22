@@ -25,6 +25,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::select::{SelectTable, view_offset};
 use crate::state::{AppState, ContextRole, McpLogEntry, McpPending, SPINNER_FRAMES, Tab};
+use crate::theme::Theme;
 
 /// The docked activity panel's width (the Python `#mcp-panel { width: 52 }`).
 pub const MCP_PANEL_WIDTH: u16 = 52;
@@ -37,22 +38,7 @@ pub const MCP_PANEL_WIDTH: u16 = 52;
 /// a new token in the core vocabulary) cannot ship unstyled.
 #[must_use]
 pub fn rich_style(spec: &str) -> Option<Style> {
-    let mut style = Style::new();
-    for token in spec.split_whitespace() {
-        style = match token {
-            "bold" => style.add_modifier(Modifier::BOLD),
-            "dim" => style.add_modifier(Modifier::DIM),
-            "green" => style.fg(Color::Green),
-            "red" => style.fg(Color::Red),
-            "yellow" => style.fg(Color::Yellow),
-            "magenta" => style.fg(Color::Magenta),
-            // The deploy tier's `_STATE_STYLE` vocabulary (screen.rs).
-            "cyan" => style.fg(Color::Cyan),
-            "blue" => style.fg(Color::Blue),
-            _ => return None,
-        };
-    }
-    Some(style)
+    Theme::default().rich_style(spec)
 }
 
 /// The drift-status style, from the core's one vocabulary. The panic is
@@ -60,26 +46,29 @@ pub fn rich_style(spec: &str) -> Option<Style> {
 /// a status cannot ship unstyled.
 #[must_use]
 pub fn drift_status_style(status: DriftStatus) -> Style {
-    rich_style(status.style())
-        .unwrap_or_else(|| panic!("unmapped style token in {:?}", status.style()))
+    Theme::default().drift_status(status)
 }
 
 /// The selection-marker cell style (`select_table.py`'s `_MARK`).
 #[must_use]
 pub fn marker_style() -> Style {
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Theme::default().selection
 }
 
 /// Status-line style: a sticky error is loud, a running spinner line is
 /// live, a resting message is plain.
 #[must_use]
 pub fn status_line_style(state: &AppState) -> Style {
+    status_line_style_with_theme(state, &Theme::default())
+}
+
+fn status_line_style_with_theme(state: &AppState, theme: &Theme) -> Style {
     if state.status_sticky && !state.any_job_running() {
-        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        theme.status_error
     } else if state.any_job_running() {
-        Style::new().fg(Color::Cyan)
+        theme.status_live
     } else {
-        Style::new()
+        theme.status
     }
 }
 
@@ -112,6 +101,10 @@ pub fn footer_hints(state: &AppState) -> Vec<(&'static str, &'static str)> {
 /// (task/attached/deploy) replace the whole frame, exactly like the Python
 /// pushed screens covered the dock.
 pub fn render(state: &AppState, frame: &mut Frame) {
+    render_with_theme(state, frame, &Theme::default());
+}
+
+pub fn render_with_theme(state: &AppState, frame: &mut Frame, theme: &Theme) {
     use crate::screen::{self, ScreenState};
     let explorer_tier = matches!(
         state.screen,
@@ -121,24 +114,24 @@ pub fn render(state: &AppState, frame: &mut Frame) {
         let [main, panel] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(MCP_PANEL_WIDTH)])
                 .areas(frame.area());
-        render_mcp_panel(state, frame, panel);
+        render_mcp_panel(state, frame, panel, theme);
         main
     } else {
         frame.area()
     };
     match &state.screen {
-        None => render_explorer(state, frame, area),
+        None => render_explorer(state, frame, area, theme),
         Some(ScreenState::Confirm(confirm)) => {
-            render_explorer(state, frame, area);
-            screen::render_confirm(confirm, frame);
+            render_explorer(state, frame, area, theme);
+            screen::render_confirm(confirm, frame, theme);
         }
         Some(ScreenState::Reboot(reboot)) => {
-            render_explorer(state, frame, area);
-            screen::render_reboot(reboot, frame);
+            render_explorer(state, frame, area, theme);
+            screen::render_reboot(reboot, frame, theme);
         }
-        Some(ScreenState::Task(task)) => screen::render_task(task, frame),
-        Some(ScreenState::AttachedLog(attached)) => screen::render_attached(attached, frame),
-        Some(ScreenState::Deploy(deploy)) => screen::render_deploy(deploy, frame),
+        Some(ScreenState::Task(task)) => screen::render_task(task, frame, theme),
+        Some(ScreenState::AttachedLog(attached)) => screen::render_attached(attached, frame, theme),
+        Some(ScreenState::Deploy(deploy)) => screen::render_deploy(deploy, frame, theme),
     }
 }
 
@@ -154,7 +147,7 @@ pub fn role_indicator(state: &AppState) -> Option<&'static str> {
 }
 
 /// The explorer view: header, tab bar, active view, status line, footer.
-fn render_explorer(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_explorer(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let [header, tabs, view, status, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -165,62 +158,55 @@ fn render_explorer(state: &AppState, frame: &mut Frame, area: Rect) {
     .areas(area);
 
     frame.render_widget(
-        Line::from(Span::styled(
-            "mandala — fleet",
-            Style::new().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled("mandala — fleet", theme.header)),
         header,
     );
     if let Some(role) = role_indicator(state) {
         frame.render_widget(
-            Line::from(Span::styled(role, Style::new().add_modifier(Modifier::DIM)))
-                .right_aligned(),
+            Line::from(Span::styled(role, theme.footer_label)).right_aligned(),
             header,
         );
     }
-    render_tab_bar(state, frame, tabs);
+    render_tab_bar(state, frame, tabs, theme);
     match state.tab {
-        Tab::Members => render_members(state, frame, view),
-        Tab::Groups => render_groups(state, frame, view),
-        Tab::Drift => render_drift(state, frame, view),
+        Tab::Members => render_members(state, frame, view, theme),
+        Tab::Groups => render_groups(state, frame, view, theme),
+        Tab::Drift => render_drift(state, frame, view, theme),
     }
     frame.render_widget(
-        Line::from(Span::styled(state.status_line(), status_line_style(state))),
+        Line::from(Span::styled(
+            state.status_line(),
+            status_line_style_with_theme(state, theme),
+        )),
         status,
     );
-    render_footer(state, frame, footer);
+    render_footer(state, frame, footer, theme);
 }
 
-fn render_tab_bar(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_tab_bar(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let mut spans = Vec::new();
     for (i, tab) in Tab::ALL.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("│"));
         }
         let style = if tab == state.tab {
-            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            theme.focused_chrome.add_modifier(Modifier::REVERSED)
         } else {
-            Style::new().add_modifier(Modifier::DIM)
+            theme.chrome
         };
         spans.push(Span::styled(format!(" {} ", tab.title()), style));
     }
     frame.render_widget(Line::from(spans), area);
 }
 
-fn render_footer(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_footer(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let mut spans = Vec::new();
     for (i, (key, label)) in footer_hints(state).into_iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(
-                "  ·  ",
-                Style::new().add_modifier(Modifier::DIM),
-            ));
+            spans.push(Span::styled("  ·  ", theme.footer_label));
         }
-        spans.push(Span::styled(key, Style::new().add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled(key, theme.footer_key));
+        spans.push(Span::styled(format!(" {label}"), theme.footer_label));
     }
     frame.render_widget(Line::from(spans), area);
 }
@@ -287,10 +273,10 @@ pub fn mcp_pending_line(pending: &McpPending, frame_char: char) -> Line<'static>
 /// The `--debug-mcp` activity panel (docked right): the settled-call log
 /// with the pending strip at the bottom — one spinner line per in-flight
 /// call, collapsing entirely when nothing is running.
-fn render_mcp_panel(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_mcp_panel(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let block = Block::new()
         .borders(Borders::LEFT)
-        .border_style(Style::new().add_modifier(Modifier::DIM));
+        .border_style(theme.chrome);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -302,19 +288,16 @@ fn render_mcp_panel(state: &AppState, frame: &mut Frame, area: Rect) {
     let [log_area, strip_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(strip_h)]).areas(inner);
 
-    let mut lines = vec![Line::from(Span::styled(
-        "mcp activity",
-        Style::new().add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines = vec![Line::from(Span::styled("mcp activity", theme.header))];
     if state.mcp_log.is_empty() {
         lines.push(Line::from(Span::styled(
             "watching for tool calls…",
-            Style::new().add_modifier(Modifier::DIM),
+            theme.footer_label,
         )));
     }
     let avail = (log_area.height as usize).saturating_sub(lines.len());
-    let start = state.mcp_log.len().saturating_sub(avail);
-    for entry in state.mcp_log.iter().skip(start) {
+    let range = state.mcp_scroll.visible_range(avail);
+    for entry in state.mcp_log.iter().skip(range.start).take(range.len()) {
         lines.push(mcp_log_line(entry));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), log_area);
@@ -323,7 +306,7 @@ fn render_mcp_panel(state: &AppState, frame: &mut Frame, area: Rect) {
         let frame_char = SPINNER_FRAMES[state.spin % SPINNER_FRAMES.len()];
         let mut strip = vec![Line::from(Span::styled(
             "─".repeat(strip_area.width as usize),
-            Style::new().add_modifier(Modifier::DIM),
+            theme.chrome,
         ))];
         for pending in state.mcp_pending.values() {
             strip.push(mcp_pending_line(pending, frame_char));
@@ -342,6 +325,7 @@ fn render_select_table(
     header: &[&'static str],
     widths: &[Constraint],
     rows: Vec<(String, Vec<Cell<'_>>)>,
+    theme: &Theme,
 ) {
     let height = area.height.saturating_sub(1) as usize; // header row
     let offset = view_offset(table.cursor(), height);
@@ -352,7 +336,7 @@ fn render_select_table(
             .take(height)
             .map(|(i, (name, cells))| {
                 let marker = if table.is_selected(&name) {
-                    Cell::from(Span::styled("●", marker_style()))
+                    Cell::from(Span::styled("●", theme.selection))
                 } else {
                     Cell::from(" ")
                 };
@@ -373,7 +357,7 @@ fn render_select_table(
     frame.render_widget(widget, area);
 }
 
-fn render_members(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_members(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let rows = state
         .member_rows
         .iter()
@@ -409,10 +393,11 @@ fn render_members(state: &AppState, frame: &mut Frame, area: Rect) {
             Constraint::Length(3),
         ],
         rows,
+        theme,
     );
 }
 
-fn render_groups(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_groups(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let rows = state
         .group_rows
         .iter()
@@ -438,10 +423,11 @@ fn render_groups(state: &AppState, frame: &mut Frame, area: Rect) {
             Constraint::Fill(1),
         ],
         rows,
+        theme,
     );
 }
 
-fn render_drift(state: &AppState, frame: &mut Frame, area: Rect) {
+fn render_drift(state: &AppState, frame: &mut Frame, area: Rect, theme: &Theme) {
     let [table_area, hint_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     let rows = state
@@ -454,7 +440,7 @@ fn render_drift(state: &AppState, frame: &mut Frame, area: Rect) {
                     Cell::from(r.name.clone()),
                     Cell::from(Span::styled(
                         r.status.as_str(),
-                        drift_status_style(r.status),
+                        theme.drift_status(r.status),
                     )),
                     Cell::from(r.current.clone()),
                     Cell::from(r.expected.clone()),
@@ -480,12 +466,10 @@ fn render_drift(state: &AppState, frame: &mut Frame, area: Rect) {
             Constraint::Length(19),
         ],
         rows,
+        theme,
     );
     frame.render_widget(
-        Line::from(Span::styled(
-            state.drift_hint.clone(),
-            Style::new().add_modifier(Modifier::DIM),
-        )),
+        Line::from(Span::styled(state.drift_hint.clone(), theme.footer_label)),
         hint_area,
     );
 }

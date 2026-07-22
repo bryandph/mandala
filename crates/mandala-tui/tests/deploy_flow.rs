@@ -170,7 +170,7 @@ fn milestones(host: &str, names: &[&str]) -> Vec<Value> {
 
 /// The confirm-gated launch streams the run's own event files back into the
 /// screen: the native stub writes build + milestone JSONL into its own
-/// registry run and the 250ms poll surfaces them as nom input + a host tab.
+/// registry run and the 250ms poll surfaces them as forest input + a host tab.
 #[tokio::test]
 async fn owned_deploy_launches_and_renders_events_live() {
     registry_env();
@@ -200,7 +200,7 @@ async fn owned_deploy_launches_and_renders_events_live() {
     assert_eq!(
         app.deploy_nixlog_lines_seen(),
         1,
-        "build record emitted before attach must reach nom's sink"
+        "build record emitted before attach must reach the native forest"
     );
     // The engine-output mirror leads with the argv header.
     assert!(view.playbook_lines[0].starts_with("$ sh -c "));

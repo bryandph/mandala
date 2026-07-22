@@ -36,7 +36,7 @@ use crate::term::{TerminalGuard, install_panic_hook};
 
 /// What the runtime needs beyond state: the contract to read and the
 /// action-tier launch lines. Tests override the argv seams with `sh -c`
-/// stubs — never a live fleet, never real ansible/nix/nom.
+/// stubs — never a live fleet, never real ansible/nix.
 #[derive(Debug, Clone)]
 pub struct ExplorerConfig {
     /// The fleet flake reference (`--flake`).

@@ -1,0 +1,20 @@
+{
+  "recorded_at": "2026-07-21",
+  "nix_version": "2.34.8+1",
+  "nom_version": "2.1.8",
+  "corpus": {
+    "small": {
+      "nom": { "built": 1, "running": 0, "planned": 0, "downloads": 0, "terminal": "success" },
+      "forest": { "built": 1, "failed": 0, "downloads": 0, "terminal": "success" }
+    },
+    "medium": {
+      "nom": { "built": 4, "running": 0, "planned": 0, "downloads": 0, "terminal": "success" },
+      "forest": { "built": 4, "failed": 0, "downloads": 0, "terminal": "success" }
+    },
+    "failure": {
+      "nom": { "built": 0, "running": 1, "planned": 0, "downloads": 0, "nix_errors": 1, "terminal": "failure" },
+      "forest": { "built": 0, "failed": 1, "downloads": 0, "terminal": "failure" },
+      "triage": "nom 2.1.8 does not convert Nix 2.34's structured Cannot build error into a failed-build state; reproducing that bug is not outcome parity"
+    }
+  }
+}

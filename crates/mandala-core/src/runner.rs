@@ -24,7 +24,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::ser::SerializeMap;
@@ -39,7 +39,7 @@ use crate::registry::{self, Meta};
 pub const SUPPORTED_EVENT_VERSIONS: [i64; 2] = [1, 2];
 
 /// The current event protocol emitted by native engine writers. Version 2 is
-/// v1 plus the verbatim `nixlog` record consumed by the nom pane.
+/// v1 plus the verbatim `nixlog` record consumed by the native build forest.
 pub const EVENT_PROTOCOL_VERSION: i64 = 2;
 
 /// Whether an event's `v` field names a supported protocol version.
@@ -374,6 +374,44 @@ impl BuildModel {
     }
 }
 
+type ForestRead = (String, Result<nix_build_forest::Derivation, String>);
+
+struct ForestResolver {
+    requests: mpsc::Sender<String>,
+    results: mpsc::Receiver<ForestRead>,
+}
+
+impl ForestResolver {
+    fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<String>();
+        let (result_tx, result_rx) = mpsc::channel::<ForestRead>();
+        std::thread::Builder::new()
+            .name("mandala-drv-resolver".to_string())
+            .spawn(move || {
+                for path in request_rx {
+                    let parsed = if path.starts_with("/nix/store/") && path.ends_with(".drv") {
+                        std::fs::read_to_string(&path)
+                            .map_err(|error| format!("drv unavailable: {error}"))
+                            .and_then(|contents| {
+                                nix_build_forest::parse_derivation(&contents)
+                                    .map_err(|error| format!("unparseable drv: {error}"))
+                            })
+                    } else {
+                        Err("drv unavailable: path is outside /nix/store".to_string())
+                    };
+                    if result_tx.send((path, parsed)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn derivation resolver");
+        Self {
+            requests: request_tx,
+            results: result_rx,
+        }
+    }
+}
+
 /// Incremental reader over a run's events directory: per-file byte offsets,
 /// version-gated records, routed to a [`BuildModel`] / per-host [`HostRun`].
 /// Port of the Python `EventTailer`.
@@ -382,10 +420,12 @@ pub struct EventTailer {
     offsets: BTreeMap<PathBuf, u64>,
     pub hosts: BTreeMap<String, HostRun>,
     pub build: BuildModel,
-    /// A callback receiving every raw `nixlog` line live (nom food). Attach it
-    /// BEFORE polling starts; `None` drops nixlog records. `Send` so an
-    /// [`ObservedRun`](crate::registry::ObservedRun) / [`DeployRun`] can be
-    /// held across await points (the MCP server's blocking waits).
+    /// Native, tolerant Nix activity state shared by every frontend.
+    pub forest: nix_build_forest::BuildForest,
+    forest_resolver: Option<ForestResolver>,
+    /// Transitional callback receiving every raw `nixlog` line live. New
+    /// consumers should read [`Self::forest`]; this remains for downstream
+    /// compatibility while the legacy aggregate model is retired.
     pub nixlog_sink: Option<Box<dyn FnMut(String) + Send>>,
 }
 
@@ -395,6 +435,7 @@ impl std::fmt::Debug for EventTailer {
             .field("directory", &self.directory)
             .field("hosts", &self.hosts)
             .field("build", &self.build)
+            .field("forest", &self.forest.snapshot())
             .field("nixlog_sink", &self.nixlog_sink.as_ref().map(|_| "<fn>"))
             .finish()
     }
@@ -408,6 +449,8 @@ impl EventTailer {
             offsets: BTreeMap::new(),
             hosts: BTreeMap::new(),
             build: BuildModel::default(),
+            forest: nix_build_forest::BuildForest::new(),
+            forest_resolver: None,
             nixlog_sink: None,
         }
     }
@@ -436,6 +479,7 @@ impl EventTailer {
     /// trailing newline is a partial write — we stop before it and re-read it
     /// on the next poll (its bytes are not counted toward the offset).
     pub fn poll(&mut self) -> usize {
+        self.poll_forest_resolver();
         let mut count = 0usize;
         if !self.directory.is_dir() {
             return 0;
@@ -478,12 +522,36 @@ impl EventTailer {
             }
             self.offsets.insert(path, offset);
         }
+        self.poll_forest_resolver();
         count
     }
 
+    fn poll_forest_resolver(&mut self) {
+        if let Some(resolver) = &self.forest_resolver {
+            while let Ok((path, parsed)) = resolver.results.try_recv() {
+                match parsed {
+                    Ok(drv) => self.forest.apply_derivation(path, drv),
+                    Err(note) => self.forest.apply_derivation_error(&path, note),
+                }
+            }
+        }
+        let pending = self.forest.take_pending_derivations();
+        if pending.is_empty() {
+            return;
+        }
+        let resolver = self.forest_resolver.get_or_insert_with(ForestResolver::new);
+        for path in pending {
+            if resolver.requests.send(path.clone()).is_err() {
+                self.forest
+                    .apply_derivation_error(&path, "drv unavailable: resolver stopped".to_string());
+            }
+        }
+    }
+
     /// Parse one raw line and route it: drop unparseable / unsupported-version
-    /// records; `nixlog` → the sink (and nowhere else); `plugin == "build"` →
-    /// the build model; else a `host`-tagged record → that host's run.
+    /// records; `nixlog` → the native forest and transitional sink;
+    /// `plugin == "build"` → the legacy build model; else a `host`-tagged
+    /// record → that host's run.
     fn route(&mut self, line: &str) {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             return;
@@ -492,8 +560,9 @@ impl EventTailer {
             return;
         }
         if event.get("event").and_then(Value::as_str) == Some("nixlog") {
+            let l = event.get("line").and_then(Value::as_str).unwrap_or("");
+            self.forest.feed_line(l);
             if let Some(sink) = self.nixlog_sink.as_mut() {
-                let l = event.get("line").and_then(Value::as_str).unwrap_or("");
                 sink(l.to_string());
             }
             return;
@@ -1507,6 +1576,7 @@ mod tests {
         );
         assert!(tailer.build.lines.is_empty()); // nixlog never pollutes the line views
         assert!(!tailer.hosts.contains_key("alpha"));
+        assert_eq!(tailer.forest.snapshot().version, 1);
     }
 
     /// Port of `test_failed_without_rollback_and_version_gate`: a bare rc=2

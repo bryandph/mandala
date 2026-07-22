@@ -1,6 +1,6 @@
 //! Screen-tier behavior tests — the `tasks.py` / `deploy.py` (view half)
 //! parity coverage, driving the pure screen states directly (no terminal,
-//! no fleet, no real ansible/nix/nom).
+//! no fleet, no real ansible/nix).
 //!
 //! Covered here: confirm/reboot modal semantics (keys, defaults, dismissal
 //! payloads, the exact rendered radio text), the after-mutation drift rule,
@@ -16,16 +16,17 @@ use std::sync::OnceLock;
 
 use mandala_core::registry::{self, Meta};
 use mandala_core::runner::{COMMAND_LOG, EventTailer, HostState};
-use mandala_tui::render::render;
+use mandala_tui::render::{render, render_with_theme};
 use mandala_tui::screen::{
     AttachedLogState, ConfirmAction, ConfirmState, DeployTab, DeployViewState, LogLine, ORDERS,
     RebootState, ScreenState, TaskState, attached_close_rc, attached_pump, confirm_lines,
     deploy_tabs, host_state_glyph, host_state_style, reboot_lines,
 };
 use mandala_tui::state::AppState;
+use mandala_tui::theme::Theme;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use serde_json::{Value, json};
 
@@ -335,6 +336,84 @@ fn build_line_tracks_progress_then_done() {
 }
 
 #[test]
+fn build_tab_renders_the_native_forest_snapshot() {
+    let dir = tmp();
+    let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo.drv";
+    write_events(
+        &dir.join("build.jsonl"),
+        &[
+            json!({"plugin":"build","event":"nixlog","line":format!(
+                "@nix {{\"action\":\"start\",\"id\":1,\"type\":105,\"fields\":[\"{drv}\",\"\",1,1],\"text\":\"building demo\"}}"
+            )}),
+            json!({"plugin":"build","event":"nixlog","line":"@nix {\"action\":\"stop\",\"id\":1}"}),
+        ],
+    );
+    let mut tailer = EventTailer::new(&dir);
+    tailer.poll();
+    let mut view = DeployViewState::new("demo", false, false, false, false);
+    view.sync(Some(&tailer), &[], false, None, 0);
+    let mut state = AppState::new();
+    state.screen = Some(ScreenState::Deploy(Box::new(view)));
+    let terminal = draw(&state, 90, 12);
+    let rendered = terminal.backend().to_string();
+    assert!(rendered.contains("✓ demo"), "{rendered}");
+    assert!(rendered.contains("1 built"), "{rendered}");
+}
+
+#[test]
+fn build_forest_uses_shared_scroll_state() {
+    let dir = tmp();
+    let events: Vec<Value> = (0..20)
+        .flat_map(|id| {
+            let drv = format!("/nix/store/{}-demo-{id:02}.drv", "a".repeat(32));
+            [
+                json!({"plugin":"build","event":"nixlog","line":format!(
+                    "@nix {{\"action\":\"start\",\"id\":{id},\"type\":105,\"fields\":[\"{drv}\",\"\",1,1]}}"
+                )}),
+                json!({"plugin":"build","event":"nixlog","line":format!(
+                    "@nix {{\"action\":\"stop\",\"id\":{id}}}"
+                )}),
+            ]
+        })
+        .collect();
+    write_events(&dir.join("build.jsonl"), &events);
+    let mut tailer = EventTailer::new(&dir);
+    tailer.poll();
+    let mut view = DeployViewState::new("demo", false, false, false, false);
+    view.sync(Some(&tailer), &[], false, None, 0);
+    let mut state = AppState::new();
+    state.screen = Some(ScreenState::Deploy(Box::new(view.clone())));
+    let tail = draw(&state, 90, 10).backend().to_string();
+    assert!(tail.contains("demo-19"), "{tail}");
+    assert!(!tail.contains("demo-00"), "{tail}");
+
+    view.build_scroll.to_top(5);
+    state.screen = Some(ScreenState::Deploy(Box::new(view)));
+    let top = draw(&state, 90, 10).backend().to_string();
+    assert!(top.contains("demo-00"), "{top}");
+    assert!(!top.contains("demo-19"), "{top}");
+}
+
+#[test]
+fn explicit_theme_is_threaded_into_the_header() {
+    let state = AppState::new();
+    let theme = Theme {
+        header: Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ..Theme::default()
+    };
+    let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+    terminal
+        .draw(|frame| render_with_theme(&state, frame, &theme))
+        .unwrap();
+    let first = terminal
+        .backend()
+        .buffer()
+        .cell((0, 0))
+        .expect("header cell");
+    assert_eq!(first.style().fg, Some(Color::Magenta));
+}
+
+#[test]
 fn summary_materializes_once_with_play_recap_verbatim() {
     let dir = tmp();
     write_events(
@@ -582,8 +661,12 @@ fn snapshot_deploy_screen_running_and_summary() {
     let dir = tmp();
     write_events(
         &dir.join("alpha.jsonl"),
-        &[json!({"host":"alpha","plugin":"build","event":"progress",
-            "built":4,"finished":2,"fetched":9,"fetched_done":9,"errors":0,"current":"system-path"})],
+        &[
+            json!({"host":"alpha","plugin":"build","event":"progress",
+                "built":4,"finished":2,"fetched":9,"fetched_done":9,"errors":0,"current":"system-path"}),
+            json!({"host":"alpha","plugin":"build","event":"nixlog","line":"@nix {\"action\":\"start\",\"id\":1,\"type\":105,\"fields\":[\"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo.drv\",\"\",1,1]}"}),
+            json!({"host":"alpha","plugin":"build","event":"nixlog","line":"@nix {\"action\":\"stop\",\"id\":1}"}),
+        ],
     );
     write_events(
         &dir.join("alpha.jsonl"),
@@ -603,9 +686,9 @@ fn snapshot_deploy_screen_running_and_summary() {
         None,
         0,
     );
-    view.active = DeployTab::Host("beta".into());
+    view.active = DeployTab::Build;
     let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(view.clone()));
+    state.screen = Some(ScreenState::Deploy(Box::new(view.clone())));
     let terminal = draw(&state, 100, 12);
     insta::assert_snapshot!("deploy_screen_running", terminal.backend());
 
@@ -617,7 +700,7 @@ fn snapshot_deploy_screen_running_and_summary() {
     ];
     view.sync(Some(&tailer), &output, true, Some(1), 83);
     let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(view));
+    state.screen = Some(ScreenState::Deploy(Box::new(view)));
     let terminal = draw(&state, 100, 16);
     insta::assert_snapshot!("deploy_screen_summary", terminal.backend());
 }
@@ -641,7 +724,7 @@ fn recorded_ansible_and_engine_runs_render_identically() {
             "batch build  built 2/2  fetched 1/1  errors 0  —  done rc=0"
         );
         let mut state = AppState::new();
-        state.screen = Some(ScreenState::Deploy(view));
+        state.screen = Some(ScreenState::Deploy(Box::new(view)));
         format!("{}", draw(&state, 100, 16).backend())
     };
 
@@ -667,7 +750,7 @@ fn deploy_tab_bar_styles_host_labels() {
     let mut view = DeployViewState::new("beta", false, false, false, true);
     view.sync(Some(&tailer), &[], false, None, 0);
     let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(view));
+    state.screen = Some(ScreenState::Deploy(Box::new(view)));
     let terminal = draw(&state, 100, 10);
     let buf = terminal.backend().buffer();
     // Row 2 is the tab bar: " ⚙ build │ ansible │ ↩ beta ". Find the ↩.
@@ -689,7 +772,7 @@ fn deploy_tab_bar_styles_host_labels() {
 fn recap_strip_contents() {
     let empty = DeployViewState::new("web", false, false, false, true);
     let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(empty));
+    state.screen = Some(ScreenState::Deploy(Box::new(empty)));
     let terminal = draw(&state, 80, 8);
     let text = format!("{}", terminal.backend());
     assert!(text.contains("waiting for host events…"));
@@ -704,7 +787,7 @@ fn recap_strip_contents() {
     let mut view = DeployViewState::new("web", false, false, false, true);
     view.sync(Some(&tailer), &[], false, None, 0);
     let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(view));
+    state.screen = Some(ScreenState::Deploy(Box::new(view)));
     let terminal = draw(&state, 80, 8);
     let text = format!("{}", terminal.backend());
     assert!(

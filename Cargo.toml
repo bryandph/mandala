@@ -6,6 +6,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/nix-build-forest",
   "crates/mandala-core",
   "crates/mandala-context",
   "crates/mandala-deploy",
@@ -23,6 +24,7 @@ rust-version = "1.90"
 repository = "https://github.com/bryanhuff/mandala"
 
 [workspace.dependencies]
+nix-build-forest = { path = "crates/nix-build-forest" }
 mandala-core = { path = "crates/mandala-core" }
 mandala-context = { path = "crates/mandala-context" }
 mandala-deploy = { path = "crates/mandala-deploy" }

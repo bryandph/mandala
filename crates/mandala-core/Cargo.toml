@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 mandala-deploy.workspace = true
+nix-build-forest.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The CLI (`mandala-core::cli`) is assembled with clap's BUILDER API — dynamic

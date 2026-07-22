@@ -17,4 +17,4 @@ expression: terminal.backend()
 "beta : ok=2 failed=1                                                                                "
 "                                                                                                    "
 " ⇄ alpha:copying  ↩ beta:rolled-back                                                                "
-"b nom build tab  ·  p playbook output tab  ·  s summary tab  ·  tab cycle tabs  ·  esc back (termina"
+"b build forest tab  ·  p playbook output tab  ·  s summary tab  ·  tab cycle tabs  ·  esc back (term"

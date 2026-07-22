@@ -27,9 +27,8 @@
 //!   (aggregate load, expected eval, output-captured state survey).
 //! - [`term`] — raw-mode/alternate-screen guard, panic-hook restore,
 //!   suspend-to-shell.
-//! - [`nom_pane`] — `nom --json` hosted on a pane-sized pty, vt100-emulated
-//!   into the pane (the `nom.py` port, spike 1.3; wired into the deploy
-//!   screen's build tab).
+//! - `nix-build-forest` — native structured Nix activity rendered directly
+//!   in the deploy screen's build tab, without a subprocess or PTY.
 //! - [`ansi`] — the `render.py` CSI/C0 pre-filter + SGR→spans conversion
 //!   every streamed pane line goes through.
 //! - [`screen`] — the action tier's pushed screens as pure data + render
@@ -44,9 +43,10 @@ pub mod context;
 pub mod deploy;
 pub mod event;
 pub mod explorer;
-pub mod nom_pane;
 pub mod render;
 pub mod screen;
+pub mod scroll;
 pub mod select;
 pub mod state;
 pub mod term;
+pub mod theme;
