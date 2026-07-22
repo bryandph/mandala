@@ -34,6 +34,7 @@ in {
   config = {
     flake.ansibleInventory = engine.projections.ansibleInventory {
       hosts = config.mandala.members;
+      deploySettings = config.mandala.projections.deploy.settings;
       inherit (cfg) extraHostvars pythonInterpreter guardGroup;
     };
     mandala.projections.ansibleInventory = config.flake.ansibleInventory;

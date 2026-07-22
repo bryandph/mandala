@@ -28,6 +28,26 @@
   mergedMembers = nixosMembers // cfg.extraMembers;
   deploySettingsType = lib.types.submodule {
     options = {
+      hostname = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "SSH endpoint override; null inherits the next tier and ultimately the member FQDN.";
+      };
+      sshUser = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "SSH connection user; null inherits the next tier and ultimately root.";
+      };
+      sshPort = lib.mkOption {
+        type = lib.types.nullOr lib.types.port;
+        default = null;
+        description = "SSH connection port; null inherits the next tier and ultimately 22.";
+      };
+      identityFile = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "/.*");
+        default = null;
+        description = "Absolute path string to the SSH private-key file; passed to clients without importing the key into the Nix store.";
+      };
       autoRollback = lib.mkOption {
         type = lib.types.nullOr lib.types.bool;
         default = null;
@@ -83,30 +103,48 @@
     (lib.attrNames cfg.deployment.groupSettings);
   deploySettingsFor = member: let
     deployment = member.deployment;
+    # The old member-only connection surface remains a compatibility input.
+    # Its schema defaults are not authored overrides: otherwise root/22/fqdn
+    # would permanently mask a fleet or group setting. A member that needs to
+    # override a layered value back to one of those defaults uses the explicit
+    # deployment.deployRs scalar.
+    legacyMemberConnection =
+      lib.optionalAttrs (deployment.ssh.host != member.fqdn) {
+        hostname = deployment.ssh.host;
+      }
+      // lib.optionalAttrs (deployment.ssh.user != "root") {
+        sshUser = deployment.ssh.user;
+      }
+      // lib.optionalAttrs (deployment.ssh.port != 22) {
+        sshPort = deployment.ssh.port;
+      };
     memberSettings =
+      legacyMemberConnection
+      // lib.filterAttrs
+      (_: value: value != null)
       (removeAttrs deployment.deployRs ["activation" "enable"])
       // {
-        sshOpts =
-          ["-p" (toString deployment.ssh.port)]
-          ++ deployment.deployRs.sshOpts;
+        inherit (deployment.deployRs) sshOpts;
       };
-  in
-    {
-      activation = deployment.deployRs.activation;
-      hostname = deployment.ssh.host;
-      sshUser = deployment.ssh.user;
-    }
-    // engine.mergeDeploySettings {
+    merged = engine.mergeDeploySettings {
       knownGroups = knownDeploymentGroups;
       fleet = cfg.deployment.settings;
       groupSettings = cfg.deployment.groupSettings;
       memberGroups = engine.ansibleGroupsFor member;
       member = memberSettings;
     };
+  in
+    {
+      activation = deployment.deployRs.activation;
+      hostname = member.fqdn;
+      sshUser = "root";
+      sshPort = 22;
+    }
+    // merged;
   flattenedDeploySettings =
     lib.mapAttrs
     (_: deploySettingsFor)
-    (lib.filterAttrs (_: member: member.deployment.deployRs.enable) cfg.members);
+    cfg.members;
   validHostname = name:
     builtins.stringLength name
     <= 63

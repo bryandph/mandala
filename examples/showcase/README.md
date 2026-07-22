@@ -26,8 +26,8 @@ nix build .#network-tf && cat result     # the terranix render
 
 Only ILLUSTRATED (a demo fleet has nothing real to push to):
 
-- actually running the fan-out deploy (`mandala.fleet.deploy`) or
-  activating with deploy-rs
+- actually running `mandala deploy run` or activating with deploy-rs
+- surveying live deployment state with `mandala.fleet.state`
 - applying the terranix output with terraform/tofu
 - ansible runs against the inventory (the members don't exist)
 - non-NixOS member management end to end (the router is data only)

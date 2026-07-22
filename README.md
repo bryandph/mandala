@@ -56,10 +56,11 @@ together.
 The projection layer is being lifted into this repo: pure projection
 functions (`lib.projections` — ansible inventory, sops config, deploy-rs
 nodes, eval-once batch builds), flake-parts shim modules, a secret-grade
-secrets schema, a `mandala.fleet` ansible collection (eval-once build +
-fan-out deploy adapters), a CLI/TUI, `nix flake init` templates, and a
-showcase fleet. Until 1.0, schemas and lib signatures may change without
-notice; aggregate outputs carry a `schemaVersion` so porcelain can keep up.
+secrets schema, a native CLI/TUI deploy engine, and a minimal
+`mandala.fleet` ansible collection for the read-only state survey, plus
+`nix flake init` templates and a showcase fleet. Until 1.0, schemas and lib
+signatures may change without notice; aggregate outputs carry a
+`schemaVersion` so porcelain can keep up.
 
 ## Design
 

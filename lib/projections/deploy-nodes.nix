@@ -42,7 +42,23 @@
     settings = assert lib.assertMsg (deploySettings ? ${name})
     "mandala deploy-nodes: ${name}: flattened deploy settings are missing";
       deploySettings.${name};
-    nodeSettings = removeAttrs settings ["activation"];
+    # deploy-rs represents port and identity as sshOpts. Keep them first so
+    # ssh's first-value-wins parsing makes the flattened scalars decisive.
+    connectionSshOpts =
+      ["-p" (toString settings.sshPort)]
+      ++ lib.optionals ((settings.identityFile or null) != null) [
+        "-i"
+        settings.identityFile
+        "-o"
+        "IdentitiesOnly=yes"
+        "-o"
+        "IdentityAgent=none"
+      ];
+    nodeSettings =
+      removeAttrs settings ["activation" "sshPort" "identityFile" "sshOpts"]
+      // {
+        sshOpts = connectionSshOpts ++ (settings.sshOpts or []);
+      };
     hostSystem = cfg.pkgs.stdenv.hostPlatform.system;
     cross =
       host.build

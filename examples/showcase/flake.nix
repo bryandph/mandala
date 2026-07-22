@@ -64,6 +64,10 @@
         };
 
         deployment.groupSettings.web = {
+          hostname = "web-deploy.fleet.example";
+          sshUser = "operator";
+          sshPort = 2222;
+          identityFile = "/var/lib/mandala/keys/showcase-deploy";
           confirmTimeout = 45;
           fastConnection = false;
           sshOpts = ["-o" "Group=yes"];
@@ -129,6 +133,23 @@
           
           assert inventory.all.hosts.web.showcase_dir == "hosts/web";
           assert inventory.all.hosts.web.ansible_python_interpreter == "/run/current-system/sw/bin/python3";
+          assert inventory.all.hosts.web.ansible_host == "web-deploy.fleet.example";
+          assert inventory.all.hosts.web.ansible_user == "operator";
+          assert inventory.all.hosts.web.ansible_port == 2222;
+          assert inventory.all.hosts.web.ansible_ssh_private_key_file
+          == "/var/lib/mandala/keys/showcase-deploy";
+          assert inventory.all.hosts.web.ansible_ssh_common_args
+          == "-o IdentitiesOnly=yes -o IdentityAgent=none";
+          assert inventory.all.hosts.web.ansible_become;
+          assert inventory.all.hosts.web.ansible_become_user == "deployer";
+          assert inventory.all.hosts.web.ansible_become_method == "doas";
+          assert inventory.all.hosts.web.mandala_deploy_sudo == "doas -u";
+          assert !(inventory.all.hosts.cache ? ansible_port);
+          assert !(inventory.all.hosts.cache ? ansible_ssh_private_key_file);
+          assert !(inventory.all.hosts.cache ? ansible_ssh_common_args);
+          assert !(inventory.all.hosts.cache ? ansible_become);
+          assert !(inventory.all.hosts.cache ? mandala_deploy_target_user);
+          assert !(inventory.all.hosts.cache ? mandala_deploy_sudo);
           assert inventory.all.children.deploy_rs.hosts
           == {
             cache = null;
@@ -155,23 +176,39 @@
             autoRollback = false;
             confirmTimeout = 45;
             fastConnection = false;
-            hostname = "web.fleet.example";
+            hostname = "web-deploy.fleet.example";
             magicRollback = false;
             sshOpts = [
               "-p"
-              "22"
+              "2222"
+              "-i"
+              "/var/lib/mandala/keys/showcase-deploy"
+              "-o"
+              "IdentitiesOnly=yes"
+              "-o"
+              "IdentityAgent=none"
               "-o"
               "Member=yes"
               "-o"
               "Group=yes"
             ];
-            sshUser = "root";
+            sshUser = "operator";
             sudo = "doas -u";
             tempPath = "/var/tmp/mandala";
             user = "deployer";
           };
-          assert removeAttrs agg.projections.deploy.settings.web ["activation"]
-          == removeAttrs nodes.web ["profiles"];
+          assert agg.projections.deploy.settings.web.hostname
+          == "web-deploy.fleet.example";
+          assert agg.projections.deploy.settings.web.sshUser == "operator";
+          assert agg.projections.deploy.settings.web.sshPort == 2222;
+          assert agg.projections.deploy.settings.web.identityFile
+          == "/var/lib/mandala/keys/showcase-deploy";
+          assert agg.projections.deploy.settings.web.sshOpts
+          == ["-o" "Member=yes" "-o" "Group=yes"];
+          # The flattened settings map is all-member so Ansible-only/facts
+          # members can share the one merge; deploy nodes still filter.
+          assert builtins.attrNames agg.projections.deploy.settings
+          == ["cache" "router" "web"];
           assert nodes.web.profiles.system ? path;
           assert lib.elem "cache" (builtins.attrNames inputs.self.legacyPackages.${system}.deployBatch);
           assert lib.elem "all" (builtins.attrNames inputs.self.legacyPackages.${system}.deployBatch);

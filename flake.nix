@@ -156,6 +156,10 @@
         fullDeploySettingsMember = self.lib.evalMember {
           name = "full-deploy-settings";
           deployment.deployRs = {
+            hostname = "full-deploy-settings.internal";
+            sshUser = "operator";
+            sshPort = 2222;
+            identityFile = "/keys/full-deploy-settings";
             autoRollback = false;
             fastConnection = false;
             magicRollback = false;
@@ -174,6 +178,8 @@
             ssh.port = 2222;
             deployRs = {
               enable = true;
+              # Explicit root wins even though it equals the legacy default.
+              sshUser = "root";
               sshOpts = ["-o" "Member=yes"];
             };
           };
@@ -200,14 +206,24 @@
         fleetModuleEval = evalFleetModule {
           deployment = {
             settings = {
+              hostname = "fleet-deploy.example";
+              sshUser = "fleet-operator";
+              sshPort = 2022;
+              identityFile = "/keys/fleet";
               autoRollback = false;
               activationTimeout = 600;
+              sudo = "sudo -u";
+              user = "fleet-app";
               sshOpts = ["-o" "Fleet=yes"];
             };
             groupSettings.edge_compute = {
+              hostname = "edge-deploy.example";
+              identityFile = "/keys/edge";
               confirmTimeout = 45;
               fastConnection = false;
               magicRollback = false;
+              sudo = "doas -u";
+              user = "edge-app";
               sshOpts = ["-o" "Group=yes"];
             };
           };
@@ -221,11 +237,11 @@
           autoRollback = false;
           confirmTimeout = 45;
           fastConnection = false;
-          hostname = "taxonomy-member";
+          hostname = "edge-deploy.example";
+          identityFile = "/keys/edge";
           magicRollback = false;
+          sshPort = 2222;
           sshOpts = [
-            "-p"
-            "2222"
             "-o"
             "Member=yes"
             "-o"
@@ -234,6 +250,8 @@
             "Fleet=yes"
           ];
           sshUser = "root";
+          sudo = "doas -u";
+          user = "edge-app";
         };
 
         # NixOS member on a cloud venue: platform names the VENUE, the
@@ -258,6 +276,44 @@
           };
         };
         hv = inventory.all.hosts.example-node;
+
+        layeredInventory = self.lib.projections.ansibleInventory {
+          hosts = {
+            example-node = managedMember;
+            cloud-node = cloudMember;
+          };
+          deploySettings = {
+            example-node = {
+              hostname = "deploy.example.test";
+              sshUser = "deploy-operator";
+              sshPort = 2222;
+              identityFile = "/keys/example-node";
+              user = "app";
+              sudo = "sudo -u";
+            };
+            cloud-node = {
+              hostname = "cloud-deploy.example.test";
+              sshUser = "cloud-operator";
+              sshPort = 22;
+              identityFile = "/keys/cloud-node";
+              user = "service";
+              sudo = "doas -u";
+            };
+          };
+        };
+        layeredHv = layeredInventory.all.hosts.example-node;
+        layeredCloudHv = layeredInventory.all.hosts.cloud-node;
+        arbitrarySudoInventory = self.lib.projections.ansibleInventory {
+          hosts = {example-node = managedMember;};
+          deploySettings.example-node = {
+            hostname = "deploy.example.test";
+            sshUser = "deploy-operator";
+            sshPort = 22;
+            user = "app";
+            sudo = "custom-run-as";
+          };
+        };
+        arbitrarySudoHv = arbitrarySudoInventory.all.hosts.example-node;
 
         # Conventions are overridable: no interpreter pin, no guard group.
         bareInventory = self.lib.projections.ansibleInventory {
@@ -351,17 +407,25 @@
         deploySettingsGolden = self.lib.mergeDeploySettings {
           knownGroups = ["alpha" "zeta"];
           fleet = {
+            hostname = "fleet.example";
+            sshUser = "fleet-user";
+            sshPort = 22;
+            identityFile = "/keys/fleet";
             activationTimeout = 600;
             confirmTimeout = 30;
             sshOpts = ["-o" "Fleet=yes"];
           };
           groupSettings = {
             alpha = {
+              hostname = "alpha.example";
+              identityFile = "/keys/alpha";
               confirmTimeout = 40;
               magicRollback = false;
               sshOpts = ["-o" "Alpha=yes"];
             };
             zeta = {
+              hostname = "zeta.example";
+              identityFile = "/keys/zeta";
               confirmTimeout = 50;
               magicRollback = true;
               sshOpts = ["-o" "Zeta=yes"];
@@ -370,6 +434,8 @@
           # Deliberately unsorted input: the merge function owns ordering.
           memberGroups = ["zeta" "alpha"];
           member = {
+            sshUser = "member-user";
+            sshPort = 2222;
             confirmTimeout = 90;
             sshOpts = ["-o" "Member=yes"];
           };
@@ -379,7 +445,10 @@
           autoRollback = true;
           confirmTimeout = 90;
           fastConnection = true;
+          hostname = "zeta.example";
+          identityFile = "/keys/zeta";
           magicRollback = true;
+          sshPort = 2222;
           sshOpts = [
             "-o"
             "Member=yes"
@@ -390,6 +459,7 @@
             "-o"
             "Fleet=yes"
           ];
+          sshUser = "member-user";
         };
         deploySettingsSiblingWinner = self.lib.mergeDeploySettings {
           knownGroups = ["alpha" "zeta"];
@@ -550,6 +620,10 @@
         # Deploy-rs settings remain absent-equivalent until authored; the
         # flattening merge restores legacy effective defaults where required.
         assert member.deployment.deployRs.autoRollback == null;
+        assert member.deployment.deployRs.hostname == null;
+        assert member.deployment.deployRs.sshUser == null;
+        assert member.deployment.deployRs.sshPort == null;
+        assert member.deployment.deployRs.identityFile == null;
         assert member.deployment.deployRs.fastConnection == null;
         assert member.deployment.deployRs.magicRollback == null;
         assert member.deployment.deployRs.confirmTimeout == null;
@@ -559,6 +633,10 @@
         assert member.deployment.deployRs.user == null;
         assert member.deployment.deployRs.sshOpts == [];
         assert fullDeploySettingsMember.deployment.deployRs.autoRollback == false;
+        assert fullDeploySettingsMember.deployment.deployRs.hostname == "full-deploy-settings.internal";
+        assert fullDeploySettingsMember.deployment.deployRs.sshUser == "operator";
+        assert fullDeploySettingsMember.deployment.deployRs.sshPort == 2222;
+        assert fullDeploySettingsMember.deployment.deployRs.identityFile == "/keys/full-deploy-settings";
         assert fullDeploySettingsMember.deployment.deployRs.fastConnection == false;
         assert fullDeploySettingsMember.deployment.deployRs.magicRollback == false;
         assert fullDeploySettingsMember.deployment.deployRs.confirmTimeout == 0;
@@ -575,12 +653,22 @@
           name = "remote-build-is-not-supported";
           deployment.deployRs.remoteBuild = true;
         });
+        assert failsDeep (self.lib.evalMember {
+          name = "relative-deploy-identity";
+          deployment.deployRs.identityFile = "keys/id_rsa";
+        });
         # Fleet/group settings use the same optional deploy-rs vocabulary.
+        assert fleetDeployment.settings.hostname == "fleet-deploy.example";
+        assert fleetDeployment.settings.sshUser == "fleet-operator";
+        assert fleetDeployment.settings.sshPort == 2022;
+        assert fleetDeployment.settings.identityFile == "/keys/fleet";
         assert fleetDeployment.settings.autoRollback == false;
         assert fleetDeployment.settings.activationTimeout == 600;
         assert fleetDeployment.settings.magicRollback == null;
         assert fleetDeployment.settings.sshOpts == ["-o" "Fleet=yes"];
         assert fleetDeployment.groupSettings.edge_compute.confirmTimeout == 45;
+        assert fleetDeployment.groupSettings.edge_compute.hostname == "edge-deploy.example";
+        assert fleetDeployment.groupSettings.edge_compute.identityFile == "/keys/edge";
         assert fleetDeployment.groupSettings.edge_compute.fastConnection == false;
         assert fleetDeployment.groupSettings.edge_compute.magicRollback == false;
         assert fleetDeployment.groupSettings.edge_compute.sshOpts == ["-o" "Group=yes"];
@@ -612,6 +700,40 @@
         assert hv.example_dir == "fleet/example-node";
         assert !(hv ? ansible_port); # default port 22 emits no var
         
+        assert !(hv ? ansible_ssh_private_key_file);
+        assert !(hv ? ansible_ssh_common_args);
+        assert !(hv ? ansible_become);
+        assert !(hv ? mandala_deploy_target_user);
+        assert !(hv ? mandala_deploy_sudo);
+        # The Ansible projection consumes the same all-member flattened map,
+        # including an ansible-only member. Standard connection/become vars
+        # are operational; arbitrary sudo prefixes remain lossless in the
+        # deploy-specific var.
+        assert layeredHv.ansible_host == "deploy.example.test";
+        assert layeredHv.ansible_user == "deploy-operator";
+        assert layeredHv.ansible_port == 2222;
+        assert layeredHv.ansible_ssh_private_key_file == "/keys/example-node";
+        assert layeredHv.ansible_ssh_common_args
+        == "-o IdentitiesOnly=yes -o IdentityAgent=none";
+        assert layeredHv.ansible_become;
+        assert layeredHv.ansible_become_user == "app";
+        assert layeredHv.ansible_become_method == "sudo";
+        assert layeredHv.mandala_deploy_target_user == "app";
+        assert layeredHv.mandala_deploy_sudo == "sudo -u";
+        assert layeredCloudHv.ansible_host == "cloud-deploy.example.test";
+        assert layeredCloudHv.ansible_user == "cloud-operator";
+        assert layeredCloudHv.ansible_ssh_private_key_file == "/keys/cloud-node";
+        assert layeredCloudHv.ansible_ssh_common_args
+        == "-o IdentitiesOnly=yes -o IdentityAgent=none";
+        assert layeredCloudHv.ansible_become;
+        assert layeredCloudHv.ansible_become_user == "service";
+        assert layeredCloudHv.ansible_become_method == "doas";
+        assert layeredCloudHv.mandala_deploy_sudo == "doas -u";
+        assert !(arbitrarySudoHv ? ansible_become);
+        assert !(arbitrarySudoHv ? ansible_become_user);
+        assert !(arbitrarySudoHv ? ansible_become_method);
+        assert arbitrarySudoHv.mandala_deploy_target_user == "app";
+        assert arbitrarySudoHv.mandala_deploy_sudo == "custom-run-as";
         assert inventory.all.children.fake.hosts == {example-node = null;};
         assert inventory.all.children.fake_extra_group.hosts == {example-node = null;};
         assert inventory.all.children.deploy_rs.hosts == {example-node = null;};

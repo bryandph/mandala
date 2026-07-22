@@ -80,12 +80,11 @@ member set.
 
 ## 6. Deploy settings are flattened once
 
-Deploy settings have three authoring tiers:
+Deploy connection and behavior settings have three authoring tiers:
 
 - fleet defaults at `mandala.deployment.settings`;
 - group settings at `mandala.deployment.groupSettings.<group>`; and
-- member settings at `host.deployment.deployRs`, with the SSH target,
-  login, and port under `host.deployment.ssh`.
+- member settings at `host.deployment.deployRs`.
 
 For scalar values, the member tier wins over the group tier, which wins
 over the fleet tier. A member can belong to several configured groups;
@@ -94,6 +93,23 @@ so the later group wins a scalar conflict. `sshOpts` is additive instead:
 member options come first, followed by applicable groups in that same
 sorted order, then fleet options.
 
+Connection fields are first-class scalars in those same tiers:
+`hostname`, `sshUser`, `sshPort`, and `identityFile`. Their final defaults
+are the member FQDN, `root`, and port 22; `identityFile` stays absent unless
+authored. It is an absolute **path string**, not a Nix path: the key itself is
+never evaluated or copied into the Nix store. When present, native and raw
+deploy clients pass it explicitly with `IdentitiesOnly=yes` and
+`IdentityAgent=none`; native deploys
+also use the resolved endpoint, user, and port for every copy, activate,
+wait, and confirm connection rather than discovering an identity through
+`HOME`.
+
+The older member-only `host.deployment.ssh.{host,user,port}` fields remain a
+compatibility input. Values differing from their legacy fqdn/root/22 defaults
+act as member overrides. A member that must override a fleet/group value
+*back* to fqdn, root, or port 22 authors the corresponding unambiguous
+`host.deployment.deployRs.{hostname,sshUser,sshPort}` scalar.
+
 `groupSettings` keys must use the sanitized canonical taxonomy spelling
 exposed by `flake.mandala.groups`. An unknown key, including an unsanitized
 spelling that does not exist there, fails evaluation. Member
@@ -101,10 +117,21 @@ spelling that does not exist there, fails evaluation. Member
 after all tiers merge, each still defaults effectively to `true` when no
 tier supplied it, preserving the historical deploy-node behavior.
 
-The resolved inspection surface is
-`flake.mandala.projections.deploy.settings.<member>`. Both the native
-engine and `flake.deploy.nodes` consume that flattened data; consumers
-must not repeat the merge. See `schema/member.nix`,
+The resolved inspection surface is the all-member map
+`flake.mandala.projections.deploy.settings.<member>`. The native engine,
+`flake.deploy.nodes`, and Ansible inventory consume that flattened data;
+consumers must not repeat the merge. Ansible receives its standard
+operational connection vars (`ansible_host`, `ansible_user`, non-default
+`ansible_port`, optional `ansible_ssh_private_key_file`, and matching
+`ansible_ssh_common_args` that disable ambient-agent signing). When deploy
+target `user` differs from `sshUser`, it also receives
+`ansible_become`/`ansible_become_user`; `sudo -u` and `doas -u` map to the
+corresponding standard Ansible become method. An arbitrary prefix cannot be
+represented losslessly by Ansible, so it is retained only as
+`mandala_deploy_sudo` (with `mandala_deploy_target_user`) and no misleading
+standard become vars are emitted. Optional key, privilege, and target-user
+vars are omitted when unconfigured, preserving the legacy inventory bytes
+for root-to-root fleets. See `schema/member.nix`,
 `flake-modules/fleet.nix`, and `lib/deploy-settings.nix` for the source of
 truth, and `examples/showcase/` for an evaluated member/group example.
 

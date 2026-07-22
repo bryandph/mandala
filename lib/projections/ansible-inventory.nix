@@ -32,6 +32,9 @@
   hosts,
   # Consumer hook: name -> attrset of extra hostvars for that member.
   extraHostvars ? (_name: {}),
+  # name -> settings already flattened by the fleet module's single merge.
+  # Optional for direct library consumers and unchanged-inventory parity.
+  deploySettings ? {},
   # ansible_python_interpreter value for platform == "nixos" members.
   pythonInterpreter ? "/run/current-system/sw/bin/python3",
   # Name of the synthetic deploy-rs guard group.
@@ -45,15 +48,46 @@
 
   hostvarsFor = name: host: let
     d = host.deployment;
+    deploy = deploySettings.${name} or {};
+    hostname = deploy.hostname or d.ssh.host;
+    sshUser = deploy.sshUser or d.ssh.user;
+    sshPort = deploy.sshPort or d.ssh.port;
+    identityFile = deploy.identityFile or null;
+    targetUser = deploy.user or null;
+    sudo = deploy.sudo or null;
+    needsBecome = targetUser != null && targetUser != sshUser;
+    becomeMethod =
+      if !needsBecome
+      then null
+      else if sudo == null || sudo == "sudo -u"
+      then "sudo"
+      else if sudo == "doas -u"
+      then "doas"
+      else null;
   in
     {
-      ansible_host = d.ssh.host;
-      ansible_user = d.ssh.user;
+      ansible_host = hostname;
+      ansible_user = sshUser;
     }
     // lib.optionalAttrs (isNixos host && pythonInterpreter != null) {
       ansible_python_interpreter = pythonInterpreter;
     }
-    // lib.optionalAttrs (d.ssh.port != 22) {ansible_port = d.ssh.port;}
+    // lib.optionalAttrs (sshPort != 22) {ansible_port = sshPort;}
+    // lib.optionalAttrs (identityFile != null) {
+      ansible_ssh_private_key_file = identityFile;
+      ansible_ssh_common_args = "-o IdentitiesOnly=yes -o IdentityAgent=none";
+    }
+    // lib.optionalAttrs (targetUser != null) {
+      mandala_deploy_target_user = targetUser;
+    }
+    // lib.optionalAttrs (becomeMethod != null) {
+      ansible_become = true;
+      ansible_become_user = targetUser;
+      ansible_become_method = becomeMethod;
+    }
+    // lib.optionalAttrs (sudo != null) {
+      mandala_deploy_sudo = sudo;
+    }
     // extraHostvars name
     // d.ansible.vars;
 

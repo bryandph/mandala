@@ -18,10 +18,8 @@ What the projection gives you:
   engine-side — `ansible -l k3s`, `.#deployBatch.k3s`, and the CLI's
   `@k3s` are the same member set by construction.
 - **The `deploy_rs` guard group.** A synthetic group of the members
-  deploy-rs can activate. Fan-out playbooks target it so `--limit` can
-  never reach a facts-only member or an ansible-only host with no
-  deploy node (the public fan-out playbook, `mandala.fleet.deploy`,
-  does exactly this and refuses to run without a limit).
+  deploy-rs can activate. The read-only `mandala.fleet.state` survey targets
+  it so drift snapshots are collected only for members with deploy nodes.
 - **NixOS conventions out of the box.** `ansible_python_interpreter`
   pins NixOS members to their system-profile python (no
   `/usr/bin/python3` exists there); override or disable via
@@ -31,7 +29,6 @@ What the projection gives you:
   playbooks that write artifacts back into the operator checkout) —
   merged after the engine defaults, so hooks can also override them.
 
-For builds and deploys inside plays, use the `mandala.fleet` collection
-(`mandala.fleet.build` / `mandala.fleet.deploy`): controller-side action
-plugins with nom-rendered output and the opt-in JSONL event channel
-(`MANDALA_FLEET_EVENTS`) for porcelain frontends.
+Build and deploy fan-out is native to `mandala deploy`; Ansible remains the
+imperative layer for operations such as the read-only `mandala.fleet.state`
+survey and operator-authored reboot, onboarding, or maintenance playbooks.

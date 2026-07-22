@@ -14,6 +14,10 @@ use std::path::PathBuf;
 pub struct GenericSettings {
     #[serde(rename = "sshUser")]
     pub ssh_user: Option<String>,
+    #[serde(rename = "sshPort")]
+    pub ssh_port: Option<u16>,
+    #[serde(rename = "identityFile")]
+    pub identity_file: Option<PathBuf>,
     pub user: Option<String>,
     #[serde(default, rename = "sshOpts")]
     pub ssh_opts: Vec<String>,
@@ -49,6 +53,8 @@ impl GenericSettings {
             };
         }
         fallback!(ssh_user);
+        fallback!(ssh_port);
+        fallback!(identity_file);
         fallback!(user);
         fallback!(fast_connection);
         fallback!(auto_rollback);

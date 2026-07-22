@@ -132,6 +132,9 @@ struct FlattenedDeploySettings {
     activation: ActivationMode,
     hostname: String,
     ssh_user: String,
+    ssh_port: u16,
+    identity_file: Option<PathBuf>,
+    #[serde(default)]
     ssh_opts: Vec<String>,
     auto_rollback: bool,
     fast_connection: bool,
@@ -147,6 +150,8 @@ impl FlattenedDeploySettings {
     fn generic(&self) -> GenericSettings {
         GenericSettings {
             ssh_user: Some(self.ssh_user.clone()),
+            ssh_port: Some(self.ssh_port),
+            identity_file: self.identity_file.clone(),
             user: self.user.clone(),
             ssh_opts: self.ssh_opts.clone(),
             fast_connection: Some(self.fast_connection),
@@ -200,6 +205,7 @@ type HostTask = Arc<
 struct DeployPrograms {
     nix: Option<PathBuf>,
     ssh: Option<PathBuf>,
+    environment: Vec<(String, String)>,
 }
 
 struct RegistryDeploySink {
@@ -908,6 +914,7 @@ async fn deploy_host_with(
         hostname: None,
         nix_program: programs.nix.clone(),
         ssh_program: programs.ssh.clone(),
+        environment: programs.environment.clone(),
     };
     let sink = RegistryDeploySink::new(Arc::clone(&writer));
     let deploy = make_deploy_data(
@@ -1428,7 +1435,12 @@ done
         (script, invocations, args)
     }
 
-    fn effect_programs(base: &Path, copy_rc: i32, confirm_rc: i32) -> (DeployPrograms, PathBuf) {
+    fn effect_programs_with_cleanup(
+        base: &Path,
+        copy_rc: i32,
+        cleanup_rc: i32,
+        confirm_rc: i32,
+    ) -> (DeployPrograms, PathBuf) {
         let trace = base.join(format!("effects-{copy_rc}-{confirm_rc}"));
         let nix = base.join(format!("nix-copy-{copy_rc}"));
         let ssh = base.join(format!("ssh-activate-{confirm_rc}"));
@@ -1437,7 +1449,7 @@ done
             &nix,
             format!(
                 r#"#!/bin/sh
-printf 'nix NIX_SSHOPTS=%s args=%s\n' "$NIX_SSHOPTS" "$*" >> '{}'
+printf 'nix USER=%s HOME=%s SSH_AUTH_SOCK=%s NIX_SSHOPTS=%s args=%s\n' "$USER" "$HOME" "$SSH_AUTH_SOCK" "$NIX_SSHOPTS" "$*" >> '{}'
 printf '%s\n' 'nix-copy-stdout'
 printf '%s\n' 'nix-copy-stderr' >&2
 exit {}
@@ -1451,15 +1463,17 @@ exit {}
             &ssh,
             format!(
                 r#"#!/bin/sh
-printf 'ssh args=%s\n' "$*" >> '{}'
+printf 'ssh USER=%s HOME=%s SSH_AUTH_SOCK=%s args=%s\n' "$USER" "$HOME" "$SSH_AUTH_SOCK" "$*" >> '{}'
 printf '%s\n' 'ssh-stdout'
 printf '%s\n' 'ssh-stderr' >&2
 case "$*" in
+  *' rm -f '*) exit {} ;;
   *' rm '*) exit {} ;;
 esac
 exit 0
 "#,
                 trace.display(),
+                cleanup_rc,
                 confirm_rc,
             ),
         )
@@ -1473,6 +1487,160 @@ exit 0
             DeployPrograms {
                 nix: Some(nix),
                 ssh: Some(ssh),
+                environment: vec![
+                    ("USER".into(), "ambient-user-must-not-win".into()),
+                    ("HOME".into(), "/ambient/home/must-not-win".into()),
+                    ("SSH_AUTH_SOCK".into(), "/ambient/agent/must-not-win".into()),
+                ],
+            },
+            trace,
+        )
+    }
+
+    fn effect_programs(base: &Path, copy_rc: i32, confirm_rc: i32) -> (DeployPrograms, PathBuf) {
+        effect_programs_with_cleanup(base, copy_rc, 0, confirm_rc)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActivationEffectOrder {
+        ConfirmationFirst,
+        ConfirmationAfterActivation,
+        ActivationBeforeWait,
+    }
+
+    impl ActivationEffectOrder {
+        fn shell_name(self) -> &'static str {
+            match self {
+                Self::ConfirmationFirst => "confirmation-first",
+                Self::ConfirmationAfterActivation => "confirmation-after-activation",
+                Self::ActivationBeforeWait => "activation-before-wait",
+            }
+        }
+    }
+
+    fn ordered_activation_programs(
+        base: &Path,
+        confirm_rc: i32,
+        activate_rc: i32,
+        order: ActivationEffectOrder,
+    ) -> (DeployPrograms, PathBuf) {
+        let order_name = order.shell_name();
+        let trace = base.join(format!(
+            "ordered-effects-{order_name}-{confirm_rc}-{activate_rc}"
+        ));
+        let confirmed = base.join(format!(
+            "confirmation-attempted-{order_name}-{confirm_rc}-{activate_rc}"
+        ));
+        let waited = base.join(format!(
+            "wait-complete-{order_name}-{confirm_rc}-{activate_rc}"
+        ));
+        let activated = base.join(format!(
+            "activation-exited-{order_name}-{confirm_rc}-{activate_rc}"
+        ));
+        let nix = base.join(format!(
+            "ordered-nix-copy-{order_name}-{confirm_rc}-{activate_rc}"
+        ));
+        let ssh = base.join(format!(
+            "ordered-ssh-activate-{order_name}-{confirm_rc}-{activate_rc}"
+        ));
+        std::fs::create_dir_all(base).unwrap();
+        std::fs::write(
+            &nix,
+            format!(
+                r#"#!/bin/sh
+printf 'nix args=%s\n' "$*" >> '{}'
+exit 0
+"#,
+                trace.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &ssh,
+            format!(
+                r#"#!/bin/sh
+printf 'ssh args=%s\n' "$*" >> '{}'
+order='{}'
+wait_for_marker() {{
+  attempt=0
+  while [ ! -e "$1" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 500 ]; then
+      exit 99
+    fi
+    sleep 0.01
+  done
+}}
+case "$*" in
+  *' rm -f '*) exit 0 ;;
+  *'activate-rs activate '*)
+    case "$order" in
+      confirmation-first)
+        wait_for_marker '{}'
+        sleep 0.05
+        ;;
+      confirmation-after-activation)
+        wait_for_marker '{}'
+        sleep 0.05
+        : > '{}'
+        ;;
+      activation-before-wait)
+        ;;
+    esac
+    exit {}
+    ;;
+  *'activate-rs wait '*)
+    case "$order" in
+      confirmation-after-activation)
+        : > '{}'
+        ;;
+      activation-before-wait)
+        sleep 0.15
+        ;;
+    esac
+    exit 0
+    ;;
+  *' rm '*)
+    case "$order" in
+      confirmation-first)
+        : > '{}'
+        ;;
+      confirmation-after-activation)
+        wait_for_marker '{}'
+        sleep 0.05
+        ;;
+      activation-before-wait)
+        exit 98
+        ;;
+    esac
+    exit {}
+    ;;
+esac
+exit 0
+"#,
+                trace.display(),
+                order_name,
+                confirmed.display(),
+                waited.display(),
+                activated.display(),
+                activate_rc,
+                waited.display(),
+                confirmed.display(),
+                activated.display(),
+                confirm_rc,
+            ),
+        )
+        .unwrap();
+        for program in [&nix, &ssh] {
+            let mut permissions = std::fs::metadata(program).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(program, permissions).unwrap();
+        }
+        (
+            DeployPrograms {
+                nix: Some(nix),
+                ssh: Some(ssh),
+                environment: Vec::new(),
             },
             trace,
         )
@@ -1483,7 +1651,9 @@ exit 0
             "activation": activation,
             "hostname": "cache.example.test",
             "sshUser": "deployer",
-            "sshOpts": ["-p", "2222", "-o", "StrictHostKeyChecking=no"],
+            "sshPort": 2222,
+            "identityFile": "/keys/mandala-test",
+            "sshOpts": ["-o", "StrictHostKeyChecking=no"],
             "autoRollback": true,
             "fastConnection": false,
             "magicRollback": true,
@@ -1492,6 +1662,18 @@ exit 0
             "tempPath": "/run/mandala",
             "sudo": "doas -u",
             "user": "app"
+        })
+    }
+
+    fn minimal_parent_deploy_settings() -> Value {
+        json!({
+            "activation": "switch",
+            "hostname": "172.16.42.7",
+            "sshUser": "root",
+            "sshPort": 22,
+            "identityFile": "/Users/bryan/.ssh/id_rsa",
+            "autoRollback": true,
+            "fastConnection": true
         })
     }
 
@@ -1907,9 +2089,9 @@ exit 0
 
         let trace = std::fs::read_to_string(trace).unwrap();
         assert!(trace.contains(
-            "nix NIX_SSHOPTS=-p 2222 -o StrictHostKeyChecking=no args=copy --substitute-on-destination --no-check-sigs --to ssh://deployer@cache.example.test /nix/store/00000000000000000000000000000000-cache-profile"
+            "nix USER=ambient-user-must-not-win HOME=/ambient/home/must-not-win SSH_AUTH_SOCK=/ambient/agent/must-not-win NIX_SSHOPTS=-p 2222 -i /keys/mandala-test -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no args=copy --substitute-on-destination --no-check-sigs --to ssh://deployer@cache.example.test /nix/store/00000000000000000000000000000000-cache-profile"
         ));
-        assert!(trace.contains("ssh args=deployer@cache.example.test -p 2222 -o StrictHostKeyChecking=no doas -u app /nix/store/00000000000000000000000000000000-cache-profile/activate-rs activate '/nix/store/00000000000000000000000000000000-cache-profile' --profile-user app --profile-name system --temp-path '/run/mandala' --confirm-timeout 41 --magic-rollback --auto-rollback --boot"));
+        assert!(trace.contains("ssh USER=ambient-user-must-not-win HOME=/ambient/home/must-not-win SSH_AUTH_SOCK=/ambient/agent/must-not-win args=deployer@cache.example.test -p 2222 -i /keys/mandala-test -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no doas -u app /nix/store/00000000000000000000000000000000-cache-profile/activate-rs activate '/nix/store/00000000000000000000000000000000-cache-profile' --profile-user app --profile-name system --temp-path '/run/mandala' --confirm-timeout 41 --magic-rollback --auto-rollback --boot"));
         assert!(!trace.contains(" activate-rs wait "));
         assert!(!trace.contains(" rm "));
 
@@ -1938,6 +2120,31 @@ exit 0
     }
 
     #[tokio::test]
+    async fn omitted_empty_ssh_opts_deserializes_and_reaches_effects() {
+        let settings = minimal_parent_deploy_settings();
+        let parsed = serde_json::from_value::<FlattenedDeploySettings>(settings.clone()).unwrap();
+        assert!(parsed.ssh_opts.is_empty());
+
+        let base = tmp_base("host-omitted-ssh-opts");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, true).unwrap();
+        run.plan.settings.insert("cache".into(), settings);
+        let (programs, trace) = effect_programs(&base, 0, 0);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Confirmed);
+        assert_eq!(result.error, None);
+
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(trace.contains(
+            "NIX_SSHOPTS=-p 22 -i /Users/bryan/.ssh/id_rsa -o IdentitiesOnly=yes -o IdentityAgent=none args=copy"
+        ));
+        assert!(trace.contains(
+            "args=root@172.16.42.7 -p 22 -i /Users/bryan/.ssh/id_rsa -o IdentitiesOnly=yes -o IdentityAgent=none"
+        ));
+    }
+
+    #[tokio::test]
     async fn dry_activate_skips_magic_wait_and_confirmation() {
         let base = tmp_base("host-dry");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
@@ -1953,6 +2160,64 @@ exit 0
         assert!(trace.contains("--dry-activate"));
         assert!(!trace.contains(" activate-rs wait "));
         assert!(!trace.contains(" rm "));
+    }
+
+    #[tokio::test]
+    async fn stale_canary_cleanup_finishes_before_activate_and_wait_spawn() {
+        let base = tmp_base("host-stale-canary-cleanup");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = effect_programs(&base, 0, 0);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Confirmed);
+
+        let trace = std::fs::read_to_string(trace).unwrap();
+        let cleanup = trace.find(" rm -f ").unwrap();
+        let activate = trace.find("activate-rs activate ").unwrap();
+        let wait = trace.find("activate-rs wait ").unwrap();
+        let cleanup_line = trace.lines().find(|line| line.contains(" rm -f ")).unwrap();
+        assert!(cleanup_line.contains("doas -u app rm -f /run/mandala/deploy-rs-canary-"));
+        assert!(cleanup_line.ends_with("00000000000000000000000000000000"));
+        assert!(cleanup < activate);
+        assert!(cleanup < wait);
+    }
+
+    #[tokio::test]
+    async fn stale_canary_cleanup_failure_prevents_activate_and_wait() {
+        let base = tmp_base("host-stale-canary-cleanup-failure");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = effect_programs_with_cleanup(&base, 0, 23, 0);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("stale deployment canary cleanup failed with exit status: 23")
+        );
+
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(trace.contains(" rm -f "));
+        assert!(!trace.contains("activate-rs activate "));
+        assert!(!trace.contains("activate-rs wait "));
+
+        let mut tailer = crate::runner::EventTailer::new(&run.path);
+        tailer.poll();
+        assert_eq!(tailer.hosts["cache"].state, HostState::Failed);
+        assert_eq!(
+            tailer.hosts["cache"].milestones,
+            ["copy", "activate", "wait"]
+        );
     }
 
     #[tokio::test]
@@ -1991,6 +2256,153 @@ exit 0
     }
 
     #[tokio::test]
+    async fn failed_confirmation_wins_over_post_rollback_activation_exit() {
+        let base = tmp_base("host-real-rollback-exit");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) =
+            ordered_activation_programs(&base, 42, 1, ActivationEffectOrder::ConfirmationFirst);
+        let task = program_task(BTreeMap::from([("cache".into(), programs)]));
+
+        let outcome = fan_out_with(&run, &built_cache_profile(), task)
+            .await
+            .unwrap();
+        let result = &outcome.results["cache"];
+        assert_eq!(result.state, HostState::RolledBack);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("confirmation failed")
+        );
+        assert_eq!(outcome.summary.failed, 0);
+        assert_eq!(outcome.summary.rolled_back, 1);
+        assert_eq!(outcome.rc, 1);
+        assert!(std::fs::read_to_string(trace).unwrap().contains(" rm "));
+
+        let mut tailer = crate::runner::EventTailer::new(&run.path);
+        tailer.poll();
+        assert_eq!(tailer.hosts["cache"].state, HostState::RolledBack);
+        assert_eq!(
+            tailer.hosts["cache"].milestones,
+            ["copy", "activate", "wait", "rollback"]
+        );
+        let meta = registry::read_meta(&run.path);
+        assert_eq!(meta["summary"]["failed"], 0);
+        assert_eq!(meta["summary"]["rolled_back"], 1);
+    }
+
+    #[tokio::test]
+    async fn successful_confirmation_does_not_hide_activation_failure() {
+        let base = tmp_base("host-activation-exit");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) =
+            ordered_activation_programs(&base, 0, 1, ActivationEffectOrder::ConfirmationFirst);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("ssh activation failed with exit status: 1")
+        );
+        assert!(std::fs::read_to_string(trace).unwrap().contains(" rm "));
+
+        let mut tailer = crate::runner::EventTailer::new(&run.path);
+        tailer.poll();
+        assert_eq!(tailer.hosts["cache"].state, HostState::Failed);
+        assert_eq!(
+            tailer.hosts["cache"].milestones,
+            ["copy", "activate", "wait"]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_wait_activation_exit_wins_over_late_confirmation_success() {
+        let base = tmp_base("host-late-confirmation");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = ordered_activation_programs(
+            &base,
+            0,
+            1,
+            ActivationEffectOrder::ConfirmationAfterActivation,
+        );
+        let task = program_task(BTreeMap::from([("cache".into(), programs)]));
+
+        let outcome = fan_out_with(&run, &built_cache_profile(), task)
+            .await
+            .unwrap();
+        let result = &outcome.results["cache"];
+        assert_eq!(result.state, HostState::RolledBack);
+        assert!(
+            result.error.as_deref().unwrap().contains(
+                "activation rolled back with exit status: 1 before confirmation completed"
+            )
+        );
+        assert_eq!(outcome.summary.failed, 0);
+        assert_eq!(outcome.summary.rolled_back, 1);
+        assert!(std::fs::read_to_string(trace).unwrap().contains(" rm "));
+
+        let mut tailer = crate::runner::EventTailer::new(&run.path);
+        tailer.poll();
+        assert_eq!(tailer.hosts["cache"].state, HostState::RolledBack);
+        assert_eq!(
+            tailer.hosts["cache"].milestones,
+            ["copy", "activate", "wait", "rollback"]
+        );
+        let meta = registry::read_meta(&run.path);
+        assert_eq!(meta["summary"]["failed"], 0);
+        assert_eq!(meta["summary"]["rolled_back"], 1);
+    }
+
+    #[tokio::test]
+    async fn activation_failure_before_waiter_completion_remains_failed() {
+        let base = tmp_base("host-pre-wait-failure");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) =
+            ordered_activation_programs(&base, 0, 1, ActivationEffectOrder::ActivationBeforeWait);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("ssh activation failed with exit status: 1")
+        );
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(trace.contains(" rm -f "));
+        assert!(
+            !trace
+                .lines()
+                .any(|line| line.contains(" rm ") && !line.contains(" rm -f "))
+        );
+
+        let mut tailer = crate::runner::EventTailer::new(&run.path);
+        tailer.poll();
+        assert_eq!(tailer.hosts["cache"].state, HostState::Failed);
+    }
+
+    #[tokio::test]
     async fn copy_failure_maps_to_failed_without_activation() {
         let base = tmp_base("host-failed");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
@@ -2004,7 +2416,7 @@ exit 0
         assert_eq!(result.state, HostState::Failed);
         assert!(result.error.as_deref().unwrap().contains("nix copy failed"));
         let trace = std::fs::read_to_string(trace).unwrap();
-        assert!(!trace.contains("ssh args="));
+        assert!(!trace.contains("ssh USER="));
 
         let mut tailer = crate::runner::EventTailer::new(&run.path);
         tailer.poll();
@@ -2116,7 +2528,7 @@ exit 0
                 .contains("revoke")
         );
         let healthy_trace = std::fs::read_to_string(healthy_trace).unwrap();
-        assert!(healthy_trace.contains("ssh args="));
+        assert!(healthy_trace.contains("ssh USER="));
         assert!(!healthy_trace.contains("revoke"));
 
         let meta = registry::read_meta(&run.path);
@@ -2201,7 +2613,7 @@ exit 0
         assert!(
             std::fs::read_to_string(healthy_trace)
                 .unwrap()
-                .contains("ssh args=")
+                .contains("ssh USER=")
         );
 
         let mut tailer = crate::runner::EventTailer::new(&run.path);

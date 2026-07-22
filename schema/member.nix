@@ -213,6 +213,26 @@ in {
           default = "switch";
           description = "Activation mode: 'switch' for live activation, 'boot' for first-time deploys where switching would break the running system";
         };
+        hostname = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "SSH endpoint override for deployment; null inherits group/fleet settings and ultimately host.fqdn";
+        };
+        sshUser = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "SSH connection user for deployment; null inherits group/fleet settings and ultimately root";
+        };
+        sshPort = mkOption {
+          type = types.nullOr types.port;
+          default = null;
+          description = "SSH connection port for deployment; null inherits group/fleet settings and ultimately 22";
+        };
+        identityFile = mkOption {
+          type = types.nullOr (types.strMatching "/.*");
+          default = null;
+          description = "Absolute path string to the SSH private-key file used for deployment; the path is passed to clients and is never imported into the Nix store";
+        };
         autoRollback = mkOption {
           type = types.nullOr types.bool;
           default = null;

@@ -5,14 +5,15 @@ version: 0.1.0
 readme: README.md
 authors:
   - Bryan Prather-Huff <bryan@pratherhuff.com>
-description: Generic fleet adapters — nix build / deploy-rs action plugins with nom-rendered output, an eval-once fan-out deploy playbook, and an opt-in versioned JSONL event channel for porcelain.
+description: >-
+  Read-only NixOS deployment-state survey for Mandala fleet drift views.
 license:
   - MIT
 tags:
   - nix
   - nixos
-  - deploy-rs
-  - nom
+  - drift
+  - survey
   - mandala
 repository: https://github.com/bryandph/mandala
 build_ignore:

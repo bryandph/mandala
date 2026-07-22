@@ -340,6 +340,7 @@ fn native_deploy_survives_leader_death_and_attaches_after_promotion() {
         "activation": "switch",
         "hostname": "stub.invalid",
         "sshUser": "deployer",
+        "sshPort": 22,
         "sshOpts": [],
         "autoRollback": true,
         "fastConnection": false,

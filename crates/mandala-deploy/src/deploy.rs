@@ -5,8 +5,11 @@
 // SPDX-License-Identifier: MPL-2.0
 //
 // Vendored from serokell/deploy-rs@6d3087eedff75a715b40c0e124ba15d2dd7bec28.
-// Mandala patch: all subprocess output and controller diagnostics flow through
-// DeployData::sink, and caller-selected programs permit effect-isolated tests.
+// Mandala patches: all subprocess output and controller diagnostics flow
+// through DeployData::sink; caller-selected programs permit effect-isolated
+// tests; stale canaries are cleared before a magic-rollback attempt; and
+// post-wait activation/confirmation completion order preserves rollback
+// semantics without parsing activate-rs output.
 
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -97,6 +100,12 @@ pub enum DeployProfileError {
     ActivateSpawn(std::io::Error),
     #[error("ssh activation failed with {0}")]
     ActivateExit(ExitStatus),
+    #[error("failed to clear stale deployment canary over ssh: {0}")]
+    CanaryCleanupSpawn(std::io::Error),
+    #[error("ssh stale deployment canary cleanup failed with {0}")]
+    CanaryCleanupExit(ExitStatus),
+    #[error("activation rolled back with {0} before confirmation completed")]
+    RollbackExit(ExitStatus),
     #[error("failed to run activation waiter over ssh: {0}")]
     WaitSpawn(std::io::Error),
     #[error("ssh activation waiter failed with {0}")]
@@ -108,11 +117,15 @@ pub enum DeployProfileError {
 }
 
 impl DeployProfileError {
-    /// A failed confirmation leaves the magic-rollback canary in place, so
-    /// activate-rs restores the prior generation before its process exits.
+    /// Once the waiter has completed, either a failed confirmation or the
+    /// activation process winning with a non-zero exit means the canary was
+    /// not removed in time and activate-rs restored the prior generation.
     #[must_use]
     pub fn rolled_back(&self) -> bool {
-        matches!(self, Self::ConfirmSpawn(_) | Self::ConfirmExit(_))
+        matches!(
+            self,
+            Self::RollbackExit(_) | Self::ConfirmSpawn(_) | Self::ConfirmExit(_)
+        )
     }
 }
 
@@ -125,11 +138,14 @@ fn ssh_command(deploy_data: &DeployData<'_>, ssh_addr: &str) -> Command {
             .unwrap_or_else(|| Path::new("ssh")),
     );
     command.arg(ssh_addr);
-    command.args(&deploy_data.merged_settings.ssh_opts);
+    command.args(deploy_data.ssh_args());
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in &deploy_data.cmd_overrides.environment {
+        command.env(key, value);
+    }
     command
 }
 
@@ -160,13 +176,41 @@ async fn confirm_profile(
     deploy_data
         .sink
         .emit(Level::Debug, &format!("confirm-command {confirm}"));
-    let output = ssh_command(deploy_data, ssh_addr)
+    let mut command = ssh_command(deploy_data, ssh_addr);
+    command.kill_on_drop(true);
+    let output = command
         .arg(confirm)
         .output()
         .await
         .map_err(DeployProfileError::ConfirmSpawn)?;
     checked_output(output, deploy_data, DeployProfileError::ConfirmExit)?;
     deploy_data.sink.emit(Level::Info, "deployment confirmed");
+    Ok(())
+}
+
+async fn clear_stale_canary(
+    deploy_data: &DeployData<'_>,
+    deploy_defs: &DeployDefs,
+    temp_path: &Path,
+    ssh_addr: &str,
+) -> Result<(), DeployProfileError> {
+    let lock_path = crate::make_lock_path(temp_path, &deploy_data.profile.profile_settings.path);
+    let mut cleanup = format!("rm -f {}", lock_path.display());
+    if let Some(sudo) = &deploy_defs.sudo {
+        cleanup = format!("{sudo} {cleanup}");
+    }
+    deploy_data
+        .sink
+        .emit(Level::Debug, &format!("canary-cleanup-command {cleanup}"));
+    let output = ssh_command(deploy_data, ssh_addr)
+        .arg(cleanup)
+        .output()
+        .await
+        .map_err(DeployProfileError::CanaryCleanupSpawn)?;
+    checked_output(output, deploy_data, DeployProfileError::CanaryCleanupExit)?;
+    deploy_data
+        .sink
+        .emit(Level::Info, "stale deployment canary cleared");
     Ok(())
 }
 
@@ -238,6 +282,12 @@ pub async fn deploy_profile(
         .sink
         .emit(Level::Debug, &format!("wait-command {wait}"));
 
+    // activate-rs leaves its deterministic canary behind when confirmation
+    // times out. Its waiter treats mere existence as readiness, so a retry of
+    // the same immutable closure must remove that stale predecessor before
+    // either the new activation or waiter can observe it.
+    clear_stale_canary(deploy_data, deploy_defs, temp_path, &ssh_addr).await?;
+
     let activate_child = ssh_command(deploy_data, &ssh_addr)
         .arg(activate)
         .spawn()
@@ -270,13 +320,43 @@ pub async fn deploy_profile(
     deploy_data
         .sink
         .emit(Level::Info, "attempting deployment confirmation");
-    let confirmation = confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr).await;
-    if activation_finished.is_none() {
-        let output = activate_output
-            .await
-            .map_err(DeployProfileError::ActivateSpawn)?;
-        checked_output(output, deploy_data, DeployProfileError::ActivateExit)?;
-    }
+    let mut confirmation = Box::pin(confirm_profile(
+        deploy_data,
+        deploy_defs,
+        temp_path,
+        &ssh_addr,
+    ));
+    let confirmation = if activation_finished.is_none() {
+        tokio::select! {
+            // If both children settle in one poll, the activation result is
+            // the protocol authority: confirmation did not complete in time.
+            biased;
+            output = &mut activate_output => {
+                let output = output.map_err(DeployProfileError::ActivateSpawn)?;
+                emit_output(deploy_data.sink, &output);
+                if !output.status.success() {
+                    return Err(DeployProfileError::RollbackExit(output.status));
+                }
+                confirmation.await
+            }
+            result = &mut confirmation => {
+                let output = activate_output
+                    .await
+                    .map_err(DeployProfileError::ActivateSpawn)?;
+                emit_output(deploy_data.sink, &output);
+                // A failed confirmation deliberately leaves the canary in
+                // place, so its typed rollback result wins the expected
+                // non-zero activate-rs exit. A timely successful confirmation
+                // still requires activation itself to succeed.
+                if result.is_ok() && !output.status.success() {
+                    return Err(DeployProfileError::ActivateExit(output.status));
+                }
+                result
+            }
+        }
+    } else {
+        confirmation.await
+    };
     if confirmation.is_err() {
         deploy_data.sink.emit(
             Level::Error,

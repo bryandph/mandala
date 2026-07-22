@@ -25,6 +25,8 @@ pub struct CmdOverrides {
     pub nix_program: Option<PathBuf>,
     /// Alternate `ssh` executable used by effect-isolated tests.
     pub ssh_program: Option<PathBuf>,
+    /// Explicit child environment overrides used by effect-isolated tests.
+    pub environment: Vec<(String, String)>,
 }
 
 pub struct DeployData<'a> {
@@ -56,23 +58,20 @@ pub(crate) enum ProfileInfo {
 
 #[derive(Error, Debug)]
 pub enum DeployDataDefsError {
+    #[error("`sshUser` is not set for profile {0} of node {1}")]
+    MissingSshUser(String, String),
     #[error("Neither `user` nor `sshUser` are set for profile {0} of node {1}")]
     NoProfileUser(String, String),
 }
 
 impl DeployData<'_> {
     pub fn defs(&self) -> Result<DeployDefs, DeployDataDefsError> {
-        let ssh_user = self
-            .merged_settings
-            .ssh_user
-            .clone()
-            .or_else(|| std::env::var("USER").ok())
-            .ok_or_else(|| {
-                DeployDataDefsError::NoProfileUser(
-                    self.profile_name.to_owned(),
-                    self.node_name.to_owned(),
-                )
-            })?;
+        let ssh_user = self.merged_settings.ssh_user.clone().ok_or_else(|| {
+            DeployDataDefsError::MissingSshUser(
+                self.profile_name.to_owned(),
+                self.node_name.to_owned(),
+            )
+        })?;
         let profile_user = self.profile_user()?;
         let sudo = self
             .merged_settings
@@ -117,6 +116,52 @@ impl DeployData<'_> {
             }),
         }
     }
+
+    /// Exact SSH client arguments derived from the flattened contract.
+    /// Connection scalars precede free-form options so ssh's first-value-wins
+    /// behavior keeps the declared endpoint settings authoritative.
+    pub(crate) fn ssh_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_owned(),
+            self.merged_settings.ssh_port.unwrap_or(22).to_string(),
+        ];
+        if let Some(identity_file) = &self.merged_settings.identity_file {
+            args.extend([
+                "-i".to_owned(),
+                identity_file.display().to_string(),
+                "-o".to_owned(),
+                "IdentitiesOnly=yes".to_owned(),
+                "-o".to_owned(),
+                "IdentityAgent=none".to_owned(),
+            ]);
+        }
+        args.extend(self.merged_settings.ssh_opts.iter().cloned());
+        args
+    }
+
+    /// Nix accepts SSH options through one shell-tokenized environment
+    /// string. Quote only arguments that need it so ordinary traces stay
+    /// readable while identity paths containing spaces remain one token.
+    pub(crate) fn nix_ssh_opts(&self) -> String {
+        self.ssh_args()
+            .iter()
+            .map(|arg| shell_word(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b'@')
+        })
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 pub fn make_deploy_data<'a>(
@@ -153,4 +198,99 @@ pub fn make_lock_path(temp_path: &Path, closure: &str) -> PathBuf {
         .next()
         .unwrap_or(closure);
     temp_path.join(format!("deploy-rs-canary-{hash}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::data::{GenericSettings, Node, NodeSettings, Profile, ProfileSettings};
+
+    #[derive(Default)]
+    struct NullSink;
+
+    impl EventSink for NullSink {
+        fn emit(&self, _level: Level, _message: &str) {}
+    }
+
+    fn fixture(settings: GenericSettings) -> (Node, Profile) {
+        let profile = Profile {
+            profile_settings: ProfileSettings {
+                path: "/nix/store/example-profile".into(),
+                profile_path: None,
+            },
+            generic_settings: GenericSettings::default(),
+        };
+        let node = Node {
+            generic_settings: settings,
+            node_settings: NodeSettings {
+                hostname: "declared.example".into(),
+                profiles: HashMap::from([("system".into(), profile.clone())]),
+                profiles_order: vec![],
+            },
+        };
+        (node, profile)
+    }
+
+    #[test]
+    fn declared_connection_is_complete_and_does_not_need_ambient_user() {
+        let (node, profile) = fixture(GenericSettings {
+            ssh_user: Some("declared-user".into()),
+            ssh_port: Some(2222),
+            identity_file: Some("/keys/declared identity".into()),
+            ..GenericSettings::default()
+        });
+        let overrides = CmdOverrides::default();
+        let sink = NullSink;
+        let deploy = make_deploy_data(
+            &GenericSettings::default(),
+            &node,
+            "declared",
+            &profile,
+            "system",
+            &overrides,
+            &sink,
+        );
+
+        assert_eq!(deploy.defs().unwrap().ssh_user, "declared-user");
+        assert_eq!(
+            deploy.ssh_args(),
+            [
+                "-p",
+                "2222",
+                "-i",
+                "/keys/declared identity",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "IdentityAgent=none",
+            ]
+        );
+        assert_eq!(
+            deploy.nix_ssh_opts(),
+            "-p 2222 -i '/keys/declared identity' -o IdentitiesOnly=yes -o IdentityAgent=none"
+        );
+    }
+
+    #[test]
+    fn missing_ssh_user_is_an_error_instead_of_reading_process_user() {
+        let (node, profile) = fixture(GenericSettings::default());
+        let overrides = CmdOverrides::default();
+        let sink = NullSink;
+        let deploy = make_deploy_data(
+            &GenericSettings::default(),
+            &node,
+            "missing-user",
+            &profile,
+            "system",
+            &overrides,
+            &sink,
+        );
+
+        assert!(matches!(
+            deploy.defs(),
+            Err(DeployDataDefsError::MissingSshUser(_, _))
+        ));
+    }
 }

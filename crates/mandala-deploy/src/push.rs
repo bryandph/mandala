@@ -66,13 +66,13 @@ pub async fn push_profile(
         .arg("--to")
         .arg(format!("ssh://{}@{hostname}", deploy_defs.ssh_user))
         .arg(&deploy_data.profile.profile_settings.path)
-        .env(
-            "NIX_SSHOPTS",
-            deploy_data.merged_settings.ssh_opts.join(" "),
-        )
+        .env("NIX_SSHOPTS", deploy_data.nix_ssh_opts())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in &deploy_data.cmd_overrides.environment {
+        command.env(key, value);
+    }
 
     let output = command.output().await?;
     emit_output(deploy_data.sink, &output);
