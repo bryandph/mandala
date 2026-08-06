@@ -14,11 +14,8 @@
 //! → {"id":3,"op":"host_eval","flake":"/p","member":"a"}
 //! ← {"id":3,"ok":true,"value":"/nix/store/…"}      // null if no such nixos host
 //!
-//! → {"id":4,"op":"reload"}                          // drop warm outputs cache
+//! → {"id":4,"op":"ping"}
 //! ← {"id":4,"ok":true}
-//!
-//! → {"id":5,"op":"ping"}
-//! ← {"id":5,"ok":true}
 //! ```
 //!
 //! Errors are returned in-band (`{"id":…,"ok":false,"error":"…"}`), never
@@ -78,10 +75,6 @@ impl Response {
 fn handle(ev: &mut Evaluator, req: &Request) -> Response {
     match req.op.as_str() {
         "ping" => Response::ok(req.id, None),
-        "reload" => {
-            ev.reload();
-            Response::ok(req.id, None)
-        }
         "aggregate" => match ev.aggregate(&req.flake) {
             Ok(v) => Response::ok(req.id, Some(v)),
             Err(e) => Response::err(req.id, e),

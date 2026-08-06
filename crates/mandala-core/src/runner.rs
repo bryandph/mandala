@@ -378,7 +378,10 @@ type ForestRead = (String, Result<nix_build_forest::Derivation, String>);
 
 pub(crate) fn build_duration_cache_path(run_directory: &Path) -> Option<PathBuf> {
     let runs_directory = run_directory.parent()?;
-    (runs_directory.file_name().is_some_and(|name| name == "runs")).then(|| {
+    (runs_directory
+        .file_name()
+        .is_some_and(|name| name == "runs"))
+    .then(|| {
         runs_directory
             .parent()
             .unwrap_or_else(|| Path::new("."))

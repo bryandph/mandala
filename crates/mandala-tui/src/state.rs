@@ -459,10 +459,24 @@ impl AppState {
     /// refreshes the contract (context loads run the `reload` tool first).
     #[must_use]
     pub fn request_reload(&mut self) -> Option<LoadRequest> {
+        self.request_rebind(true)
+    }
+
+    /// Adopt an inventory swap that the context leader has ALREADY evaluated.
+    /// The follow-up load re-reads the shared inventory with `fresh = false`;
+    /// invoking reload again here would recursively cold-evaluate once per
+    /// observer. A locally queued fresh reload is preserved if both events
+    /// race while another load is busy.
+    #[must_use]
+    pub fn request_inventory_swap(&mut self) -> Option<LoadRequest> {
+        self.request_rebind(false)
+    }
+
+    fn request_rebind(&mut self, fresh: bool) -> Option<LoadRequest> {
         self.generation += 1;
         self.inventory = None;
         self.expected = None;
-        self.fresh_wanted = true;
+        self.fresh_wanted |= fresh;
         self.request_load()
     }
 
@@ -1264,6 +1278,22 @@ mod tests {
         s.reload_pending = false; // consume path runs request_load directly
         let req = s.request_load().expect("consumed reload");
         assert!(req.fresh, "the queued reload still refreshes the contract");
+    }
+
+    #[test]
+    fn inventory_swap_rebinds_without_recursive_reload() {
+        let mut s = AppState::new();
+        let req = s.request_inventory_swap().expect("idle swap starts a load");
+        assert!(!req.fresh, "the leader already performed the reload");
+        assert_eq!(req.generation, 1);
+
+        // If a manual reload is already owed behind a busy load, a remote
+        // swap must not erase that stronger request.
+        let mut s = AppState::new();
+        let _ = s.request_load();
+        let _ = s.request_reload();
+        let _ = s.request_inventory_swap();
+        assert!(s.fresh_wanted && s.reload_pending);
     }
 
     #[test]

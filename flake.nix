@@ -119,6 +119,10 @@
         # crate itself is a vendored cargo dep in Cargo.lock.
         nativeBuildInputs = [pkgs.pkg-config pkgs.rustPlatform.bindgenHook];
         buildInputs = [pkgs.nix];
+        # Commit-watcher and moved-flake regressions create temporary Git
+        # repositories during `cargo test`; Git is check-only and does not
+        # enter the shipped runtime closure.
+        nativeCheckInputs = [pkgs.gitMinimal];
 
         # cargo test over the workspace runs in the check phase (the unit
         # tests in each crate, the inline golden-byte format gates, and the

@@ -43,8 +43,10 @@
 //! serde_json's default 2-space pretty.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -339,14 +341,63 @@ pub fn eval_expected(
 /// on any git failure (mirrors the Python `except (OSError, CalledProcessError)`).
 #[must_use]
 pub fn repo_rev(flake: &str) -> Option<String> {
-    let rev = git_output(flake, &["rev-parse", "HEAD"])?;
+    let rev = repo_head(flake)?;
     let dirty = git_output(flake, &["status", "--porcelain"])?;
-    let rev = rev.trim();
     if dirty.trim().is_empty() {
-        Some(rev.to_string())
+        Some(rev)
     } else {
         Some(format!("{rev}-dirty"))
     }
+}
+
+/// The checkout's current commit, without dirty-state decoration. This is the
+/// watcher identity: only a moved commit triggers automatic inventory reload;
+/// uncommitted edits remain an explicit/manual reload concern. `None` for a
+/// non-local/non-Git flake or any transient Git failure.
+#[must_use]
+pub fn repo_head(flake: &str) -> Option<String> {
+    git_output(flake, &["rev-parse", "HEAD"]).map(|rev| rev.trim().to_string())
+}
+
+/// Poll a local checkout's current commit without blocking the async runtime.
+/// `on_change` runs once per successfully observed transition and returns
+/// whether watching should continue. Failed Git probes are ignored so a
+/// transient repository operation cannot replace the last good baseline.
+///
+/// The caller supplies the baseline captured before its initial evaluation;
+/// this closes the slow-first-load race (a commit that lands during that load
+/// is observed as a transition and queues an authoritative reload).
+pub fn spawn_repo_head_watch<F, Fut>(
+    flake: String,
+    initial_head: String,
+    mut on_change: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut(String) -> Fut + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut seen = initial_head;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        // `interval`'s first tick is immediate; consume it so the first Git
+        // process is launched after one cadence, not during caller startup.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let checkout = flake.clone();
+            let Ok(Some(head)) = tokio::task::spawn_blocking(move || repo_head(&checkout)).await
+            else {
+                continue;
+            };
+            if head == seen {
+                continue;
+            }
+            seen = head.clone();
+            if !on_change(head).await {
+                return;
+            }
+        }
+    })
 }
 
 /// Run `git -C <flake> <args>`; `None` if the process fails to spawn, exits
@@ -705,6 +756,132 @@ mod tests {
             .iter()
             .map(|h| ((*h).to_string(), "/nix/store/aaa-x".to_string()))
             .collect()
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn repo_head_changes_only_when_the_commit_moves() {
+        let dir = tmp();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("tracked"), "one\n").unwrap();
+        git(&dir, &["add", "tracked"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Mandala Test",
+                "-c",
+                "user.email=mandala.invalid",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+        let first = repo_head(dir.to_str().unwrap()).expect("first HEAD");
+
+        std::fs::write(dir.join("tracked"), "dirty\n").unwrap();
+        assert_eq!(
+            repo_head(dir.to_str().unwrap()).as_deref(),
+            Some(first.as_str())
+        );
+        let dirty_first = format!("{first}-dirty");
+        assert_eq!(
+            repo_rev(dir.to_str().unwrap()).as_deref(),
+            Some(dirty_first.as_str())
+        );
+
+        git(&dir, &["add", "tracked"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Mandala Test",
+                "-c",
+                "user.email=mandala.invalid",
+                "commit",
+                "-qm",
+                "two",
+            ],
+        );
+        let second = repo_head(dir.to_str().unwrap()).expect("second HEAD");
+        assert_ne!(first, second);
+        assert_eq!(
+            repo_rev(dir.to_str().unwrap()).as_deref(),
+            Some(second.as_str())
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_watcher_ignores_dirty_edits_and_reports_a_commit() {
+        let dir = tmp();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("tracked"), "one\n").unwrap();
+        git(&dir, &["add", "tracked"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Mandala Test",
+                "-c",
+                "user.email=mandala.invalid",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+        let initial = repo_head(dir.to_str().unwrap()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let watch =
+            spawn_repo_head_watch(dir.to_string_lossy().into_owned(), initial, move |head| {
+                let tx = tx.clone();
+                async move { tx.send(head).await.is_ok() }
+            });
+
+        std::fs::write(dir.join("tracked"), "dirty\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(rx.try_recv().is_err(), "a dirty edit is not a commit move");
+
+        git(&dir, &["add", "tracked"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Mandala Test",
+                "-c",
+                "user.email=mandala.invalid",
+                "commit",
+                "-qm",
+                "two",
+            ],
+        );
+        let expected = repo_head(dir.to_str().unwrap()).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("watcher deadline")
+            .expect("watcher event");
+        assert_eq!(observed, expected);
+
+        watch.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // ---- test_expected_cache_roundtrip_and_freshness ------------------------

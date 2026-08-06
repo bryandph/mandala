@@ -63,6 +63,9 @@ pub enum AppEvent {
     /// The context session's role CHANGED (an observer promoted to leader
     /// after winning a re-race; sent only on change by the role watcher).
     McpRoleChanged { leader: bool },
+    /// A standalone TUI (no fleet context) observed a new checkout commit.
+    /// Context-joined TUIs receive the leader's normal reload settle instead.
+    RepoHeadChanged { head: String },
 }
 
 /// Identity of an armed timer. One id = one logical timer; re-arming an id

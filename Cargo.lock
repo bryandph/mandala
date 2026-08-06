@@ -940,6 +940,7 @@ dependencies = [
 name = "mandala-eval-worker"
 version = "0.1.0"
 dependencies = [
+ "mandala-core",
  "nix-bindings",
  "serde",
  "serde_json",

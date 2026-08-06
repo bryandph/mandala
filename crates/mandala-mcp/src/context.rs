@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use mandala_context::{
     CallError, ContextSession, Dispatch, FleetContext, HostConfig, HostConfigFactory,
 };
+use mandala_core::drift;
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::mcp_server::ServerHandler;
 use rust_mcp_sdk::schema::schema_utils::CallToolError;
@@ -114,8 +115,40 @@ fn factory_with_effects(
                 },
             )),
         );
+        spawn_handler_head_watch(&flake, &handler);
         HostConfig::new(handler_dispatch(handler), events)
     })
+}
+
+/// Start the context leader's checkout watcher. Public for the cross-crate TUI
+/// integration gate; production callers get exactly one invocation from the
+/// leader-only host-config factory above.
+#[doc(hidden)]
+pub fn spawn_handler_head_watch(
+    flake: &str,
+    handler: &Arc<MandalaHandler>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let initial_head = drift::repo_head(flake)?;
+    let weak_handler = Arc::downgrade(handler);
+    Some(drift::spawn_repo_head_watch(
+        flake.to_string(),
+        initial_head,
+        move |_head| {
+            let weak_handler = weak_handler.clone();
+            async move {
+                let Some(handler) = weak_handler.upgrade() else {
+                    return false;
+                };
+                // Use the normal dispatch wrapper: the reload is audited,
+                // swaps the leader's inventory atomically, and publishes one
+                // settle event that every observer adopts.
+                let _ = handler
+                    .call_tool_from(Some("checkout-watch"), "reload", serde_json::Map::new())
+                    .await;
+                true
+            }
+        },
+    ))
 }
 
 /// The stdio [`ServerHandler`] of a context-joined instance: the MCP

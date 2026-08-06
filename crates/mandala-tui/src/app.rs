@@ -181,6 +181,18 @@ impl App {
         self.sync_spinner();
     }
 
+    /// Start commit watching only for the context-free fallback shape. A
+    /// joined context's leader owns the one watcher/evaluator for every
+    /// participant and publishes reload settles through the activity stream.
+    pub fn start_fallback_head_watch(&self, initial_head: String) {
+        let flake = self.cfg.flake.clone();
+        let tx = self.tx.clone();
+        drift::spawn_repo_head_watch(flake, initial_head, move |head| {
+            let tx = tx.clone();
+            async move { tx.send(AppEvent::RepoHeadChanged { head }).await.is_ok() }
+        });
+    }
+
     /// Drive the loop until quit. Generic over the backend AND the event
     /// stream so tests can run the real loop on `TestBackend` with a
     /// synthetic stream of key events.
@@ -368,6 +380,16 @@ impl App {
                 });
                 None
             }
+            AppEvent::RepoHeadChanged { head } => {
+                self.state.set_status(
+                    format!(
+                        "checkout moved to {} · reloading inventory",
+                        drift::short_rev(Some(&head))
+                    ),
+                    false,
+                );
+                self.state.request_reload()
+            }
         };
         if let Some(req) = follow_up {
             self.start_load(req);
@@ -397,7 +419,7 @@ impl App {
                 // re-reads the swapped contract through the context (or
                 // re-evaluates locally in the fallback shape), exactly the
                 // Python `McpInventorySwap` minus the eval.
-                if let Some(req) = self.state.request_reload() {
+                if let Some(req) = self.state.request_inventory_swap() {
                     self.start_load(req);
                 }
                 self.state.set_status("inventory reloaded (mcp)", false);

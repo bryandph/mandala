@@ -875,15 +875,9 @@ mod tests {
                 r#"@nix {{"action":"start","id":{id},"type":105,"fields":["{drv}","",1,1]}}"#
             ));
         }
-        forest.feed_line(
-            r#"@nix {"action":"result","id":1,"type":101,"fields":["first-a"]}"#,
-        );
-        forest.feed_line(
-            r#"@nix {"action":"result","id":2,"type":101,"fields":["second-a"]}"#,
-        );
-        forest.feed_line(
-            r#"@nix {"action":"result","id":1,"type":101,"fields":["first-b"]}"#,
-        );
+        forest.feed_line(r#"@nix {"action":"result","id":1,"type":101,"fields":["first-a"]}"#);
+        forest.feed_line(r#"@nix {"action":"result","id":2,"type":101,"fields":["second-a"]}"#);
+        forest.feed_line(r#"@nix {"action":"result","id":1,"type":101,"fields":["first-b"]}"#);
         let snapshot = forest.snapshot();
         assert_eq!(
             snapshot

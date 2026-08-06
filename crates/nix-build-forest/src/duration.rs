@@ -167,7 +167,10 @@ mod tests {
             bytes,
             "{\n  \"version\": 1,\n  \"durations\": {\n    \"demo\": {\n      \"samples\": 2,\n      \"total_ms\": 4000\n    }\n  }\n}\n"
         );
-        assert_eq!(DurationCache::load(&path).unwrap().estimates_ms()["demo"], 2_000);
+        assert_eq!(
+            DurationCache::load(&path).unwrap().estimates_ms()["demo"],
+            2_000
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

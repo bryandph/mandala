@@ -119,6 +119,10 @@ impl ExplorerConfig {
 /// Terminal setup/IO failures.
 pub async fn run_explorer(cfg: ExplorerConfig) -> io::Result<()> {
     install_panic_hook();
+    // Capture the watch baseline BEFORE the slow initial eval. If HEAD moves
+    // during that eval, the watcher observes the transition and queues a load
+    // for the new commit instead of letting the old generation stay final.
+    let initial_head = drift::repo_head(&cfg.flake);
     let context = crate::context::join_context(&cfg.flake).await;
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -128,6 +132,8 @@ pub async fn run_explorer(cfg: ExplorerConfig) -> io::Result<()> {
     app.guard = Some(guard);
     if let Some(ctx) = context {
         app.adopt_context(ctx);
+    } else if let Some(head) = initial_head {
+        app.start_fallback_head_watch(head);
     }
     app.start_initial_load();
     let mut events = EventStream::new();

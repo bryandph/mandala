@@ -8,7 +8,7 @@
 //!   [`mandala-eval-worker`], talking newline-delimited JSON over stdio. A warm
 //!   `EvalState` makes repeated evals (drift refresh, per-host toplevels)
 //!   effectively free. The worker is respawned on crash (one retry per call),
-//!   and `reload` re-roots it so warm state never serves a moved contract.
+//!   and `reload` replaces it so warm state never serves a moved contract.
 //! * `subprocess` — the build-selectable fallback: shell out to
 //!   `nix eval --no-warn-dirty --json`, byte-for-byte the argv the Python
 //!   porcelain uses. No warm state, no worker process; every call is cold.
@@ -188,12 +188,15 @@ impl Evaluator {
         }
     }
 
-    /// Discard warm state so a moved contract is re-locked and re-evaluated on
-    /// the next call. Worker backend: sends `reload` (and restarts the worker if
-    /// it is unreachable). Subprocess backend: a no-op (always cold).
+    /// Discard ALL warm state so a moved contract is re-locked and re-evaluated
+    /// on the next call. Worker backend: drop and reap the worker process; the
+    /// next request lazily starts a new process with a new Nix `EvalState`.
+    /// Clearing only the worker's `LockedFlake` map is insufficient because
+    /// the retained `EvalState` memoizes values from the previous checkout.
+    /// Subprocess backend: a no-op (every call is already cold).
     pub fn reload(&mut self) -> Result<(), EvalError> {
-        if self.backend == Backend::Worker && self.worker.is_some() {
-            self.worker_call("reload", "", None, None)?;
+        if self.backend == Backend::Worker {
+            self.worker.take();
         }
         Ok(())
     }

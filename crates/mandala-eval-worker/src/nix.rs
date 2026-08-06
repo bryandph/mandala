@@ -384,11 +384,4 @@ impl Evaluator {
         }
         Ok(out)
     }
-
-    /// Drop the warm locked-flake cache so a moved contract is re-locked and
-    /// re-evaluated on the next request (stale-state discipline). Dropping each
-    /// [`LockedFlake`] releases its GC-managed graph.
-    pub fn reload(&mut self) {
-        self.cache.clear();
-    }
 }

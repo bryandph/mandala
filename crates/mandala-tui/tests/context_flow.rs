@@ -17,6 +17,8 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ use mandala_context::{
 use mandala_core::inventory::{Inventory, InventoryError};
 use mandala_core::registry::{self, Meta, RunLiveness};
 use mandala_core::runner::{CommandRun, DeployRun};
+use mandala_mcp::context::spawn_handler_head_watch;
 use mandala_mcp::effects::{
     AdhocError, AdhocOutput, CommandLaunch, DeployLaunch, Effects, EvalFailure, SurveyOutput,
 };
@@ -370,6 +373,26 @@ async fn drift_and_reload_settles_update_the_views() {
     );
 }
 
+#[tokio::test]
+async fn standalone_repo_head_event_reloads_without_a_keypress() {
+    test_env();
+    let app = App::new(filled_state(), stub_cfg());
+    app.sender()
+        .send(AppEvent::RepoHeadChanged {
+            head: "bbbbbbbbbbbbbbbb".to_string(),
+        })
+        .await
+        .unwrap();
+    let (app, _terminal) = drive(app, vec![], 600).await;
+    assert_eq!(app.state.generation, 1);
+    assert!(app.state.inventory.is_some());
+    assert!(
+        app.state.status.starts_with("2 members"),
+        "automatic reload repainted the inventory: {:?}",
+        app.state.status
+    );
+}
+
 /// The `m` toggle exists only under `--debug-mcp` (the binding is inert and
 /// unhinted without the flag).
 #[tokio::test]
@@ -460,11 +483,15 @@ async fn debug_panel_renders_and_is_absent_without_the_flag() {
 /// child (the phase-1 machinery, no ansible anywhere).
 struct StubEffects {
     inventory_delay: Duration,
+    reload_count: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
 impl Effects for StubEffects {
     async fn fresh_inventory(&self, _flake: &str) -> Result<Inventory, InventoryError> {
+        if let Some(count) = &self.reload_count {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
         tokio::time::sleep(self.inventory_delay).await;
         Ok(Inventory::from_value(aggregate()).expect("fixture aggregate"))
     }
@@ -532,14 +559,107 @@ fn stub_factory(inventory_delay: Duration) -> HostConfigFactory {
         let (events, _) = broadcast::channel::<Value>(64);
         let sink_events = events.clone();
         let handler = Arc::new(
-            MandalaHandler::with_effects(".", Arc::new(StubEffects { inventory_delay }))
-                .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
-                .with_sink(Arc::new(move |event: &Value| {
-                    let _ = sink_events.send(event.clone());
-                })),
+            MandalaHandler::with_effects(
+                ".",
+                Arc::new(StubEffects {
+                    inventory_delay,
+                    reload_count: None,
+                }),
+            )
+            .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
+            .with_sink(Arc::new(move |event: &Value| {
+                let _ = sink_events.send(event.clone());
+            })),
         );
         HostConfig::new(handler_dispatch(handler), events)
     })
+}
+
+fn counting_stub_factory(reload_count: Arc<AtomicUsize>) -> HostConfigFactory {
+    Arc::new(move || {
+        let (events, _) = broadcast::channel::<Value>(64);
+        let sink_events = events.clone();
+        let handler = Arc::new(
+            MandalaHandler::with_effects(
+                ".",
+                Arc::new(StubEffects {
+                    inventory_delay: Duration::ZERO,
+                    reload_count: Some(Arc::clone(&reload_count)),
+                }),
+            )
+            .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
+            .with_sink(Arc::new(move |event: &Value| {
+                let _ = sink_events.send(event.clone());
+            })),
+        );
+        HostConfig::new(handler_dispatch(handler), events)
+    })
+}
+
+fn watching_stub_factory(flake: PathBuf, reload_count: Arc<AtomicUsize>) -> HostConfigFactory {
+    Arc::new(move || {
+        let (events, _) = broadcast::channel::<Value>(64);
+        let sink_events = events.clone();
+        let handler = Arc::new(
+            MandalaHandler::with_effects(
+                flake.to_string_lossy(),
+                Arc::new(StubEffects {
+                    inventory_delay: Duration::ZERO,
+                    reload_count: Some(Arc::clone(&reload_count)),
+                }),
+            )
+            .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
+            .with_sink(Arc::new(move |event: &Value| {
+                let _ = sink_events.send(event.clone());
+            })),
+        );
+        spawn_handler_head_watch(&flake.to_string_lossy(), &handler)
+            .expect("test checkout has a Git HEAD");
+        HostConfig::new(handler_dispatch(handler), events)
+    })
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(repo)
+        .args(args)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
+fn commit(repo: &std::path::Path, message: &str) {
+    git(repo, &["add", "."]);
+    git(
+        repo,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=Mandala Test",
+            "-c",
+            "user.email=mandala@example.invalid",
+            "commit",
+            "-m",
+            message,
+        ],
+    );
+}
+
+async fn wait_for_count(count: &AtomicUsize, wanted: usize) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while count.load(Ordering::SeqCst) != wanted {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "reload count did not reach {wanted}; got {}",
+            count.load(Ordering::SeqCst)
+        )
+    });
 }
 
 async fn acquire_tui(
@@ -634,6 +754,121 @@ async fn leader_tui_serves_follower_calls_origin_labeled() {
     follower.shutdown(Duration::from_millis(200)).await;
     let mut app = app;
     app.shutdown_context(Duration::from_secs(1)).await;
+}
+
+/// A reload settle means the leader has already evaluated and swapped its
+/// inventory. The observer must re-read that inventory, not recursively issue
+/// a second reload (the pre-fix path paid one cold eval per observer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_adopts_a_reload_with_one_leader_evaluation() {
+    let scratch = test_env().clone();
+    let flake_dir = scratch.join("flake-28882");
+    std::fs::create_dir_all(&flake_dir).unwrap();
+    let identity = ContextIdentity::with_port_range(&flake_dir, 28882, 2).unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let leader = ContextSession::acquire(
+        identity.clone(),
+        test_env().join("state"),
+        "mcp-0",
+        counting_stub_factory(Arc::clone(&count)),
+    )
+    .await
+    .unwrap();
+    let observer = ContextSession::acquire(
+        identity,
+        test_env().join("state"),
+        "tui-2",
+        stub_factory(Duration::ZERO),
+    )
+    .await
+    .unwrap();
+    let mut app = App::new(filled_state(), stub_cfg());
+    app.adopt_context(TuiContext {
+        session: observer,
+        client_name: "tui-2".to_string(),
+        leader: false,
+    });
+
+    let reload = {
+        let leader = leader.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            leader.call("reload", serde_json::Map::new(), false).await
+        })
+    };
+    let (mut app, _terminal) = drive(app, vec![], 900).await;
+    assert!(reload.await.unwrap().is_ok());
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "the observer re-read the swapped inventory without reloading it"
+    );
+    assert!(app.state.inventory.is_some());
+
+    app.shutdown_context(Duration::from_secs(1)).await;
+    leader.shutdown(Duration::from_secs(1)).await;
+}
+
+/// Exactly the context leader watches the checkout. A dirty edit is inert,
+/// each commit causes one reload, promotion installs a new leader-owned
+/// watcher, and the watcher cannot keep a shut-down handler alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repo_head_watch_follows_context_leadership() {
+    let scratch = test_env().join(format!(
+        "head-watch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&scratch).unwrap();
+    git(&scratch, &["init", "-q"]);
+    std::fs::write(scratch.join("marker"), "A\n").unwrap();
+    commit(&scratch, "A");
+
+    let identity = ContextIdentity::with_port_range(&scratch, 28905, 3).unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let factory = watching_stub_factory(scratch.clone(), Arc::clone(&count));
+    let leader = ContextSession::acquire(
+        identity.clone(),
+        test_env().join("state"),
+        "mcp-watch-0",
+        Arc::clone(&factory),
+    )
+    .await
+    .unwrap();
+    assert!(leader.is_leader().await);
+    let follower =
+        ContextSession::acquire(identity, test_env().join("state"), "mcp-watch-1", factory)
+            .await
+            .unwrap();
+    assert!(!follower.is_leader().await);
+
+    std::fs::write(scratch.join("marker"), "dirty\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 0, "dirty edits are inert");
+
+    commit(&scratch, "B");
+    wait_for_count(&count, 1).await;
+
+    leader.shutdown(Duration::from_secs(1)).await;
+    let members = mcp_call(&follower, "members", json!({})).await;
+    assert!(members.get("web").is_some());
+    assert!(follower.is_leader().await, "the follower promoted");
+
+    std::fs::write(scratch.join("marker"), "C\n").unwrap();
+    commit(&scratch, "C");
+    wait_for_count(&count, 2).await;
+
+    follower.shutdown(Duration::from_secs(1)).await;
+    std::fs::write(scratch.join("marker"), "D\n").unwrap();
+    commit(&scratch, "D");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "shut-down leaders cannot reload"
+    );
 }
 
 /// Quit ordering (task 6.4, the drain proof at the TUI level): a follower's
