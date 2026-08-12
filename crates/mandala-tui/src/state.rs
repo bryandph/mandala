@@ -220,6 +220,14 @@ pub struct AppState {
     /// An aggregate/expected eval is in flight (`_busy`): gates BOTH the
     /// load and the expected eval, and queues reloads.
     pub busy: bool,
+    /// `busy` is specifically an expected-toplevel eval. This distinguishes
+    /// a duplicate `S` (still a no-op) from the first `S` pressed while the
+    /// launch/reload inventory eval owns the shared eval slot.
+    pub expected_eval_running: bool,
+    /// An expected-toplevel eval was requested while an inventory load owned
+    /// the eval slot. It starts as soon as the final queued load settles, so
+    /// the first launch-time `S` hydrates the cache instead of disappearing.
+    pub expected_eval_pending: bool,
     /// A reload arrived while busy — queued, not dropped; consumed by the
     /// fill/fail/drift-done paths.
     pub reload_pending: bool,
@@ -301,6 +309,8 @@ impl AppState {
             cached_rev: None,
             generation: 0,
             busy: false,
+            expected_eval_running: false,
+            expected_eval_pending: false,
             reload_pending: false,
             surveying: false,
             survey_n: 0,
@@ -654,13 +664,33 @@ impl AppState {
     }
 
     /// Start the expected-toplevel eval unless an eval-class job already
-    /// runs (`action_eval_expected` returns early on `_busy` — no queueing).
+    /// runs. A duplicate request during an expected eval remains a no-op;
+    /// the first request during an inventory load is queued so launch cannot
+    /// silently lose the operator's cache refresh.
     #[must_use]
     pub fn request_eval_expected(&mut self) -> bool {
         if self.busy {
+            if !self.expected_eval_running {
+                self.expected_eval_pending = true;
+            }
             return false;
         }
         self.busy = true;
+        self.expected_eval_running = true;
+        true
+    }
+
+    /// Start the expected eval queued behind one or more inventory loads.
+    /// The runtime calls this only after a load settles without starting a
+    /// queued reload first.
+    #[must_use]
+    pub fn start_pending_eval_expected(&mut self) -> bool {
+        if self.busy || !self.expected_eval_pending {
+            return false;
+        }
+        self.expected_eval_pending = false;
+        self.busy = true;
+        self.expected_eval_running = true;
         true
     }
 
@@ -675,6 +705,7 @@ impl AppState {
         now: DateTime<Utc>,
     ) -> Option<LoadRequest> {
         self.busy = false;
+        self.expected_eval_running = false;
         let error = match result {
             Ok((rev, expected)) => {
                 self.rev = rev.clone();

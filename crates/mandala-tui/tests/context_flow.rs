@@ -29,6 +29,7 @@ use futures_util::Stream;
 use mandala_context::{
     ContextIdentity, ContextSession, FleetContext, HostConfig, HostConfigFactory, discovery,
 };
+use mandala_core::drift;
 use mandala_core::inventory::{Inventory, InventoryError};
 use mandala_core::registry::{self, Meta, RunLiveness};
 use mandala_core::runner::{CommandRun, DeployRun};
@@ -484,6 +485,7 @@ async fn debug_panel_renders_and_is_absent_without_the_flag() {
 struct StubEffects {
     inventory_delay: Duration,
     reload_count: Option<Arc<AtomicUsize>>,
+    expected_eval_count: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -500,6 +502,9 @@ impl Effects for StubEffects {
         _flake: &str,
         members: &[String],
     ) -> Result<BTreeMap<String, String>, EvalFailure> {
+        if let Some(count) = &self.expected_eval_count {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(members
             .iter()
             .map(|m| (m.clone(), format!("/nix/store/expected-{m}")))
@@ -564,6 +569,7 @@ fn stub_factory(inventory_delay: Duration) -> HostConfigFactory {
                 Arc::new(StubEffects {
                     inventory_delay,
                     reload_count: None,
+                    expected_eval_count: None,
                 }),
             )
             .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
@@ -585,6 +591,7 @@ fn counting_stub_factory(reload_count: Arc<AtomicUsize>) -> HostConfigFactory {
                 Arc::new(StubEffects {
                     inventory_delay: Duration::ZERO,
                     reload_count: Some(Arc::clone(&reload_count)),
+                    expected_eval_count: None,
                 }),
             )
             .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
@@ -606,6 +613,7 @@ fn watching_stub_factory(flake: PathBuf, reload_count: Arc<AtomicUsize>) -> Host
                 Arc::new(StubEffects {
                     inventory_delay: Duration::ZERO,
                     reload_count: Some(Arc::clone(&reload_count)),
+                    expected_eval_count: None,
                 }),
             )
             .preloaded(Inventory::from_value(aggregate()).expect("fixture aggregate"))
@@ -615,6 +623,33 @@ fn watching_stub_factory(flake: PathBuf, reload_count: Arc<AtomicUsize>) -> Host
         );
         spawn_handler_head_watch(&flake.to_string_lossy(), &handler)
             .expect("test checkout has a Git HEAD");
+        HostConfig::new(handler_dispatch(handler), events)
+    })
+}
+
+/// A context leader whose inventory is deliberately cold and slow. This
+/// keeps the launch load in flight long enough to press `S`, while counting
+/// whether that first request eventually reaches the expected evaluator.
+fn cold_counting_stub_factory(
+    inventory_delay: Duration,
+    expected_eval_count: Arc<AtomicUsize>,
+) -> HostConfigFactory {
+    Arc::new(move || {
+        let (events, _) = broadcast::channel::<Value>(64);
+        let sink_events = events.clone();
+        let handler = Arc::new(
+            MandalaHandler::with_effects(
+                ".",
+                Arc::new(StubEffects {
+                    inventory_delay,
+                    reload_count: None,
+                    expected_eval_count: Some(Arc::clone(&expected_eval_count)),
+                }),
+            )
+            .with_sink(Arc::new(move |event: &Value| {
+                let _ = sink_events.send(event.clone());
+            })),
+        );
         HostConfig::new(handler_dispatch(handler), events)
     })
 }
@@ -804,6 +839,60 @@ async fn observer_adopts_a_reload_with_one_leader_evaluation() {
         "the observer re-read the swapped inventory without reloading it"
     );
     assert!(app.state.inventory.is_some());
+
+    app.shutdown_context(Duration::from_secs(1)).await;
+    leader.shutdown(Duration::from_secs(1)).await;
+}
+
+/// The launch inventory load and expected-toplevel eval share one eval slot.
+/// Pressing `S` while that first load is still cold must queue the eval and
+/// hydrate the shared cache on the same keypress, not require a second `S`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_launch_eval_hydrates_cache_after_inventory_load() {
+    let scratch = test_env().clone();
+    let flake_dir = scratch.join("flake-28883");
+    std::fs::create_dir_all(&flake_dir).unwrap();
+    let identity = ContextIdentity::with_port_range(&flake_dir, 28883, 2).unwrap();
+    let expected_eval_count = Arc::new(AtomicUsize::new(0));
+    let leader = ContextSession::acquire(
+        identity.clone(),
+        test_env().join("state"),
+        "mcp-launch",
+        cold_counting_stub_factory(Duration::from_millis(250), Arc::clone(&expected_eval_count)),
+    )
+    .await
+    .unwrap();
+    let observer = ContextSession::acquire(
+        identity,
+        test_env().join("state"),
+        "tui-launch",
+        stub_factory(Duration::ZERO),
+    )
+    .await
+    .unwrap();
+
+    let mut cfg = stub_cfg();
+    cfg.survey_argv = vec!["sh".into(), "-c".into(), "exit 0".into()];
+    let mut app = App::new(AppState::new(), cfg);
+    app.adopt_context(TuiContext {
+        session: observer,
+        client_name: "tui-launch".to_string(),
+        leader: false,
+    });
+    app.start_initial_load();
+
+    let (mut app, _terminal) = drive(app, vec![(20, KeyCode::Char('S'))], 900).await;
+    assert_eq!(
+        expected_eval_count.load(Ordering::SeqCst),
+        1,
+        "the first launch-time S reaches the leader exactly once"
+    );
+    let (_cached_rev, cached) = drift::load_expected(&drift::state_dir());
+    assert_eq!(
+        cached.get("web").map(String::as_str),
+        Some("/nix/store/expected-web"),
+        "the first request hydrates the shared expected cache"
+    );
 
     app.shutdown_context(Duration::from_secs(1)).await;
     leader.shutdown(Duration::from_secs(1)).await;

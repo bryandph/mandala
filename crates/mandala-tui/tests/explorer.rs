@@ -236,13 +236,36 @@ fn load_failure_surfaces_the_last_error_line_sticky() {
 }
 
 #[test]
-fn eval_expected_never_queues_while_busy() {
+fn duplicate_eval_expected_never_queues_while_busy() {
     let mut state = filled_state();
     assert!(state.request_eval_expected());
     // A second S while the eval runs is a no-op (returns early on busy)…
     assert!(!state.request_eval_expected());
     // …and does NOT queue anything for later (unlike a reload).
     assert!(!state.reload_pending);
+    assert!(!state.expected_eval_pending);
+}
+
+#[test]
+fn first_eval_during_launch_queues_until_inventory_lands() {
+    let mut state = AppState::new();
+    let load = state.request_load().expect("launch inventory load starts");
+
+    let (eval, survey) = state.refresh_drift();
+    assert!(!eval, "the shared eval slot is still occupied");
+    assert!(survey, "the independent survey starts immediately");
+    assert!(state.expected_eval_pending, "the first S is retained");
+
+    let follow_up = state.on_load_finished(
+        load.generation,
+        Ok(loaded(Some("aaaaaaaaaaaaaaaa"), None)),
+        &snapshots(),
+        now(),
+    );
+    assert!(follow_up.is_none());
+    assert!(state.start_pending_eval_expected());
+    assert!(state.busy && state.expected_eval_running);
+    assert!(!state.expected_eval_pending);
 }
 
 // ---- reload queued-not-dropped + the stale-aggregate guard ------------------

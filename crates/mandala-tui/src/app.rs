@@ -344,8 +344,10 @@ impl App {
     /// apply (attaching a screen needs the terminal size).
     fn on_app_event(&mut self, ev: AppEvent) -> Option<McpFollowUp> {
         let mut mcp_follow = None;
+        let mut load_settled = false;
         let follow_up = match ev {
             AppEvent::LoadFinished { generation, result } => {
+                load_settled = true;
                 let snapshots = drift::read_snapshots(&drift::state_dir());
                 self.state
                     .on_load_finished(generation, result, &snapshots, Utc::now())
@@ -411,6 +413,8 @@ impl App {
         };
         if let Some(req) = follow_up {
             self.start_load(req);
+        } else if load_settled && self.state.start_pending_eval_expected() {
+            self.start_eval_expected();
         }
         self.sync_spinner();
         self.dirty = true;
