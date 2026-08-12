@@ -1,6 +1,6 @@
 [package]
 name = "mandala-tui"
-description = "Native fleet TUI substrate: hand-rolled ratatui event loop and native Nix build forest"
+description = "Native fleet TUI substrate with a PTY-hosted nix-output-monitor build pane"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -13,7 +13,6 @@ repository.workspace = true
 # vocabulary, `runner::ansible_dir`, and the `cli::load_inventory` seam
 # (`MANDALA_AGGREGATE_FILE`) so tests inject fixtures exactly like the CLI's.
 mandala-core.workspace = true
-nix-build-forest = { workspace = true, features = ["ratatui"] }
 # Section 6: the TUI participates in the per-checkout fleet execution
 # context — leader (hosting the endpoint) or observer (activity
 # subscription), the same `ContextSession` state machine `mandala mcp`
@@ -41,9 +40,17 @@ ratatui = { version = "0.30", features = ["crossterm"] }
 # must stay in lockstep with what ratatui's `crossterm` feature resolves
 # (ratatui-crossterm ^0.29) or the Event types bifurcate.
 crossterm = { version = "0.29", features = ["event-stream"] }
-# Process termination and suspend-to-shell signals. The former PTY-specific
-# term/ioctl features are intentionally absent.
-nix = { version = "0.30", default-features = false, features = ["signal"] }
+# `nom --json` renders into a pane-sized PTY. Its stdin stays a pipe so fed
+# internal-json is not echoed into the emulated terminal; only stdout/stderr
+# use the slave. vt100 + tui-term preserve nom's colors and layout in ratatui.
+vt100 = "0.16"
+tui-term = "0.3"
+# Raw openpty, winsize ioctls, and SIGWINCH/SIGTERM lifecycle handling.
+nix = { version = "0.30", default-features = false, features = [
+  "term",
+  "ioctl",
+  "signal",
+] }
 # One async runtime across the workspace (design mandate): the loop is a
 # single `tokio::select!` over the event stream, the internal channel, and
 # the deadline-min timer set. `process` + `io-util` power the background

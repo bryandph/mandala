@@ -39,7 +39,8 @@ use crate::registry::{self, Meta};
 pub const SUPPORTED_EVENT_VERSIONS: [i64; 2] = [1, 2];
 
 /// The current event protocol emitted by native engine writers. Version 2 is
-/// v1 plus the verbatim `nixlog` record consumed by the native build forest.
+/// v1 plus the verbatim `nixlog` record consumed by the native build forest
+/// and the TUI's `nix-output-monitor` presentation process.
 pub const EVENT_PROTOCOL_VERSION: i64 = 2;
 
 /// Whether an event's `v` field names a supported protocol version.
@@ -436,9 +437,9 @@ pub struct EventTailer {
     /// Native, tolerant Nix activity state shared by every frontend.
     pub forest: nix_build_forest::BuildForest,
     forest_resolver: Option<ForestResolver>,
-    /// Transitional callback receiving every raw `nixlog` line live. New
-    /// consumers should read [`Self::forest`]; this remains for downstream
-    /// compatibility while the legacy aggregate model is retired.
+    /// Presentation callback receiving every raw `nixlog` line live. The TUI
+    /// feeds this stream to `nix-output-monitor`; structured consumers read
+    /// [`Self::forest`] instead.
     pub nixlog_sink: Option<Box<dyn FnMut(String) + Send>>,
 }
 
@@ -565,7 +566,7 @@ impl EventTailer {
     }
 
     /// Parse one raw line and route it: drop unparseable / unsupported-version
-    /// records; `nixlog` → the native forest and transitional sink;
+    /// records; `nixlog` → the native forest and optional presentation sink;
     /// `plugin == "build"` → the legacy build model; else a `host`-tagged
     /// record → that host's run.
     fn route(&mut self, line: &str) {

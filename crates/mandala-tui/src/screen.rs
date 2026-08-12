@@ -22,7 +22,6 @@ use std::collections::{BTreeMap, VecDeque};
 
 use mandala_core::registry::{self, RunLiveness};
 use mandala_core::runner::{COMMAND_LOG, EventTailer, HostState};
-use nix_build_forest::{ForestSnapshot, ForestWidget};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -455,7 +454,7 @@ pub fn host_state_glyph(state: HostState) -> &'static str {
 /// The deploy screen's tab identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployTab {
-    /// The native build-forest pane (`⚙ build`).
+    /// The PTY-hosted nix-output-monitor pane (`⚙ build`).
     Build,
     /// The playbook's own stdout/stderr mirror (`ansible`).
     Playbook,
@@ -508,8 +507,6 @@ pub struct DeployViewState {
     pub after_mutation: bool,
     pub active: DeployTab,
     pub build_line: String,
-    pub forest: Option<Box<ForestSnapshot>>,
-    pub build_scroll: ScrollState,
     pub playbook_lines: Vec<String>,
     pub playbook_scroll: ScrollState,
     /// Sorted by name (the tailer's BTreeMap order).
@@ -537,8 +534,6 @@ impl DeployViewState {
             after_mutation,
             active: DeployTab::Build,
             build_line: String::new(),
-            forest: None,
-            build_scroll: ScrollState::default(),
             playbook_lines: Vec::new(),
             playbook_scroll: ScrollState::default(),
             hosts: Vec::new(),
@@ -576,12 +571,6 @@ impl DeployViewState {
         elapsed_secs: u64,
     ) {
         if let Some(tailer) = tailer {
-            self.forest = Some(Box::new(tailer.forest.snapshot()));
-            let forest_len = self
-                .forest
-                .as_deref()
-                .map_or(0, ForestWidget::activity_line_count);
-            self.build_scroll.update_content(forest_len);
             let b = &tailer.build;
             let mut head = format!(
                 "batch build  built {}/{}  fetched {}/{}  errors {}",
@@ -623,7 +612,7 @@ impl DeployViewState {
 
     pub fn active_scroll_mut(&mut self) -> Option<&mut ScrollState> {
         match &self.active {
-            DeployTab::Build => Some(&mut self.build_scroll),
+            DeployTab::Build => None,
             DeployTab::Playbook => Some(&mut self.playbook_scroll),
             DeployTab::Host(name) => self.host_scrolls.get_mut(name),
             DeployTab::Summary => None,
@@ -878,7 +867,8 @@ fn deploy_tab_label(view: &DeployViewState, tab: &DeployTab, theme: &Theme) -> S
     }
 }
 
-/// The full deploy screen, including the pure native build-forest widget.
+/// The pure deploy screen. The runtime overlays the PTY-hosted nom widget on
+/// the build content area because terminal-emulator state owns process handles.
 pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
     let [header, build, tab_bar, content, recap, footer] = deploy_areas(frame.area());
     render_header(frame, header, "deploy runner", &view.sub_title(), theme);
@@ -904,21 +894,10 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
     frame.render_widget(Line::from(spans), tab_bar);
 
     match &view.active {
-        DeployTab::Build => {
-            if let Some(snapshot) = &view.forest {
-                frame.render_widget(
-                    ForestWidget::new(snapshot)
-                        .styles(theme.forest())
-                        .scroll(view.build_scroll.top_offset(content.height as usize)),
-                    content,
-                );
-            } else {
-                frame.render_widget(
-                    Paragraph::new("waiting for Nix build activity…").style(theme.footer_label),
-                    content,
-                );
-            }
-        }
+        DeployTab::Build => frame.render_widget(
+            Paragraph::new("starting nix-output-monitor…").style(theme.footer_label),
+            content,
+        ),
         DeployTab::Playbook => {
             render_log_tail(
                 frame,
@@ -972,7 +951,7 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
         frame,
         footer,
         &[
-            ("b", "build forest tab"),
+            ("b", "nom build tab"),
             ("p", "playbook output tab"),
             ("s", "summary tab"),
             ("tab", "cycle tabs"),

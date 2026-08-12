@@ -64,6 +64,8 @@
           # Native build deps (openssl-sys and friends)
           pkg-config
           openssl
+          # Interactive `cargo run -- tui` exercises the real build renderer.
+          nix-output-monitor
           # Nix-side tooling (CI runs `nix fmt -- --check .`)
           alejandra
           statix
@@ -117,12 +119,24 @@
         # binding generation. This keeps the flake purity invariant intact —
         # `nix` and clang come from nixpkgs, no new flake inputs; the binding
         # crate itself is a vendored cargo dep in Cargo.lock.
-        nativeBuildInputs = [pkgs.pkg-config pkgs.rustPlatform.bindgenHook];
+        nativeBuildInputs = [
+          pkgs.pkg-config
+          pkgs.rustPlatform.bindgenHook
+          pkgs.makeWrapper
+        ];
         buildInputs = [pkgs.nix];
         # Commit-watcher and moved-flake regressions create temporary Git
         # repositories during `cargo test`; Git is check-only and does not
         # enter the shipped runtime closure.
         nativeCheckInputs = [pkgs.gitMinimal];
+
+        # The interactive build tab spawns `nom --json`. Keep the renderer an
+        # explicit runtime dependency of the public package instead of relying
+        # on the caller's shell PATH.
+        postFixup = ''
+          wrapProgram $out/bin/mandala \
+            --prefix PATH : ${lib.makeBinPath [pkgs.nix-output-monitor]}
+        '';
 
         # cargo test over the workspace runs in the check phase (the unit
         # tests in each crate, the inline golden-byte format gates, and the

@@ -62,11 +62,12 @@ secrets schema, a native CLI/TUI deploy engine, and a minimal
 signatures may change without notice; aggregate outputs carry a
 `schemaVersion` so porcelain can keep up.
 
-The native deploy porcelain folds Nix's structured build events into one
-dependency forest shared by the TUI, headless CLI output, and MCP status.
-The build tab renders that state directly; it does not launch `nom` or host a
-terminal emulator, so the same counts, current activity, and failed derivation
-attribution remain available in non-interactive and CI runs.
+The native deploy porcelain folds Nix's structured build events into a typed
+dependency forest for headless CLI output and MCP status. The interactive TUI
+feeds those same verbatim internal-JSON records to a PTY-hosted
+`nix-output-monitor` build tab; structured counts, current activity, and failed
+derivation attribution remain available independently in non-interactive and
+CI runs.
 
 ## Design
 

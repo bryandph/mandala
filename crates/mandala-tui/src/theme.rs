@@ -1,7 +1,6 @@
 //! One explicit TUI palette and named-style layer.
 
 use mandala_core::drift::DriftStatus;
-use nix_build_forest::ForestStyles;
 use ratatui::style::{Color, Modifier, Style};
 
 use mandala_core::runner::HostState;
@@ -99,19 +98,6 @@ impl Theme {
         };
         self.rich_style(spec)
             .unwrap_or_else(|| panic!("unmapped host-state style {spec:?}"))
-    }
-
-    #[must_use]
-    pub fn forest(&self) -> ForestStyles {
-        ForestStyles {
-            unknown: Style::new().fg(self.palette.muted),
-            planned: Style::new().fg(self.palette.foreground),
-            building: Style::new().fg(self.palette.warning),
-            transfer: Style::new().fg(self.palette.accent),
-            built: Style::new().fg(self.palette.success),
-            failed: Style::new().fg(self.palette.error),
-            summary: self.footer_label,
-        }
     }
 }
 

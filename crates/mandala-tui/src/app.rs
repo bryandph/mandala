@@ -28,6 +28,7 @@ use mandala_core::registry;
 use mandala_core::runner::{DeployRun, ansible_dir};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -206,8 +207,19 @@ impl App {
             if self.dirty {
                 let state = &self.state;
                 let theme = &self.theme;
+                let deploy = self.deploy.as_ref();
                 terminal
-                    .draw(|frame| render_with_theme(state, frame, theme))
+                    .draw(|frame| {
+                        render_with_theme(state, frame, theme);
+                        if let (Some(ScreenState::Deploy(view)), Some(job)) =
+                            (state.screen.as_ref(), deploy)
+                            && view.active == DeployTab::Build
+                            && let Ok(nom) = job.nom.lock()
+                        {
+                            let area = screen::deploy_content_area(frame.area());
+                            frame.render_widget(&*nom, area);
+                        }
+                    })
                     .map_err(io::Error::other)?;
                 self.dirty = false;
             }
@@ -276,7 +288,13 @@ impl App {
             LoopEvent::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 self.on_key(key.code, key.modifiers, terminal).await?;
             }
-            LoopEvent::Term(Event::Resize(_, _)) => {
+            LoopEvent::Term(Event::Resize(width, height)) => {
+                if let Some(job) = self.deploy.as_ref()
+                    && let Ok(mut nom) = job.nom.lock()
+                {
+                    let area = screen::deploy_content_area(Rect::new(0, 0, width, height));
+                    nom.resize(area.height, area.width);
+                }
                 self.dirty = true;
             }
             LoopEvent::Term(_) => {}
@@ -968,9 +986,11 @@ impl App {
         standalone: bool,
         after_mutation: bool,
         attached: bool,
-        _size: (u16, u16),
+        size: (u16, u16),
     ) -> bool {
         let mut job = DeployJob::new(run);
+        let pane = screen::deploy_content_area(Rect::new(0, 0, size.0, size.1));
+        job.spawn_nom(pane.height, pane.width);
         if !attached {
             job.started_at = Some(std::time::Instant::now());
             if let Err(e) = job.run.start().await {
@@ -980,6 +1000,7 @@ impl App {
                 return false;
             }
         }
+        job.attach_nixlog_sink();
         let mut view = screen::DeployViewState::new(
             job.run.limit.clone(),
             job.run.dry_activate,
@@ -996,8 +1017,8 @@ impl App {
         true
     }
 
-    /// Number of structured Nix records accepted by the active deploy's
-    /// native build forest.
+    /// Number of structured Nix records delivered to the active deploy's nom
+    /// renderer.
     #[must_use]
     pub fn deploy_nixlog_lines_seen(&self) -> usize {
         self.deploy.as_ref().map_or(0, DeployJob::nixlog_lines_seen)

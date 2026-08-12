@@ -1,14 +1,16 @@
 //! Deploy-runner runtime: the process half of the deploy screen, and
 //! the standalone `mandala tui deploy` entry (tasks 5.4/5.5/5.6).
 //!
-//! [`DeployJob`] owns or attaches to a [`DeployRun`]; the 250ms loop timer
-//! drives [`DeployJob::tick`], which polls the event tailer and refreshes the
-//! pure [`DeployViewState`] (including its native build-forest snapshot). The
-//! native deploy stays the engine — the argv is built ONLY by
+//! [`DeployJob`] pairs the owned/attached [`DeployRun`] with the PTY-hosted
+//! `nix-output-monitor` pane. The 250ms loop timer polls the event tailer,
+//! finishes the renderer exactly once on `build.done`, and refreshes the pure
+//! [`DeployViewState`]. The native deploy stays the engine — the argv is built ONLY by
 //! `DeployRun`'s own construction (limit guard, throttle, magic rollback
 //! never bypassed), and every child's output is captured (the quiet rule).
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::event::EventStream;
@@ -18,6 +20,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::app::App;
 use crate::explorer::ExplorerConfig;
+use crate::nom_pane::NomPane;
 use crate::screen::DeployViewState;
 use crate::state::AppState;
 use crate::term::{TerminalGuard, install_panic_hook};
@@ -26,6 +29,12 @@ use crate::term::{TerminalGuard, install_panic_hook};
 /// [`DeployJob::tick`] snapshots into the pure view state.
 pub struct DeployJob {
     pub run: DeployRun,
+    /// Runtime-only terminal renderer fed by the tailer's verbatim nixlog
+    /// callback before the first event poll.
+    pub nom: Arc<Mutex<NomPane>>,
+    nom_finished: bool,
+    nixlog_attached: bool,
+    nixlog_lines_seen: Arc<AtomicUsize>,
     /// Owned mode: when the run was launched, for the summary's elapsed
     /// clock. `None` in attached mode (elapsed renders 0 — Python parity).
     pub started_at: Option<Instant>,
@@ -36,25 +45,64 @@ impl DeployJob {
     pub fn new(run: DeployRun) -> Self {
         Self {
             run,
+            nom: Arc::new(Mutex::new(NomPane::new())),
+            nom_finished: false,
+            nixlog_attached: false,
+            nixlog_lines_seen: Arc::new(AtomicUsize::new(0)),
             started_at: None,
         }
     }
 
-    /// Number of structured Nix records accepted by the native forest.
+    /// Spawn `nom --json` on a pane-sized PTY.
+    pub fn spawn_nom(&mut self, rows: u16, cols: u16) {
+        if let Ok(mut nom) = self.nom.lock() {
+            nom.spawn(rows, cols);
+        }
+    }
+
+    /// Wire the raw internal-json stream into nom before the first poll.
+    pub fn attach_nixlog_sink(&mut self) {
+        if self.nixlog_attached {
+            return;
+        }
+        if let Some(tailer) = self.run.tailer.as_mut() {
+            let nom = Arc::clone(&self.nom);
+            let lines_seen = Arc::clone(&self.nixlog_lines_seen);
+            tailer.nixlog_sink = Some(Box::new(move |line| {
+                lines_seen.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut nom) = nom.lock() {
+                    nom.feed(&line);
+                }
+            }));
+            self.nixlog_attached = true;
+        }
+    }
+
+    /// Number of native build records delivered to nom.
     #[must_use]
     pub fn nixlog_lines_seen(&self) -> usize {
-        self.run
-            .tailer
-            .as_ref()
-            .map_or(0, |tailer| tailer.forest.snapshot().version as usize)
+        self.nixlog_lines_seen.load(Ordering::Relaxed)
     }
 
     /// One 250ms poll: consume new events and refresh the view state.
     pub fn tick(&mut self, view: &mut DeployViewState) -> bool {
         // Native owned runs do not have a frontend-allocated tailer. Discover
-        // the engine-owned run before consuming the first event batch.
+        // the engine-owned run, attach nom, and only then consume events.
         let _ = self.run.discover_run();
+        self.attach_nixlog_sink();
         self.run.poll();
+        if !self.nom_finished
+            && self
+                .run
+                .tailer
+                .as_ref()
+                .is_some_and(|tailer| tailer.build.done)
+        {
+            self.nom_finished = true;
+            if let Ok(mut nom) = self.nom.lock() {
+                nom.finish();
+            }
+        }
         let finished = self.run.finished();
         let returncode = self.run.returncode();
         let elapsed = self
@@ -68,7 +116,7 @@ impl DeployJob {
             returncode,
             elapsed,
         );
-        false
+        self.nom.lock().map(|nom| nom.take_dirty()).unwrap_or(false)
     }
 }
 

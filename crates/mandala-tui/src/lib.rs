@@ -27,8 +27,8 @@
 //!   (aggregate load, expected eval, output-captured state survey).
 //! - [`term`] — raw-mode/alternate-screen guard, panic-hook restore,
 //!   suspend-to-shell.
-//! - `nix-build-forest` — native structured Nix activity rendered directly
-//!   in the deploy screen's build tab, without a subprocess or PTY.
+//! - [`nom_pane`] — `nix-output-monitor` fed from the same internal-json
+//!   stream as the native structured forest and hosted in a pane-sized PTY.
 //! - [`ansi`] — the `render.py` CSI/C0 pre-filter + SGR→spans conversion
 //!   every streamed pane line goes through.
 //! - [`screen`] — the action tier's pushed screens as pure data + render
@@ -43,6 +43,7 @@ pub mod context;
 pub mod deploy;
 pub mod event;
 pub mod explorer;
+pub mod nom_pane;
 pub mod render;
 pub mod screen;
 pub mod scroll;

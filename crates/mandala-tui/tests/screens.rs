@@ -336,65 +336,6 @@ fn build_line_tracks_progress_then_done() {
 }
 
 #[test]
-fn build_tab_renders_the_native_forest_snapshot() {
-    let dir = tmp();
-    let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo.drv";
-    write_events(
-        &dir.join("build.jsonl"),
-        &[
-            json!({"plugin":"build","event":"nixlog","line":format!(
-                "@nix {{\"action\":\"start\",\"id\":1,\"type\":105,\"fields\":[\"{drv}\",\"\",1,1],\"text\":\"building demo\"}}"
-            )}),
-            json!({"plugin":"build","event":"nixlog","line":"@nix {\"action\":\"stop\",\"id\":1}"}),
-        ],
-    );
-    let mut tailer = EventTailer::new(&dir);
-    tailer.poll();
-    let mut view = DeployViewState::new("demo", false, false, false, false);
-    view.sync(Some(&tailer), &[], false, None, 0);
-    let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(Box::new(view)));
-    let terminal = draw(&state, 90, 12);
-    let rendered = terminal.backend().to_string();
-    assert!(rendered.contains("✓ demo"), "{rendered}");
-    assert!(rendered.contains("1 built"), "{rendered}");
-}
-
-#[test]
-fn build_forest_uses_shared_scroll_state() {
-    let dir = tmp();
-    let events: Vec<Value> = (0..20)
-        .flat_map(|id| {
-            let drv = format!("/nix/store/{}-demo-{id:02}.drv", "a".repeat(32));
-            [
-                json!({"plugin":"build","event":"nixlog","line":format!(
-                    "@nix {{\"action\":\"start\",\"id\":{id},\"type\":105,\"fields\":[\"{drv}\",\"\",1,1]}}"
-                )}),
-                json!({"plugin":"build","event":"nixlog","line":format!(
-                    "@nix {{\"action\":\"stop\",\"id\":{id}}}"
-                )}),
-            ]
-        })
-        .collect();
-    write_events(&dir.join("build.jsonl"), &events);
-    let mut tailer = EventTailer::new(&dir);
-    tailer.poll();
-    let mut view = DeployViewState::new("demo", false, false, false, false);
-    view.sync(Some(&tailer), &[], false, None, 0);
-    let mut state = AppState::new();
-    state.screen = Some(ScreenState::Deploy(Box::new(view.clone())));
-    let tail = draw(&state, 90, 10).backend().to_string();
-    assert!(tail.contains("demo-19"), "{tail}");
-    assert!(!tail.contains("demo-00"), "{tail}");
-
-    view.build_scroll.to_top(5);
-    state.screen = Some(ScreenState::Deploy(Box::new(view)));
-    let top = draw(&state, 90, 10).backend().to_string();
-    assert!(top.contains("demo-00"), "{top}");
-    assert!(!top.contains("demo-19"), "{top}");
-}
-
-#[test]
 fn explicit_theme_is_threaded_into_the_header() {
     let state = AppState::new();
     let theme = Theme {
