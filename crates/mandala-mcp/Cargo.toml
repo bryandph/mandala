@@ -15,7 +15,7 @@ mandala-core.workspace = true
 mandala-context.workspace = true
 # rust-mcp-sdk: server-only, stdio transport, tool macros (phase-1 spike,
 # section 1.2). HTTP/SSE transports (hyper-server) come in phase 2.
-rust-mcp-sdk = { version = "0.10", default-features = false, features = [
+rust-mcp-sdk = { version = "1.0", default-features = false, features = [
   "server",
   "macros",
   "stdio",

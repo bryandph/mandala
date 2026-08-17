@@ -46,7 +46,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 vt100 = "0.16"
 tui-term = "0.3"
 # Raw openpty, winsize ioctls, and SIGWINCH/SIGTERM lifecycle handling.
-nix = { version = "0.30", default-features = false, features = [
+nix = { version = "0.31", default-features = false, features = [
   "term",
   "ioctl",
   "signal",

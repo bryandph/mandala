@@ -4,7 +4,7 @@
 //! Drives the full initialize → notifications/initialized → tools/list →
 //! tools/call → clean-exit sequence over newline-delimited JSON-RPC, exactly
 //! as a headless MCP client (Claude Code's stdio transport) does. Proves the
-//! rust-mcp-sdk 0.10 stdio server negotiates, advertises the full 12-tool
+//! rust-mcp-sdk 1.0 stdio server negotiates, advertises the full 12-tool
 //! surface, answers a call with structured JSON, and exits 0 when stdin
 //! closes. The fleet is injected via the `MANDALA_AGGREGATE_FILE` seam (the
 //! same aggregate the parity fixtures use), so no flake eval runs; state is
@@ -735,5 +735,62 @@ fn wait_with_timeout(
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
+    }
+}
+
+/// Every protocol version the linked SDK supports must negotiate — above all
+/// the newest one, which is what a current client actually asks for.
+///
+/// Regression (the "mandala MCP times out in Claude Code" bug): `server_info`
+/// advertised a hardcoded `2025-06-18`, so a client negotiating a NEWER
+/// version had its `initialize` dropped — no reply, no stderr, exit 0. The
+/// client could only report a 30s connect timeout, which points nowhere near
+/// protocol negotiation. Claude Code moved to `2025-11-25` and every session
+/// lost the fleet tools.
+///
+/// Driving this from `ProtocolVersion::supported_versions` (rather than a
+/// hardcoded list) means the next SDK bump extends the assertion for free:
+/// whatever the SDK learns to speak, the handshake must actually speak.
+#[test]
+fn stdio_negotiates_every_supported_protocol_version() {
+    for version in mandala_mcp::ProtocolVersion::supported_versions(false) {
+        let version = version.to_string();
+        let (flake, state, aggregate) = scratch_tree(&format!("proto-{version}"));
+        let mut child = spawn_mcp(&flake, &state, &aggregate);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": {"roots": {"listChanged": true}, "elicitation": {}},
+                    "clientInfo": {"name": "claude-code", "version": "0"}
+                }
+            }),
+        );
+        // Closing stdin turns the failure mode into a fast EOF: an unhandled
+        // version makes the server exit silently, so `read_response` fails
+        // with "closed stdout before responding" instead of hanging the suite.
+        drop(stdin);
+
+        let init = read_response(&mut stdout, 1);
+        assert_eq!(
+            init["result"]["protocolVersion"], version,
+            "server must echo the negotiated version {version}: {init}"
+        );
+        assert_eq!(
+            init["result"]["serverInfo"]["name"], "mandala-fleet",
+            "initialize result for {version}: {init}"
+        );
+
+        assert!(
+            wait_with_timeout(&mut child, Duration::from_secs(10)).success(),
+            "clean exit after negotiating {version}"
+        );
     }
 }

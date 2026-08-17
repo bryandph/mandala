@@ -32,7 +32,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "now"] 
 # Safe `kill(pid, 0)` liveness probe for the run registry (no raw unsafe):
 # `nix::sys::signal::kill(pid, None)` sends signal 0, mapping ESRCH→gone,
 # EPERM→exists. `SIGTERM` (for `DeployRun::terminate`) rides the same feature.
-nix = { version = "0.30", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 # The write-side runner (`DeployRun`/`CommandRun`) spawns and supervises
 # subprocesses on tokio: `process` = `tokio::process::Command` + async child
 # wait/try_wait; `io-util` = `AsyncBufReadExt::lines` for the stdout reader

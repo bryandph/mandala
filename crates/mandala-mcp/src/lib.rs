@@ -34,7 +34,7 @@ use mandala_context::{ContextIdentity, ContextSession};
 use rust_mcp_sdk::error::SdkResult;
 use rust_mcp_sdk::mcp_server::{McpServerOptions, ToMcpServerHandler, server_runtime};
 use rust_mcp_sdk::schema::{
-    Implementation, InitializeResult, ProtocolVersion, ServerCapabilities, ServerCapabilitiesTools,
+    Implementation, InitializeResult, ServerCapabilities, ServerCapabilitiesTools,
 };
 use rust_mcp_sdk::{McpServer as _, StdioTransport, TransportOptions};
 
@@ -43,6 +43,11 @@ pub use context::{
     tool_is_idempotent,
 };
 pub use server::{MandalaHandler, server_name};
+
+/// The protocol versions this server can negotiate, re-exported so callers
+/// (and the stdio integration tests) can assert the handshake surface without
+/// taking their own `rust-mcp-sdk` dependency.
+pub use rust_mcp_sdk::schema::ProtocolVersion;
 
 use mandala_core::VERSION;
 
@@ -68,7 +73,12 @@ fn server_info() -> InitializeResult {
             tools: Some(ServerCapabilitiesTools { list_changed: None }),
             ..Default::default()
         },
-        protocol_version: ProtocolVersion::V2025_06_18.into(),
+        // Track the SDK's newest schema rather than pinning a date: a client
+        // that negotiates a version NEWER than the one advertised here gets
+        // its `initialize` dropped with no reply and no stderr, which the
+        // client can only report as a connect timeout (Claude Code moved to
+        // 2025-11-25 and hung for 30s against a pinned 2025-06-18).
+        protocol_version: ProtocolVersion::latest().into(),
         instructions: None,
         meta: None,
     }
