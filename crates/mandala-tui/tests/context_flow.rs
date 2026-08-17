@@ -221,7 +221,7 @@ async fn settle_auto_attaches_reboot_with_live_pid_guard_and_no_double_attach() 
         attached.after_mutation,
         "client runs refresh drift on close"
     );
-    assert!(app.state.attached_runs.contains(&run_id));
+    assert!(app.state.auto_attached_runs.contains(&run_id));
 
     // Replay the same settle after a detach (the carried pure state in a
     // fresh loop — `quit` is sticky on a driven App): the run never
@@ -267,7 +267,7 @@ async fn settle_auto_attaches_reboot_with_live_pid_guard_and_no_double_attach() 
         .unwrap();
     let (app, _terminal) = drive(app, vec![], 300).await;
     assert!(app.state.screen.is_none(), "dead pid must not attach");
-    assert!(!app.state.attached_runs.contains(&dead_id));
+    assert!(!app.state.auto_attached_runs.contains(&dead_id));
 }
 
 /// A client's deploy settle attaches the live per-host deploy view (attached
@@ -330,7 +330,7 @@ async fn settle_auto_attaches_deploy_screen_and_never_clobbers_an_open_screen() 
         matches!(busy.state.screen, Some(ScreenState::Task(_))),
         "an open screen survives a client settle"
     );
-    assert!(!busy.state.attached_runs.contains(&other_id));
+    assert!(!busy.state.auto_attached_runs.contains(&other_id));
 }
 
 /// A settled client `drift(refresh/do_eval)` re-reads the shared state like

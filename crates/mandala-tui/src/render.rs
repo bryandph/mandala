@@ -132,6 +132,7 @@ pub fn render_with_theme(state: &AppState, frame: &mut Frame, theme: &Theme) {
         Some(ScreenState::Task(task)) => screen::render_task(task, frame, theme),
         Some(ScreenState::AttachedLog(attached)) => screen::render_attached(attached, frame, theme),
         Some(ScreenState::Deploy(deploy)) => screen::render_deploy(deploy, frame, theme),
+        Some(ScreenState::Runs(runs)) => screen::render_runs(runs, frame, theme),
     }
 }
 

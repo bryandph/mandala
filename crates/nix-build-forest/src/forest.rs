@@ -120,6 +120,99 @@ pub struct ForestSnapshot {
     pub ignored_lines: u64,
 }
 
+/// Hard cap on activity rows in a [`ForestSummary`]. The projection's row
+/// budget is advisory for ACTIVE work (active/failed rows are mandatory and
+/// may exceed it); the summary must be bounded even against a pathological
+/// stream, so it truncates and reports how many rows it dropped.
+pub const SUMMARY_ACTIVITY_ROW_CAP: usize = 256;
+
+/// The bounded projection of a [`ForestSnapshot`] safe to embed in
+/// size-limited transports (the MCP `deploy_status` result): everything the
+/// snapshot carries EXCEPT the per-node lists that grow with the build graph
+/// (`nodes`, `roots`, `expectations`). The budgeted [`ActivityProjection`]
+/// keeps active/failed work visible; exact counts keep the full-forest shape
+/// legible. Fleet-scale terminal snapshots serialized past a client's
+/// single-message cap through `nodes` — the summary is bounded by
+/// construction (bryan/nixspace#123).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForestSummary {
+    pub version: u64,
+    pub elapsed_ms: u64,
+    pub counts: ForestCounts,
+    pub activity: ActivityProjection,
+    /// Activity rows dropped by [`SUMMARY_ACTIVITY_ROW_CAP`] (0 normally —
+    /// real streams keep concurrent active work near the nix parallelism
+    /// limits, well under the cap).
+    pub activity_rows_truncated: usize,
+    pub completed_downloads: u64,
+    pub completed_substitutions: u64,
+    pub transfers: Vec<Transfer>,
+    pub recent_logs: Vec<BuildLogLine>,
+    pub current_activity: Vec<String>,
+    pub failed_derivations: Vec<String>,
+    pub errors: Vec<String>,
+    pub unknown_activity_types: BTreeMap<i64, u64>,
+    pub unknown_result_types: BTreeMap<i64, u64>,
+    pub unknown_actions: u64,
+    pub malformed_messages: u64,
+    pub ignored_lines: u64,
+}
+
+impl ForestSnapshot {
+    /// Project into the bounded [`ForestSummary`], consuming the snapshot so
+    /// the retained fields move instead of cloning.
+    #[must_use]
+    pub fn into_summary(self) -> ForestSummary {
+        let mut activity = self.activity;
+        let activity_rows_truncated = activity.rows.len().saturating_sub(SUMMARY_ACTIVITY_ROW_CAP);
+        activity.rows.truncate(SUMMARY_ACTIVITY_ROW_CAP);
+        ForestSummary {
+            version: self.version,
+            elapsed_ms: self.elapsed_ms,
+            counts: self.counts,
+            activity,
+            activity_rows_truncated,
+            completed_downloads: self.completed_downloads,
+            completed_substitutions: self.completed_substitutions,
+            transfers: self.transfers,
+            recent_logs: self.recent_logs,
+            current_activity: self.current_activity,
+            failed_derivations: self.failed_derivations,
+            errors: self.errors,
+            unknown_activity_types: self.unknown_activity_types,
+            unknown_result_types: self.unknown_result_types,
+            unknown_actions: self.unknown_actions,
+            malformed_messages: self.malformed_messages,
+            ignored_lines: self.ignored_lines,
+        }
+    }
+
+    /// The node list bounded to `cap` entries for opt-in graph consumers:
+    /// active and failed work first (failed, building, downloading,
+    /// substituting), then planned, then settled/unknown — each tier in the
+    /// snapshot's deterministic order. Returns the kept nodes and how many
+    /// were elided.
+    #[must_use]
+    pub fn capped_nodes(&self, cap: usize) -> (Vec<DerivationNode>, usize) {
+        let tier = |status: DerivationStatus| match status {
+            DerivationStatus::Failed => 0,
+            DerivationStatus::Building => 1,
+            DerivationStatus::Downloading | DerivationStatus::Substituting => 2,
+            DerivationStatus::Planned => 3,
+            DerivationStatus::Built | DerivationStatus::Unknown => 4,
+        };
+        let mut order: Vec<usize> = (0..self.nodes.len()).collect();
+        order.sort_by_key(|&i| (tier(self.nodes[i].status), i));
+        let elided = self.nodes.len().saturating_sub(cap);
+        let kept = order
+            .into_iter()
+            .take(cap)
+            .map(|i| self.nodes[i].clone())
+            .collect();
+        (kept, elided)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedOutcome {
     Ignored,
@@ -933,5 +1026,83 @@ mod tests {
         assert_eq!(transfer.source, None);
         assert_eq!(transfer.destination, None);
         assert_eq!(transfer.progress, None);
+    }
+
+    fn drv_path(n: usize) -> String {
+        format!("/nix/store/{:032}-node-{n}.drv", n)
+    }
+
+    /// The summary keeps every bounded field and none of the graph-sized
+    /// ones; the capped node list is active-first with an exact elision
+    /// count. (The unbounded `nodes` list is what blew a 16MB transport cap
+    /// on a fleet-scale terminal snapshot.)
+    #[test]
+    fn summary_is_bounded_and_capped_nodes_are_active_first() {
+        let mut forest = BuildForest::new();
+        for n in 0..6 {
+            let drv = drv_path(n);
+            forest.feed_line(&format!(
+                r#"@nix {{"action":"start","id":{},"type":105,"fields":["{drv}","",1,1]}}"#,
+                n + 1
+            ));
+        }
+        // Node 0 fails; the rest stay building.
+        forest.feed_line(&format!(
+            r#"@nix {{"action":"msg","level":0,"msg":"error: builder for '{}' failed"}}"#,
+            drv_path(0)
+        ));
+        let snapshot = forest.snapshot();
+        assert_eq!(snapshot.counts.failed, 1);
+
+        let (kept, elided) = snapshot.capped_nodes(3);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(elided, snapshot.counts.total() - 3);
+        // Failed first, then building, in deterministic order.
+        assert_eq!(kept[0].status, DerivationStatus::Failed);
+        assert!(
+            kept[1..]
+                .iter()
+                .all(|node| node.status == DerivationStatus::Building)
+        );
+
+        let summary = snapshot.clone().into_summary();
+        assert_eq!(summary.counts, snapshot.counts);
+        assert_eq!(summary.failed_derivations, snapshot.failed_derivations);
+        assert_eq!(summary.recent_logs, snapshot.recent_logs);
+        let text = serde_json::to_string(&summary).unwrap();
+        // The graph-sized lists are structurally absent from the summary.
+        assert!(!text.contains("\"nodes\""));
+        assert!(!text.contains("\"roots\""));
+        assert!(!text.contains("\"expectations\""));
+    }
+
+    /// A fleet-scale (or pathological) forest still summarizes small: the
+    /// activity rows are hard-capped with an explicit truncation count, and
+    /// the serialized summary stays orders of magnitude under the ~16MB
+    /// transport caps the full snapshot blew (bryan/nixspace#123).
+    #[test]
+    fn fleet_scale_summary_stays_bounded() {
+        let mut forest = BuildForest::new();
+        for n in 0..10_000 {
+            let drv = drv_path(n);
+            forest.feed_line(&format!(
+                r#"@nix {{"action":"start","id":{},"type":105,"fields":["{drv}","",1,1]}}"#,
+                n + 1
+            ));
+        }
+        let snapshot = forest.snapshot();
+        assert_eq!(snapshot.counts.building, 10_000);
+        let summary = snapshot.into_summary();
+        assert_eq!(summary.activity.rows.len(), SUMMARY_ACTIVITY_ROW_CAP);
+        assert_eq!(
+            summary.activity_rows_truncated,
+            10_000 - SUMMARY_ACTIVITY_ROW_CAP
+        );
+        let text = serde_json::to_string(&summary).unwrap();
+        assert!(
+            text.len() < 1_000_000,
+            "summary must stay bounded, got {} bytes",
+            text.len()
+        );
     }
 }

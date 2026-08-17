@@ -267,9 +267,11 @@ pub struct AppState {
     /// key: our own calls are already represented by the explorer's job
     /// flags and never double-render as activity.
     pub mcp_client: Option<String>,
-    /// Runs already auto-attached this session (`_attached_runs`): a settle
-    /// naming an already-attached run attaches nothing.
-    pub attached_runs: BTreeSet<String>,
+    /// Runs already AUTO-attached this session: a settle naming one attaches
+    /// nothing again (a dismissed screen is never re-summoned). Manual
+    /// attachment — the runs screen, `mandala tui attach` — is unrestricted:
+    /// every registry run stays re-attachable for its registry lifetime.
+    pub auto_attached_runs: BTreeSet<String>,
     /// A contract refresh is owed to the next load (see
     /// [`LoadRequest::fresh`]); set by [`AppState::request_reload`] and
     /// consumed by [`AppState::request_load`], so a reload queued behind a
@@ -324,7 +326,7 @@ impl AppState {
             mcp_scroll: ScrollState::default(),
             context_role: None,
             mcp_client: None,
-            attached_runs: BTreeSet::new(),
+            auto_attached_runs: BTreeSet::new(),
             fresh_wanted: false,
             screen: None,
         }

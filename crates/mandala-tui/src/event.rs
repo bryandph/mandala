@@ -78,6 +78,9 @@ pub enum TimerId {
     DeployPoll,
     /// The attached-log screen's 500ms tail/liveness poll.
     AttachedLogPoll,
+    /// The detached-run settlement watch (2s, meta-only): fires the drift
+    /// auto-refresh for a run whose screen was dismissed while it ran.
+    RunWatchPoll,
 }
 
 /// Deadline-min timer set: the loop sleeps until the *earliest* armed

@@ -24,8 +24,8 @@ pub use drv::{Derivation, DrvReader, FsDrvReader, parse_derivation};
 pub use duration::{DURATION_CACHE_RELATIVE_PATH, DurationCache};
 pub use forest::{
     ActivityExpectation, ActivityProgress, BuildForest, BuildLogLine, DERIVATION_LOG_TAIL_LIMIT,
-    DerivationNode, DerivationStatus, FeedOutcome, ForestCounts, ForestSnapshot, RECENT_LOG_LIMIT,
-    Transfer,
+    DerivationNode, DerivationStatus, FeedOutcome, ForestCounts, ForestSnapshot, ForestSummary,
+    RECENT_LOG_LIMIT, Transfer,
 };
 pub use msg::{ActivityType, NixMessage, ResultType, parse_nix_line};
 pub use sort::{

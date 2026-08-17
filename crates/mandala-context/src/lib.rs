@@ -57,6 +57,10 @@ pub enum AcquireError {
     /// A live leader for our flake rejected our token and the discovery file
     /// never yielded a working one.
     TokenUnavailable,
+    /// A bound endpoint kept timing out our handshake for the whole retry
+    /// window: the leader is alive but wedged. The caller degrades to
+    /// standalone — it must NOT claim a second leadership for the checkout.
+    LeaderBusy,
 }
 
 impl From<io::Error> for AcquireError {
@@ -76,6 +80,12 @@ impl std::fmt::Display for AcquireError {
                     "live leader rejected our token and discovery never refreshed"
                 )
             }
+            Self::LeaderBusy => {
+                write!(
+                    f,
+                    "the context leader is bound but too busy to answer; not claiming a second context"
+                )
+            }
         }
     }
 }
@@ -86,6 +96,14 @@ impl std::error::Error for AcquireError {}
 /// token before giving up.
 const TOKEN_RACE_WINDOW: Duration = Duration::from_secs(2);
 const TOKEN_RACE_POLL: Duration = Duration::from_millis(50);
+
+/// Handshake attempts against a busy (bound but timing out) endpoint before
+/// acquisition gives up as [`AcquireError::LeaderBusy`]. Total worst case —
+/// attempts × [`client::HANDSHAKE_TIMEOUT`] plus backoffs — must stay inside
+/// an MCP harness's ~30s connect deadline so a standalone fallback still
+/// answers `initialize` in time.
+const BUSY_PROBE_ATTEMPTS: u32 = 3;
+const BUSY_PROBE_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Acquire the context for `identity`: join the live leader if one answers,
 /// else bind-as-lock and become it.
@@ -115,10 +133,14 @@ pub async fn acquire(
 
     // The discovery url is authoritative for clients: the leader may sit on
     // a walked (non-derived) port. Probe it first; a dead endpoint here is
-    // exactly the stale-discovery case — fall through and claim.
+    // exactly the stale-discovery case — fall through and claim. A BUSY
+    // endpoint (bound, handshake timing out) is a live wedged leader: retry
+    // it, and if the window exhausts, fail the acquisition — falling through
+    // would bind a second context for the checkout.
     if let Some(addr) = existing.as_ref().and_then(Discovery::addr) {
-        match probe(addr, &token, client_name, identity.flake()).await {
+        match probe_with_busy_retry(addr, &token, client_name, identity.flake()).await {
             Probe::OurLeader(client) => return Ok(Acquired::Follower(client)),
+            Probe::Busy => return Err(AcquireError::LeaderBusy),
             Probe::TokenMismatch | Probe::Foreign | Probe::Dead => {}
         }
     }
@@ -148,8 +170,12 @@ pub async fn acquire(
                 return Ok(Acquired::Leader(host));
             }
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                match probe(addr, &token, client_name, identity.flake()).await {
+                match probe_with_busy_retry(addr, &token, client_name, identity.flake()).await {
                     Probe::OurLeader(client) => return Ok(Acquired::Follower(client)),
+                    // Bound but not answering in time: a busy live leader.
+                    // Never step past it to bind another port — degrade to
+                    // standalone instead of splitting the context.
+                    Probe::Busy => return Err(AcquireError::LeaderBusy),
                     Probe::TokenMismatch => {
                         // Our context's live leader, our token stale: we lost
                         // a mint race (concurrent first claims) or hold a
@@ -185,6 +211,9 @@ enum Probe {
     Foreign,
     /// Nothing accepted the connection.
     Dead,
+    /// Accepted the connection but never finished the handshake — a live
+    /// leader too wedged to answer (the busy-retry window already elapsed).
+    Busy,
 }
 
 /// Connect + hello to classify whatever listens at `addr`.
@@ -202,8 +231,31 @@ async fn probe(addr: SocketAddr, token: &str, client_name: &str, flake: &str) ->
             }
         }
         Err(ConnectError::NotAContext(_)) => Probe::Foreign,
+        Err(ConnectError::Timeout) => Probe::Busy,
         Err(ConnectError::Io(_)) => Probe::Dead,
     }
+}
+
+/// [`probe`], but a handshake timeout is retried up to
+/// [`BUSY_PROBE_ATTEMPTS`] with [`BUSY_PROBE_BACKOFF`] between attempts —
+/// a leader mid-grind (a fleet-scale status poll, a long reload) usually
+/// answers on a later try. Only a still-timing-out endpoint classifies as
+/// [`Probe::Busy`].
+async fn probe_with_busy_retry(
+    addr: SocketAddr,
+    token: &str,
+    client_name: &str,
+    flake: &str,
+) -> Probe {
+    for attempt in 1..=BUSY_PROBE_ATTEMPTS {
+        match probe(addr, token, client_name, flake).await {
+            Probe::Busy if attempt < BUSY_PROBE_ATTEMPTS => {
+                tokio::time::sleep(BUSY_PROBE_BACKOFF).await;
+            }
+            outcome => return outcome,
+        }
+    }
+    Probe::Busy
 }
 
 /// A live leader for our flake rejected `stale`: poll discovery until the

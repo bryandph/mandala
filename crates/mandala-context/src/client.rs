@@ -34,8 +34,15 @@ pub enum ConnectError {
     /// tells a port-collision probe WHOSE context answered.
     Unauthorized { server_flake: Option<String> },
     /// The listener did not speak protocol v1 (foreign service, garbage,
-    /// silence, or close-before-welcome).
+    /// or close-before-welcome).
     NotAContext(String),
+    /// The listener accepted the connection but the handshake never finished
+    /// inside [`HANDSHAKE_TIMEOUT`]. Distinct from [`Self::NotAContext`]
+    /// because a wedged-but-live leader looks exactly like this — acquisition
+    /// must treat it as "busy, retry", never as a dead/foreign endpoint it
+    /// may step past (stepping past a busy leader is how a checkout grew a
+    /// second leader — bryan/nixspace#123).
+    Timeout,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -47,6 +54,7 @@ impl std::fmt::Display for ConnectError {
                 None => write!(f, "unauthorized"),
             },
             Self::NotAContext(why) => write!(f, "not a context endpoint: {why}"),
+            Self::Timeout => write!(f, "handshake timed out (endpoint busy or wedged)"),
         }
     }
 }
@@ -162,7 +170,7 @@ impl ContextClient {
         let (mut lines, mut write_half, server_flake, server_pid) =
             tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
                 .await
-                .map_err(|_| ConnectError::NotAContext("handshake timeout".to_string()))??;
+                .map_err(|_| ConnectError::Timeout)??;
 
         let waiters = Arc::new(Mutex::new(Waiters::default()));
         let heartbeats = Arc::new(AtomicU64::new(0));

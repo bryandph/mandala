@@ -68,6 +68,10 @@ pub enum ScreenState {
     AttachedLog(AttachedLogState),
     /// Full screen: the deploy runner.
     Deploy(Box<DeployViewState>),
+    /// Full screen: the registry runs list — every run is (re-)attachable
+    /// for its registry lifetime (fleet-cli requirement "Runs are
+    /// re-attachable"; the foreground verb for backgrounded runs).
+    Runs(RunsState),
 }
 
 // ==== ConfirmScreen ==========================================================
@@ -316,6 +320,9 @@ pub struct AttachedLogState {
     pub scroll: ScrollState,
     pub settled: bool,
     pub after_mutation: bool,
+    /// Standalone (`mandala tui attach`): esc exits the app with the rc
+    /// (0 on live detach) instead of returning to the explorer.
+    pub standalone: bool,
 }
 
 impl AttachedLogState {
@@ -329,6 +336,7 @@ impl AttachedLogState {
             scroll: ScrollState::default(),
             settled: false,
             after_mutation,
+            standalone: false,
         }
     }
 }
@@ -390,6 +398,147 @@ pub fn attached_close_rc(run_id: &str) -> Option<i64> {
         return None;
     }
     obs.info.meta.get("rc").and_then(serde_json::Value::as_i64)
+}
+
+// ==== RunsScreen =============================================================
+
+/// One row of the runs list — a registry run's identity and a cheap,
+/// meta-derived liveness (pid + recorded rc; no event tailing, the list must
+/// open instantly over any run size).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRow {
+    pub run_id: String,
+    pub kind: String,
+    pub limit: String,
+    /// The recorded pid is alive — the run is (very likely) still going.
+    pub live: bool,
+    /// The recorded effective rc, once settled.
+    pub rc: Option<i64>,
+}
+
+impl RunRow {
+    /// The status cell: `running` / `ok` / `rc=<n>` / `unknown`.
+    #[must_use]
+    pub fn status(&self) -> String {
+        if self.live {
+            return "running".to_string();
+        }
+        match self.rc {
+            Some(0) => "ok".to_string(),
+            Some(rc) => format!("rc={rc}"),
+            None => "unknown".to_string(),
+        }
+    }
+}
+
+/// The runs-list screen: every registry run, newest first, each
+/// (re-)attachable — the foreground verb for backgrounded runs.
+#[derive(Debug, Clone, Default)]
+pub struct RunsState {
+    pub rows: Vec<RunRow>,
+    pub cursor: usize,
+}
+
+impl RunsState {
+    /// Snapshot the registry (newest first — `list_runs` order). Registry
+    /// reads are meta-only: cheap enough to run inline on open/refresh.
+    #[must_use]
+    pub fn load() -> Self {
+        let rows = registry::list_runs()
+            .into_iter()
+            .map(|info| RunRow {
+                live: registry::pid_alive(info.pid()),
+                kind: info.kind().to_string(),
+                limit: info
+                    .meta
+                    .get("limit")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                rc: info.meta.get("rc").and_then(serde_json::Value::as_i64),
+                run_id: info.run_id,
+            })
+            .collect();
+        Self { rows, cursor: 0 }
+    }
+
+    /// The row under the cursor.
+    #[must_use]
+    pub fn selected(&self) -> Option<&RunRow> {
+        self.rows.get(self.cursor)
+    }
+
+    pub fn move_cursor(&mut self, delta: i64) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() - 1;
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        {
+            self.cursor = (self.cursor as i64 + delta).clamp(0, last as i64) as usize;
+        }
+    }
+}
+
+/// The runs list: header, one row per run (cursor reversed), attach hint.
+pub fn render_runs(state: &RunsState, frame: &mut Frame, theme: &Theme) {
+    let [header, body, footer] = screen_chrome(frame.area());
+    render_header(
+        frame,
+        header,
+        "runs",
+        &format!("{} in registry", state.rows.len()),
+        theme,
+    );
+    let mut lines: Vec<Line> = Vec::with_capacity(state.rows.len() + 1);
+    lines.push(Line::from(Span::styled(
+        format!("{:<30} {:<8} {:<9} target", "run", "kind", "status"),
+        theme.footer_label,
+    )));
+    for (i, row) in state.rows.iter().enumerate() {
+        let style = if row.live {
+            theme
+                .rich_style("bold green")
+                .expect("default theme maps green")
+        } else if matches!(row.rc, Some(rc) if rc != 0) {
+            theme.status_error
+        } else {
+            Style::new()
+        };
+        let style = if i == state.cursor {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{:<30} {:<8} {:<9} {}",
+                row.run_id,
+                row.kind,
+                row.status(),
+                row.limit
+            ),
+            style,
+        )));
+    }
+    if state.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no registered runs",
+            theme.footer_label,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+    render_footer_hint(
+        frame,
+        footer,
+        &[
+            ("enter", "attach"),
+            ("j/k", "move"),
+            ("r", "refresh"),
+            ("esc", "back"),
+        ],
+        theme,
+    );
 }
 
 /// Tail-read a file from `*offset`, advancing it by the bytes read
@@ -499,11 +648,16 @@ pub struct SummaryState {
 pub struct DeployViewState {
     pub limit: String,
     pub dry_activate: bool,
-    /// Standalone (`mandala tui deploy`): esc exits the app with the rc.
+    /// Standalone (`mandala tui deploy` / `mandala tui attach`): esc exits
+    /// the app with the rc (0 while the run continues detached).
     pub standalone: bool,
-    /// Attached: the run was launched elsewhere — esc detaches, never
-    /// terminates (the run keeps going).
+    /// Attached: the run was launched elsewhere. Esc detaches in BOTH modes
+    /// (runs are engine-owned and survive their frontends); `attached` still
+    /// gates ownership details (elapsed clock, terminate target).
     pub attached: bool,
+    /// `ctrl-k` armed the terminate confirmation: the next `y` SIGTERMs the
+    /// run, anything else disarms. Never a side effect of leaving the view.
+    pub kill_armed: bool,
     pub after_mutation: bool,
     pub active: DeployTab,
     pub build_line: String,
@@ -531,6 +685,7 @@ impl DeployViewState {
             dry_activate,
             standalone,
             attached,
+            kill_armed: false,
             after_mutation,
             active: DeployTab::Build,
             build_line: String::new(),
@@ -942,23 +1097,30 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
     }
     frame.render_widget(Line::from(recap_spans), recap);
 
-    let esc_hint = if view.attached {
-        ("esc", "detach (run keeps going)")
+    // Esc ALWAYS detaches (runs are engine-owned and survive their
+    // frontends); termination is the explicit armed ctrl-k → y sequence.
+    if view.kill_armed {
+        render_footer_hint(
+            frame,
+            footer,
+            &[("y", "TERMINATE the run"), ("any other key", "cancel")],
+            theme,
+        );
+        return;
+    }
+    let mut hints = vec![
+        ("b", "nom build tab"),
+        ("p", "playbook output tab"),
+        ("s", "summary tab"),
+        ("tab", "cycle tabs"),
+    ];
+    if view.finished {
+        hints.push(("esc", "close"));
     } else {
-        ("esc", "back (terminates a running deploy)")
-    };
-    render_footer_hint(
-        frame,
-        footer,
-        &[
-            ("b", "nom build tab"),
-            ("p", "playbook output tab"),
-            ("s", "summary tab"),
-            ("tab", "cycle tabs"),
-            esc_hint,
-        ],
-        theme,
-    );
+        hints.push(("esc", "detach (run keeps going)"));
+        hints.push(("ctrl-k", "terminate…"));
+    }
+    render_footer_hint(frame, footer, &hints, theme);
 }
 
 /// The summary tab body: head + build line, host table, PLAY RECAP verbatim.

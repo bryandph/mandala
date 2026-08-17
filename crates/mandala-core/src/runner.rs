@@ -1187,18 +1187,22 @@ impl DeployRun {
         effective_deploy_returncode(process_rc, self.tailer.as_ref())
     }
 
-    /// Signal the owned subprocess to terminate (SIGTERM, parity of
-    /// `subprocess.Popen.terminate`). A no-op in attached mode (an observer
-    /// never owns the subprocess) or once it has exited.
+    /// Signal the run to terminate (SIGTERM, parity of
+    /// `subprocess.Popen.terminate`). Works in attached mode too — the
+    /// registry meta names the engine pid, so the explicitly-confirmed
+    /// terminate verb reaches a run launched by any frontend. Never fired
+    /// implicitly (screen dismissal detaches); a no-op once the run exited
+    /// (the pid-alive guard also keeps a recycled pid from being signalled).
     pub fn terminate(&mut self) {
-        if self.attached || self.poll_exit().is_some() {
+        if self.poll_exit().is_some() {
             return;
         }
         let deployed_pid = self
             .events_dir
             .as_deref()
             .map(registry::read_meta)
-            .and_then(|meta| meta.get("pid").and_then(Value::as_i64));
+            .and_then(|meta| meta.get("pid").and_then(Value::as_i64))
+            .filter(|pid| registry::pid_alive(Some(*pid)));
         if let Some(pid) = deployed_pid.and_then(|pid| i32::try_from(pid).ok()) {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),

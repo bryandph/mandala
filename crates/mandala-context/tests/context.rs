@@ -357,3 +357,69 @@ async fn heartbeats_cover_a_blocking_call() {
     let seen = client.heartbeats_seen();
     assert!(seen >= 3, "expected heartbeats during the call, saw {seen}");
 }
+
+// ---- busy-leader discipline (bryan/nixspace#123) ----------------------------
+
+/// A bound endpoint that accepts connections but never completes the
+/// handshake is a live wedged leader. Acquisition must retry it and then
+/// fail as LeaderBusy — it must NEVER walk to another port and bind a second
+/// context for the same checkout, and it must not touch the discovery file.
+/// (Split-brain observed live: probe timeouts were classified as
+/// foreign/dead and joiners claimed extra leaderships mid-deploy.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_leader_is_never_usurped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (flake, state) = scratch("busy");
+    let identity = ContextIdentity::with_port_range(&flake, 28900, 8).unwrap();
+
+    // The "wedged leader": accepts, reads nothing, answers nothing.
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, identity.derived_port()));
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let probed = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&probed);
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            held.push(stream); // keep connections open, never respond
+        }
+    });
+
+    // Discovery points at the wedged endpoint, as it would after the real
+    // leader wrote it and then wedged.
+    let token = mandala_context::mint_token();
+    discovery::write(
+        &state,
+        identity.key(),
+        &Discovery {
+            url: format!("tcp://127.0.0.1:{}", identity.derived_port()),
+            token: token.clone(),
+            pid: std::process::id(),
+            flake: identity.flake().to_string(),
+        },
+    )
+    .unwrap();
+    let before = discovery::read(&state, identity.key()).unwrap();
+
+    let outcome = acquire(&identity, &state, "joiner", config).await;
+    match outcome {
+        Err(mandala_context::AcquireError::LeaderBusy) => {}
+        Ok(Acquired::Leader(_)) => panic!("must not claim a second leadership past a busy leader"),
+        Ok(Acquired::Follower(_)) => panic!("nothing completed a handshake to follow"),
+        Err(other) => panic!("expected LeaderBusy, got {other}"),
+    }
+
+    // It really probed (with retries), and left discovery alone.
+    assert!(
+        probed.load(Ordering::SeqCst) >= 2,
+        "expected busy retries, saw {} probe(s)",
+        probed.load(Ordering::SeqCst)
+    );
+    let after = discovery::read(&state, identity.key()).unwrap();
+    assert_eq!(after.url, before.url, "discovery must not be rewritten");
+    assert_eq!(after.token, before.token);
+
+    hold.abort();
+}

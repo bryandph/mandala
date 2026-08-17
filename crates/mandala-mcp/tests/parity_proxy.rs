@@ -628,9 +628,10 @@ async fn leader_and_follower_paths_are_byte_identical() {
     assert_eq!(mixed["liveness"], "rolled-back", "{mixed}");
     assert_eq!(mixed["hosts"]["web"]["state"], "rolled-back");
     assert_eq!(
-        mixed["hosts"]["web"]["raw"],
+        mixed["hosts"]["web"]["raw_tail"],
         json!(["activation failed; rolling back"])
     );
+    assert_eq!(mixed["hosts"]["web"]["raw_lines_total"], 1);
 
     let listing = read_both(follower, local, "deploy_status", &json!({"limit": 5})).await;
     assert!(

@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::Stream;
 use mandala_core::inventory::Inventory;
 use mandala_core::registry::{self, Meta};
@@ -207,11 +207,12 @@ async fn owned_deploy_launches_and_renders_events_live() {
 }
 
 #[tokio::test]
-async fn owned_esc_before_completion_cancels_without_refresh() {
+async fn owned_esc_detaches_without_refresh_or_termination() {
     registry_env();
-    let cfg = stub_cfg(&["sh", "-c", "sleep 30"]);
-    // esc terminates the running deploy and dismisses with rc None (not
-    // yet reaped) — an operator cancel, so no drift refresh.
+    let cfg = stub_cfg(&["sh", "-c", "sleep 2"]);
+    // esc DETACHES the running deploy (never terminates — runs are
+    // engine-owned) and dismisses with rc None; no immediate drift refresh
+    // (that rides the settlement watch once the run completes).
     let app = drive(
         App::new(filled_state(), cfg),
         vec![
@@ -223,7 +224,52 @@ async fn owned_esc_before_completion_cancels_without_refresh() {
     )
     .await;
     assert!(app.state.screen.is_none());
-    assert!(!app.state.surveying, "cancel must not refresh drift");
+    assert!(
+        !app.state.surveying,
+        "detach must not refresh drift eagerly"
+    );
+}
+
+#[tokio::test]
+async fn deploy_ctrl_k_arms_then_y_terminates() {
+    registry_env();
+    let cfg = stub_cfg(&["sh", "-c", "sleep 30"]);
+    // ctrl-k arms the terminate confirmation, y signals the run (SIGTERM),
+    // the run settles killed, and esc then dismisses a finished screen.
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+    let (tx, mut events) = key_channel();
+    let driver = tokio::spawn(async move {
+        let _ = tx.send(key(KeyCode::Char('D')));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(key(KeyCode::Char('y'))); // confirm launch
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = tx.send(Ok(Event::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        ))));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(key(KeyCode::Char('y'))); // confirm terminate
+        // Give SIGTERM time to land and the poll to reap it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        drop(tx);
+    });
+    let mut app = App::new(filled_state(), cfg);
+    app.run(&mut terminal, &mut events)
+        .await
+        .expect("loop runs");
+    driver.await.expect("driver task");
+    // The screen stays up (no esc sent): the gated terminate must have
+    // killed the sleep-30 stub — finished, non-zero (signal) rc, disarmed.
+    let Some(ScreenState::Deploy(view)) = &app.state.screen else {
+        panic!("deploy screen expected, got {:?}", app.state.screen);
+    };
+    assert!(!view.kill_armed, "y must disarm the gate");
+    assert!(view.finished, "terminate must settle the run");
+    assert!(
+        view.returncode.is_some_and(|rc| rc != 0),
+        "a terminated run reports a non-zero rc, got {:?}",
+        view.returncode
+    );
 }
 
 #[tokio::test]
@@ -464,10 +510,66 @@ async fn standalone_exit_code_is_the_run_rc() {
 async fn standalone_operator_cancel_exits_zero() {
     registry_env();
     let mut run = DeployRun::new("web");
-    run.program = Some(vec!["sh".into(), "-c".into(), "sleep 30".into()]);
+    run.program = Some(vec!["sh".into(), "-c".into(), "sleep 2".into()]);
     let mut app = App::new(AppState::new(), ExplorerConfig::default());
     assert!(app.start_deploy(run, true, false, false, (100, 20)).await);
-    // esc before completion: terminate + exit 0 (the Python `run() or 0`).
+    // esc before completion: DETACH + exit 0 (the run continues — the
+    // re-attach notice needs a registry run id, which the raw stub never
+    // registers, so only the exit contract is asserted here).
     let app = drive(app, vec![(400, KeyCode::Esc)], 100).await;
     assert_eq!(app.exit_code, Some(0));
+}
+
+// ---- runs list: the foreground verb (bryan/nixspace#123) --------------------
+
+/// A settled run stays re-attachable any number of times: open the runs
+/// list (`a`), attach (`enter`), detach (`esc`), and do it again — the
+/// retired once-only auto-attach set must not block manual attachment.
+#[tokio::test]
+async fn runs_list_reattaches_a_detached_run_repeatedly() {
+    let (run_id, path) = make_run(&[
+        ("limit", Value::from("web")),
+        ("dry_activate", Value::from(false)),
+        ("pid", Value::from(999_999_991)), // dead → settled
+        ("rc", Value::from(0)),
+    ]);
+    write_events(
+        &path.join("web.jsonl"),
+        &milestones("web", &["eval", "activate", "confirm"]),
+    );
+
+    // One script, two attach rounds (a closed event stream quits the app,
+    // so the round trip must happen inside a single drive): attach, detach,
+    // attach AGAIN — the second attach proves detaching never consumes a
+    // run's attachability.
+    let app = drive(
+        App::new(filled_state(), stub_cfg(&["sh", "-c", "true"])),
+        vec![
+            (0, KeyCode::Char('a')),
+            (150, KeyCode::Enter),
+            (300, KeyCode::Esc),
+            (450, KeyCode::Char('a')),
+            (600, KeyCode::Enter),
+        ],
+        300,
+    )
+    .await;
+    // The registry is shared across this parallel suite, so cursor 0 may be
+    // ANY test's newest run — the invariant under test is that the second
+    // attach opened an observer screen at all (detach never consumes
+    // attachability). The identity-exact rendering is covered by
+    // `attached_deploy_tails_without_launching_and_esc_detaches`.
+    match &app.state.screen {
+        Some(ScreenState::Deploy(view)) => assert!(view.attached, "attached mode"),
+        Some(ScreenState::AttachedLog(_)) => {}
+        other => panic!("re-attach after detach must open an observer screen, got {other:?}"),
+    }
+    // The fixture run is listed and re-listable.
+    assert!(
+        mandala_tui::screen::RunsState::load()
+            .rows
+            .iter()
+            .any(|row| row.run_id == run_id),
+        "the fixture run must appear in the runs list"
+    );
 }

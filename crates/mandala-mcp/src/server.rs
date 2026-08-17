@@ -56,6 +56,19 @@ const DEPLOY_THROTTLE: i64 = 4;
 /// Lines of a command run's teed log surfaced in its snapshot.
 const OUTPUT_TAIL: usize = 120;
 
+/// Lines of a failed/rolled-back host's raw stream surfaced in a deploy
+/// snapshot. The full stream stays on disk in the run dir; the snapshot says
+/// how much it elided. Unbounded host streams were one of the two ways a
+/// fleet-scale `deploy_status` blew a client's 16MB single-message cap
+/// (bryan/nixspace#123).
+const HOST_RAW_TAIL: usize = 200;
+
+/// Node budget for the opt-in `forest_nodes` graph — active-first, with an
+/// explicit elision count. The other half of the 16MB blowup: the default
+/// snapshot now carries the bounded [`nix_build_forest::ForestSummary`]
+/// instead of the full node list.
+const FOREST_NODE_CAP: usize = 2000;
+
 /// systemd unit names an MCP client may restart: a plain name (dots, @, :)
 /// only — anything shell-ish or path-ish is refused before ansible sees it.
 /// (The Python `_UNIT_RE`: `^[A-Za-z0-9][A-Za-z0-9@:._-]*$`.)
@@ -555,29 +568,44 @@ impl MandalaHandler {
                     "invalid run id {run_id:?}: expected a Mandala-generated run id"
                 )));
             }
-            let Some(mut obs) = registry::open_run(run_id) else {
+            let Some(obs) = registry::open_run(run_id) else {
                 return Err(tool_error(format!("no such run: {run_id}")));
+            };
+            let detail = SnapshotDetail::Full {
+                forest_nodes: t.forest_nodes.unwrap_or(false),
             };
             let wait = t.wait_seconds.unwrap_or(0).clamp(0, MAX_WAIT_SECONDS);
             #[allow(clippy::cast_sign_loss)]
             let deadline = Instant::now() + Duration::from_secs(wait as u64);
-            let mut snap = run_snapshot(&mut obs);
+            // Tailing a fleet-scale run parses megabytes of JSONL and clones
+            // the forest — off the async loop, so the leader keeps answering
+            // stdio calls and coordination hellos while a wait poll grinds
+            // (bryan/nixspace#123 starved joiners into connect timeouts). The
+            // same observer threads through every poll: its tail offsets and
+            // forest state advance incrementally.
+            let (mut obs, mut snap) = blocking_snapshot(obs, detail).await?;
             while snap.get("liveness").and_then(Value::as_str) == Some("running")
                 && Instant::now() < deadline
             {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                snap = run_snapshot(&mut obs);
+                (obs, snap) = blocking_snapshot(obs, detail).await?;
             }
+            drop(obs);
             return Ok(snap);
         }
         #[allow(clippy::cast_sign_loss)]
         let limit = t.limit.unwrap_or(10).max(1) as usize;
-        let mut runs = Vec::new();
-        for info in registry::list_runs().into_iter().take(limit) {
-            if let Some(mut obs) = registry::open_run(&info.run_id) {
-                runs.push(run_snapshot(&mut obs));
+        let runs = tokio::task::spawn_blocking(move || {
+            let mut runs = Vec::new();
+            for info in registry::list_runs().into_iter().take(limit) {
+                if let Some(mut obs) = registry::open_run(&info.run_id) {
+                    runs.push(run_snapshot(&mut obs, SnapshotDetail::Listing));
+                }
             }
-        }
+            runs
+        })
+        .await
+        .map_err(|e| tool_error(format!("status task failed: {e}")))?;
         Ok(json!({"runs": runs}))
     }
 
@@ -879,12 +907,42 @@ fn read_log_lines(path: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How much of a run's state a snapshot carries. Every level is bounded by
+/// construction — no field grows with the size of the underlying run
+/// (bryan/nixspace#123: unbounded snapshots got the server disconnected for
+/// flooding its stdio transport).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDetail {
+    /// The no-`run_id` listing: identity, liveness, phase, per-host
+    /// state/rc, build counters — no forest, no raw streams, no milestones.
+    Listing,
+    /// One named run: bounded forest summary, milestones, and bounded raw
+    /// tails for failed/rolled-back hosts; `forest_nodes` opts into the
+    /// capped node graph.
+    Full { forest_nodes: bool },
+}
+
+/// Move one poll+snapshot onto the blocking pool, threading the observer
+/// through so its tail offsets and forest advance incrementally.
+async fn blocking_snapshot(
+    mut obs: ObservedRun,
+    detail: SnapshotDetail,
+) -> Result<(ObservedRun, Value), CallToolError> {
+    tokio::task::spawn_blocking(move || {
+        let snap = run_snapshot(&mut obs, detail);
+        (obs, snap)
+    })
+    .await
+    .map_err(|e| tool_error(format!("status task failed: {e}")))
+}
+
 /// Per-host states + build progress for one registry run. A failed/rolled-
-/// back host carries its raw stream so the client can debug it (the same text
-/// the operator reads in the failed host tab). A command run (reboot, …) has
-/// no event streams: its snapshot is liveness (pid, then the reaped rc) plus
-/// the tail of its teed `output.log`.
-fn run_snapshot(obs: &mut ObservedRun) -> Value {
+/// back host carries a bounded tail of its raw stream (plus how many lines
+/// were elided and where the full stream lives — the run dir) so the client
+/// can debug it without the response growing with the run. A command run
+/// (reboot, …) has no event streams: its snapshot is liveness (pid, then the
+/// reaped rc) plus the tail of its teed `output.log`.
+fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
     if obs.info.kind() != "deploy" {
         return command_snapshot(obs);
     }
@@ -894,18 +952,26 @@ fn run_snapshot(obs: &mut ObservedRun) -> Value {
         let mut entry = json!({
             "state": h.state.as_str(),
             "rc": h.rc,
-            "milestones": h.milestones,
         });
-        if matches!(h.state, HostState::Failed | HostState::RolledBack) {
-            entry["raw"] = Value::from(h.lines.iter().cloned().collect::<Vec<_>>());
+        if let SnapshotDetail::Full { .. } = detail {
+            entry["milestones"] = Value::from(h.milestones.clone());
+            if matches!(h.state, HostState::Failed | HostState::RolledBack) {
+                let tail: Vec<String> = h
+                    .lines
+                    .iter()
+                    .skip(h.lines.len().saturating_sub(HOST_RAW_TAIL))
+                    .cloned()
+                    .collect();
+                entry["raw_tail"] = Value::from(tail);
+                entry["raw_lines_total"] = Value::from(h.lines.len());
+            }
         }
         hosts.insert(name.clone(), entry);
     }
     let b = obs.tailer.build.clone();
-    let forest = obs.tailer.forest.snapshot();
     let liveness = obs.liveness();
     // A coarse phase so an early snapshot doesn't read as stalled: the
-    // The native engine batch-builds every selected profile first (no host
+    // native engine batch-builds every selected profile first (no host
     // events yet), then fans out per host.
     let phase = if liveness != RunLiveness::Running {
         "done"
@@ -914,6 +980,23 @@ fn run_snapshot(obs: &mut ObservedRun) -> Value {
     } else {
         "fan-out"
     };
+    let mut build = json!({
+        "built": b.built,
+        "finished": b.finished,
+        "fetched": b.fetched,
+        "errors": b.errors,
+        "done": b.done,
+        "rc": b.rc,
+    });
+    if let SnapshotDetail::Full { forest_nodes } = detail {
+        let snapshot = obs.tailer.forest.snapshot();
+        if forest_nodes {
+            let (nodes, elided) = snapshot.capped_nodes(FOREST_NODE_CAP);
+            build["nodes"] = serde_json::to_value(nodes).unwrap_or_default();
+            build["nodes_truncated"] = Value::from(elided);
+        }
+        build["forest"] = serde_json::to_value(snapshot.into_summary()).unwrap_or_default();
+    }
     json!({
         "run_id": obs.info.run_id,
         "kind": obs.info.kind(),
@@ -921,15 +1004,7 @@ fn run_snapshot(obs: &mut ObservedRun) -> Value {
         "liveness": liveness.as_str(),
         "phase": phase,
         "hosts": hosts,
-        "build": {
-            "built": b.built,
-            "finished": b.finished,
-            "fetched": b.fetched,
-            "errors": b.errors,
-            "done": b.done,
-            "rc": b.rc,
-            "forest": forest,
-        },
+        "build": build,
     })
 }
 
@@ -1048,8 +1123,11 @@ mod tests {
     fn recorded_ansible_and_engine_runs_have_identical_mcp_snapshots() {
         let mut ansible = recorded_run("ansible");
         let mut engine = recorded_run("engine");
-        let mut ansible_snapshot = run_snapshot(&mut ansible);
-        let mut engine_snapshot = run_snapshot(&mut engine);
+        let detail = SnapshotDetail::Full {
+            forest_nodes: false,
+        };
+        let mut ansible_snapshot = run_snapshot(&mut ansible, detail);
+        let mut engine_snapshot = run_snapshot(&mut engine, detail);
 
         assert_eq!(engine_snapshot["meta"]["build_rc"], 0);
         assert_eq!(engine_snapshot["meta"]["process_rc"], 0);
@@ -1077,13 +1155,41 @@ mod tests {
         assert!(engine_snapshot["build"]["forest"]["current_activity"].is_array());
         assert!(engine_snapshot["build"]["forest"]["recent_logs"].is_array());
         assert!(engine_snapshot["build"]["forest"]["transfers"].is_array());
-        assert!(engine_snapshot["build"]["forest"]["expectations"].is_array());
         assert!(engine_snapshot["build"]["forest"]["activity"].is_object());
+        // The bounded summary never carries the graph-sized lists.
+        assert!(engine_snapshot["build"]["forest"].get("nodes").is_none());
+        assert!(
+            engine_snapshot["build"]["forest"]
+                .get("expectations")
+                .is_none()
+        );
+        assert!(engine_snapshot["build"].get("nodes").is_none());
         assert_eq!(engine_snapshot["hosts"]["alpha"]["state"], "confirmed");
         assert_eq!(engine_snapshot["hosts"]["beta"]["state"], "rolled-back");
         assert_eq!(
-            engine_snapshot["hosts"]["beta"]["raw"],
+            engine_snapshot["hosts"]["beta"]["raw_tail"],
             json!(["confirmation failed; rolled back"])
         );
+        assert_eq!(engine_snapshot["hosts"]["beta"]["raw_lines_total"], 1);
+    }
+
+    /// The opt-in graph is capped active-first with an explicit elision
+    /// count; the listing form carries no forest, no milestones, no raw.
+    #[test]
+    fn snapshot_detail_levels_bound_what_a_run_reports() {
+        let mut engine = recorded_run("engine");
+        let with_nodes = run_snapshot(&mut engine, SnapshotDetail::Full { forest_nodes: true });
+        assert!(with_nodes["build"]["nodes"].is_array());
+        assert_eq!(with_nodes["build"]["nodes_truncated"], 0);
+
+        let mut engine = recorded_run("engine");
+        let listing = run_snapshot(&mut engine, SnapshotDetail::Listing);
+        assert!(listing["build"].get("forest").is_none());
+        assert!(listing["build"].get("nodes").is_none());
+        assert_eq!(listing["hosts"]["beta"]["state"], "rolled-back");
+        assert!(listing["hosts"]["beta"].get("raw_tail").is_none());
+        assert!(listing["hosts"]["beta"].get("milestones").is_none());
+        assert_eq!(listing["liveness"], "rolled-back");
+        assert_eq!(listing["phase"], "done");
     }
 }

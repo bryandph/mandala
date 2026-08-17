@@ -42,8 +42,8 @@ use crate::event::{AppEvent, Deadlines, LoopEvent, TimerId};
 use crate::explorer::{ExplorerConfig, pump_lines, spawn_eval_expected, spawn_load, spawn_survey};
 use crate::render::render_with_theme;
 use crate::screen::{
-    self, AttachedLogState, ConfirmAction, ConfirmState, DeployTab, RebootState, ScreenState,
-    TaskState,
+    self, AttachedLogState, ConfirmAction, ConfirmState, DeployTab, RebootState, RunRow, RunsState,
+    ScreenState, TaskState,
 };
 use crate::state::{AppState, ContextRole, LoadRequest, McpFollowUp, Tab};
 use crate::term::TerminalGuard;
@@ -62,6 +62,9 @@ const DEPLOY_POLL: Duration = Duration::from_millis(250);
 
 /// The attached-log screen's poll cadence (`set_interval(0.5, self._pump)`).
 const ATTACHED_POLL: Duration = Duration::from_millis(500);
+
+/// The detached-run settlement watch cadence (meta-only reads — cheap).
+const RUN_WATCH_POLL: Duration = Duration::from_secs(2);
 
 /// Operator actions above plain navigation — the explicit Action enum of
 /// the design's loop decision. Each variant computes the target
@@ -105,6 +108,12 @@ pub struct App {
     /// The standalone deploy screen's exit code (`run_deploy` reads it
     /// after the loop; the Python `app.exit(returncode)`).
     pub exit_code: Option<i64>,
+    /// A parting notice the standalone entries print AFTER the terminal
+    /// restores (e.g. "run continues detached — re-attach with …").
+    pub detach_notice: Option<String>,
+    /// Runs detached while still live, watched (meta-only, 2s) so the
+    /// after-mutation drift refresh still fires when they settle.
+    watched_runs: Vec<(String, bool)>,
     cfg: ExplorerConfig,
     dirty: bool,
     quit: bool,
@@ -128,6 +137,8 @@ impl App {
             theme: Theme::default(),
             guard: None,
             exit_code: None,
+            detach_notice: None,
+            watched_runs: Vec::new(),
             cfg,
             dirty: true,
             quit: false,
@@ -327,6 +338,9 @@ impl App {
                         .arm(TimerId::AttachedLogPoll, Instant::now() + ATTACHED_POLL);
                 }
             }
+            LoopEvent::Timer(TimerId::RunWatchPoll) => {
+                self.poll_watched_runs();
+            }
             LoopEvent::App(ev) => {
                 if let Some(follow) = self.on_app_event(ev) {
                     let size = terminal.size().map_err(io::Error::other)?;
@@ -473,10 +487,10 @@ impl App {
         if !registry::pid_alive(info.pid()) {
             return;
         }
-        if self.state.attached_runs.contains(&info.run_id) {
+        if self.state.auto_attached_runs.contains(&info.run_id) {
             return;
         }
-        self.state.attached_runs.insert(info.run_id.clone());
+        self.state.auto_attached_runs.insert(info.run_id.clone());
         if kind == "deploy" {
             if let Some(run) = DeployRun::attach(&info.run_id) {
                 // Same continuation as an operator deploy: refresh drift
@@ -488,6 +502,24 @@ impl App {
         let limit = info.meta.get("limit").and_then(Value::as_str).unwrap_or("");
         let title = format!("{kind} {limit}").trim().to_string();
         self.push_attached_log(title, info.run_id.clone(), true);
+    }
+
+    /// Manual attach from the runs screen: unrestricted — live or settled,
+    /// any number of times (the auto-attach once-only set does not apply).
+    /// The after-mutation continuation rides only live runs; re-opening a
+    /// settled run is pure inspection.
+    async fn attach_run_manual(&mut self, row: RunRow, size: (u16, u16)) {
+        if row.kind == "deploy" {
+            if let Some(run) = DeployRun::attach(&row.run_id) {
+                self.start_deploy(run, false, row.live, true, size).await;
+            } else {
+                self.state
+                    .set_status(format!("run {} is gone", row.run_id), true);
+            }
+            return;
+        }
+        let title = format!("{} {}", row.kind, row.limit).trim().to_string();
+        self.push_attached_log(title, row.run_id, row.live);
     }
 
     async fn on_key<B: Backend>(
@@ -609,6 +641,12 @@ impl App {
             KeyCode::Char('R') => self.dispatch(Action::Reboot),
             KeyCode::Char('D') => self.dispatch(Action::Deploy),
 
+            // -- runs list: every registry run is (re-)attachable ---------
+            KeyCode::Char('a') => {
+                self.state.screen = Some(ScreenState::Runs(RunsState::load()));
+                self.dirty = true;
+            }
+
             // -- mcp activity panel (`--debug-mcp` only: without the flag
             // the binding does not exist — the key is inert and the footer
             // never hints it, the `check_action` mechanism) ----------------
@@ -719,13 +757,51 @@ impl App {
                     };
                     self.deadlines.disarm(TimerId::AttachedLogPoll);
                     let rc = screen::attached_close_rc(&attached.run_id);
+                    if rc.is_none() && attached.after_mutation {
+                        // Detached mid-run: the settlement watch keeps the
+                        // after-mutation refresh alive.
+                        self.watch_run(attached.run_id.clone(), true);
+                    }
+                    if attached.standalone {
+                        self.exit_code = Some(rc.unwrap_or(0));
+                        if rc.is_none() {
+                            self.detach_notice = Some(format!(
+                                "run {} continues\nre-attach with: mandala tui attach {}",
+                                attached.run_id, attached.run_id
+                            ));
+                        }
+                        self.state.screen = None;
+                        self.quit = true;
+                        return Ok(());
+                    }
                     self.finish_screen(rc, attached.after_mutation);
                 }
             }
 
-            // DeployScreen: b/p/s + tab cycling; esc terminates (owned) or
-            // detaches (attached), standalone exits the app with the rc.
+            // DeployScreen: b/p/s + tab cycling; esc ALWAYS detaches (runs
+            // are engine-owned and survive their frontends — standalone
+            // exits the app with the rc, 0 while the run continues);
+            // terminate is the explicit armed ctrl-k → y sequence.
+            ScreenState::Deploy(view) if view.kill_armed => {
+                view.kill_armed = false;
+                if code == KeyCode::Char('y') {
+                    if let Some(job) = self.deploy.as_mut() {
+                        job.run.terminate();
+                    }
+                    self.state.set_status("terminate signalled", true);
+                } else {
+                    self.state.set_status("terminate cancelled", false);
+                }
+                self.dirty = true;
+            }
             ScreenState::Deploy(view) => match code {
+                // Before the plain `k` scroll arm — modifiers decide.
+                KeyCode::Char('k')
+                    if modifiers.contains(KeyModifiers::CONTROL) && !view.finished =>
+                {
+                    view.kill_armed = true;
+                    self.dirty = true;
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if let Some(scroll) = view.active_scroll_mut() {
                         scroll.scroll_up(1, size.1.saturating_sub(5) as usize);
@@ -805,20 +881,35 @@ impl App {
                         unreachable!("matched Deploy above");
                     };
                     self.deadlines.disarm(TimerId::DeployPoll);
-                    let rc = match self.deploy.as_mut() {
-                        Some(job) => {
-                            // A no-op in attached mode (an observer never
-                            // owns the subprocess) or once it has exited.
-                            job.run.terminate();
-                            job.run.returncode()
-                        }
-                        None => None,
-                    };
+                    // NEVER terminate on dismissal: the run is engine-owned
+                    // and keeps going; termination is only the gated verb.
+                    let rc = self.deploy.as_mut().and_then(|job| job.run.returncode());
+                    let run_id = self.deploy.as_ref().and_then(|job| job.run.run_id.clone());
                     self.deploy = None;
+                    if rc.is_none()
+                        && let Some(id) = run_id.clone()
+                    {
+                        // Detached mid-run: keep the after-mutation refresh
+                        // alive via the settlement watch.
+                        if view.after_mutation {
+                            self.watch_run(id.clone(), true);
+                        }
+                        self.state.set_status(
+                            format!("detached — run {id} continues (a: runs list)"),
+                            false,
+                        );
+                    }
                     if view.standalone {
-                        // returncode is None if the operator bailed before
-                        // it finished (`DeployApp(run).run() or 0`).
+                        // rc is None if the operator detached before it
+                        // finished (`DeployApp(run).run() or 0`).
                         self.exit_code = Some(rc.unwrap_or(0));
+                        if rc.is_none()
+                            && let Some(id) = run_id
+                        {
+                            self.detach_notice = Some(format!(
+                                "deploy continues detached: run {id}\nre-attach with: mandala tui attach {id}"
+                            ));
+                        }
                         self.state.screen = None;
                         self.quit = true;
                     } else {
@@ -827,8 +918,88 @@ impl App {
                 }
                 _ => {}
             },
+
+            // RunsScreen: navigate, refresh, attach (every registry run is
+            // re-attachable — the foreground verb for backgrounded runs).
+            ScreenState::Runs(runs) => match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    runs.move_cursor(-1);
+                    self.dirty = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    runs.move_cursor(1);
+                    self.dirty = true;
+                }
+                KeyCode::Char('r') => {
+                    *runs = RunsState::load();
+                    self.dirty = true;
+                }
+                KeyCode::Enter => {
+                    let Some(ScreenState::Runs(runs)) = self.state.screen.take() else {
+                        unreachable!("matched Runs above");
+                    };
+                    if let Some(row) = runs.selected().cloned() {
+                        self.attach_run_manual(row, size).await;
+                    }
+                    self.dirty = true;
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.state.screen = None;
+                    self.dirty = true;
+                }
+                _ => {}
+            },
         }
         Ok(())
+    }
+
+    /// Watch a live run whose screen was dismissed: the after-mutation
+    /// drift refresh still fires when it settles (spec: leaving the view
+    /// backgrounds the run, the post-settlement refresh survives).
+    fn watch_run(&mut self, run_id: String, after_mutation: bool) {
+        if self.watched_runs.iter().any(|(id, _)| *id == run_id) {
+            return;
+        }
+        self.watched_runs.push((run_id, after_mutation));
+        if !self.deadlines.is_armed(TimerId::RunWatchPoll) {
+            self.deadlines
+                .arm(TimerId::RunWatchPoll, Instant::now() + RUN_WATCH_POLL);
+        }
+    }
+
+    /// One meta-only pass over the watched runs: a recorded rc (or a dead
+    /// pid) settles the watch and fires the after-mutation continuation; a
+    /// pruned run just stops being watched.
+    fn poll_watched_runs(&mut self) {
+        let mut settled: Vec<(Option<i64>, bool)> = Vec::new();
+        self.watched_runs.retain(|(run_id, after_mutation)| {
+            let Some(obs) = registry::open_run(run_id) else {
+                return false; // pruned
+            };
+            let rc = obs.info.meta.get("rc").and_then(Value::as_i64);
+            if rc.is_none() && registry::pid_alive(obs.info.pid()) {
+                return true; // still running
+            }
+            settled.push((rc, *after_mutation));
+            false
+        });
+        for (rc, after_mutation) in settled {
+            if after_mutation {
+                let (eval, survey) = self.state.after_mutation(rc);
+                if eval {
+                    self.start_eval_expected();
+                }
+                if survey {
+                    self.start_survey();
+                }
+                self.sync_spinner();
+                self.dirty = true;
+            }
+        }
+        if !self.watched_runs.is_empty() {
+            self.deadlines
+                .arm(TimerId::RunWatchPoll, Instant::now() + RUN_WATCH_POLL);
+        }
     }
 
     /// A screen dismissed with `rc`. The after-mutation rule: a completed

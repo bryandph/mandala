@@ -172,7 +172,16 @@ pub struct ReloadTool {}
         "`wait_seconds` (with a `run_id`) blocks until the run leaves the\n",
         "`running` state or the wait elapses — one call instead of a poll\n",
         "loop; capped at 570s to stay under client timeouts. The returned\n",
-        "`liveness` tells whether it finished or the wait timed out."
+        "`liveness` tells whether it finished or the wait timed out.\n",
+        "\n",
+        "Every response is bounded: a named deploy carries a build-forest\n",
+        "SUMMARY (status counts, failed derivation names, current activity,\n",
+        "recent log ring, budgeted activity rows) and failed/rolled-back\n",
+        "hosts carry `raw_tail` (last 200 lines) + `raw_lines_total`; the\n",
+        "full stream lives in the run dir named by `meta`. The listing form\n",
+        "is lighter still (states and counters only). Set `forest_nodes` to\n",
+        "add the per-derivation graph, capped at 2000 active-first nodes\n",
+        "with `nodes_truncated` reporting any elision."
     )
 )]
 #[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
@@ -185,6 +194,9 @@ pub struct DeployStatusTool {
     /// Block until the run settles or the wait elapses (cap 570).
     #[json_schema(default = 0)]
     pub wait_seconds: Option<i64>,
+    /// Include the capped per-derivation node graph (with a `run_id`).
+    #[json_schema(default = false)]
+    pub forest_nodes: Option<bool>,
 }
 
 /// `build` arguments.

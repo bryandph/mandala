@@ -174,8 +174,84 @@ pub async fn run_deploy(cfg: DeployConfig) -> io::Result<i64> {
     let mut events = EventStream::new();
     let result = app.run(&mut terminal, &mut events).await;
     let code = app.exit_code.unwrap_or(0);
+    let notice = app.detach_notice.take();
     drop(app); // restores the terminal via the guard
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
     result.map(|()| code)
+}
+
+/// Attach an observer screen to a registry run from the shell (`mandala tui
+/// attach <run-id>`): live or settled, launched by any frontend — the
+/// direct foreground verb for a backgrounded run. Exit code = the run's
+/// effective rc when observed to settlement, 0 on live detach (with the
+/// re-attach notice printed after the terminal restores).
+///
+/// # Errors
+/// An unknown/malformed run id (refused before the terminal opens) and
+/// terminal setup/IO failures.
+pub async fn run_attach(flake: String, run_id: String) -> io::Result<i64> {
+    use mandala_core::registry;
+
+    // Validate + resolve BEFORE the alternate screen: a bad id prints
+    // normally and nothing launches (id confinement as in the MCP).
+    if !registry::is_valid_run_id(&run_id) {
+        return Err(io::Error::other(format!(
+            "invalid run id {run_id:?}: expected a Mandala-generated run id"
+        )));
+    }
+    let Some(info) = registry::open_run(&run_id).map(|obs| obs.info) else {
+        return Err(io::Error::other(format!("no such run: {run_id}")));
+    };
+
+    install_panic_hook();
+    let guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut app = App::new(AppState::new(), ExplorerConfig::for_flake(flake));
+    app.guard = Some(guard);
+    let size = terminal.size()?;
+    if info.kind() == "deploy" {
+        let run = DeployRun::attach(&run_id)
+            .ok_or_else(|| io::Error::other(format!("run {run_id} vanished")))?;
+        // standalone + attached: esc exits the app; the run is never owned.
+        app.start_deploy(run, true, false, true, (size.width, size.height))
+            .await;
+    } else {
+        let limit = info
+            .meta
+            .get("limit")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let title = format!("{} {}", info.kind(), limit).trim().to_string();
+        app.push_attached_log(title, run_id.clone(), false);
+        if let Some(crate::screen::ScreenState::AttachedLog(attached)) = &mut app.state.screen {
+            attached.standalone = true;
+        }
+    }
+    let mut events = EventStream::new();
+    let result = app.run(&mut terminal, &mut events).await;
+    let code = app.exit_code.unwrap_or(0);
+    let notice = app.detach_notice.take();
+    drop(app); // restores the terminal via the guard
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
+    result.map(|()| code)
+}
+
+/// As [`run_attach`], hosting its own current-thread runtime — the
+/// `mandala tui attach` bin entry.
+///
+/// # Errors
+/// Runtime construction and [`run_attach`] failures.
+pub fn run_attach_blocking(flake: String, run_id: String) -> io::Result<i64> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run_attach(flake, run_id));
+    rt.shutdown_timeout(crate::explorer::RUNTIME_TEARDOWN_BOUND);
+    result
 }
 
 /// As [`run_deploy`], hosting its own current-thread runtime — the

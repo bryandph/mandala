@@ -104,6 +104,14 @@ pub enum TuiRequest {
         /// `--throttle`: per-host deploy parallelism (default 4).
         throttle: i64,
     },
+    /// `mandala tui attach <RUN_ID>` — open an observer screen on a registry
+    /// run (live or settled, launched by any frontend). Exit code = the
+    /// run's effective rc when observed to settlement, 0 on live detach.
+    Attach {
+        /// The Mandala-generated run id (validated against the registry
+        /// before any terminal setup).
+        run_id: String,
+    },
 }
 
 /// The native-TUI launcher closure: the resolved `--flake` value plus the
@@ -249,6 +257,16 @@ impl Cli {
                                     .default_value("4")
                                     .help("Per-host deploy parallelism"),
                             ),
+                    )
+                    .subcommand(
+                        Command::new("attach")
+                            .about("Attach an observer screen to a registry run (live or settled; exit code = the run's effective rc, 0 on live detach)")
+                            .arg(
+                                Arg::new("run-id")
+                                    .required(true)
+                                    .value_name("RUN_ID")
+                                    .help("The run id (see `deploy_status` or the TUI runs list)"),
+                            ),
                     ),
             );
         for engine in &self.engines {
@@ -336,6 +354,9 @@ fn tui_request(m: &ArgMatches) -> TuiRequest {
             limit: d.get_one::<String>("limit").cloned().unwrap_or_default(),
             dry_activate: d.get_flag("dry-activate"),
             throttle: d.get_one::<i64>("throttle").copied().unwrap_or(4),
+        },
+        Some(("attach", a)) => TuiRequest::Attach {
+            run_id: a.get_one::<String>("run-id").cloned().unwrap_or_default(),
         },
         _ => TuiRequest::Explorer {
             debug_mcp: m.get_flag("debug-mcp"),
@@ -772,6 +793,16 @@ mod tests {
                 limit: "web".into(),
                 dry_activate: false,
                 throttle: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn tui_attach_parses_the_run_id() {
+        assert_eq!(
+            parse_tui(&["mandala", "tui", "attach", "20260817T071849_517057-76627"]),
+            TuiRequest::Attach {
+                run_id: "20260817T071849_517057-76627".into(),
             }
         );
     }

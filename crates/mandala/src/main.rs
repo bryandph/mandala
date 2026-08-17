@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use mandala_core::engines::{ansible, deploy};
 use mandala_core::{Cli, TuiRequest};
-use mandala_tui::deploy::{DeployConfig, run_deploy_blocking};
+use mandala_tui::deploy::{DeployConfig, run_attach_blocking, run_deploy_blocking};
 use mandala_tui::explorer::{ExplorerConfig, run_explorer_blocking};
 
 fn main() -> ExitCode {
@@ -53,10 +53,21 @@ fn main() -> ExitCode {
                 };
                 match run_deploy_blocking(cfg) {
                     // The process exit code IS the run's rc (0 on operator
-                    // cancel); an out-of-range rc collapses to 1.
+                    // detach); an out-of-range rc collapses to 1.
                     Ok(rc) => ExitCode::from(u8::try_from(rc).unwrap_or(1)),
                     Err(err) => {
                         eprintln!("mandala tui deploy: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            TuiRequest::Attach { run_id } => {
+                match run_attach_blocking(flake.to_string(), run_id) {
+                    // Exit code = the run's effective rc once settled, 0 on
+                    // live detach.
+                    Ok(rc) => ExitCode::from(u8::try_from(rc).unwrap_or(1)),
+                    Err(err) => {
+                        eprintln!("mandala tui attach: {err}");
                         ExitCode::FAILURE
                     }
                 }
