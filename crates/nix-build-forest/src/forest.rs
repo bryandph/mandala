@@ -75,7 +75,12 @@ pub struct Transfer {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ForestCounts {
-    pub unknown: usize,
+    /// Graph nodes materialized only as dependency edges or transfer
+    /// references, never observed by an activity. A coverage note, not a
+    /// failure bucket — labeled `untracked` so a 13k-node count doesn't
+    /// read as breakage (bryan/nixspace#128), and excluded from
+    /// [`ForestCounts::total`] so it never inflates completion denominators.
+    pub untracked: usize,
     pub planned: usize,
     pub building: usize,
     pub downloading: usize,
@@ -85,10 +90,12 @@ pub struct ForestCounts {
 }
 
 impl ForestCounts {
+    /// Tracked work only — the denominator for "x/y" completion displays.
+    /// Untracked nodes are deliberately excluded: they were never work the
+    /// build reported on.
     #[must_use]
     pub fn total(self) -> usize {
-        self.unknown
-            + self.planned
+        self.planned
             + self.building
             + self.downloading
             + self.substituting
@@ -692,7 +699,7 @@ impl BuildForest {
             .iter()
             .fold(ForestCounts::default(), |mut counts, node| {
                 match node.status {
-                    DerivationStatus::Unknown => counts.unknown += 1,
+                    DerivationStatus::Unknown => counts.untracked += 1,
                     DerivationStatus::Planned => counts.planned += 1,
                     DerivationStatus::Building => counts.building += 1,
                     DerivationStatus::Downloading => counts.downloading += 1,
@@ -1104,5 +1111,24 @@ mod tests {
             "summary must stay bounded, got {} bytes",
             text.len()
         );
+    }
+
+    /// Never-observed graph nodes are a coverage note, not a failure bucket:
+    /// serialized as `untracked` (never `unknown`) and excluded from the
+    /// completion denominator (bryan/nixspace#128 saw `unknown: 13093` read
+    /// as breakage).
+    #[test]
+    fn untracked_nodes_are_labeled_and_out_of_the_denominator() {
+        let counts = ForestCounts {
+            untracked: 13_093,
+            planned: 2,
+            building: 1,
+            built: 3,
+            ..ForestCounts::default()
+        };
+        assert_eq!(counts.total(), 6);
+        let text = serde_json::to_string(&counts).unwrap();
+        assert!(text.contains("\"untracked\":13093"), "{text}");
+        assert!(!text.contains("\"unknown\""), "{text}");
     }
 }

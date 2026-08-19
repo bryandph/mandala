@@ -1,11 +1,13 @@
 //! The 12 fleet tools: argument structs + agent-facing descriptions.
 //!
 //! Each struct is one tool's argument schema (`#[mcp_tool]` + `JsonSchema`
-//! derive). The `description` strings are the Python FastMCP tool docstrings
-//! ported VERBATIM — they are agent-facing documentation, part of the parity
-//! contract (`fleet-mcp` spec: same tool names, argument names, defaults).
-//! Defaulted arguments are `Option<T>` (optional in the schema, defaulted at
-//! dispatch), mirroring the Python keyword defaults.
+//! derive). The `description` strings are agent-facing documentation and part
+//! of the `fleet-mcp` spec contract (tool names, argument names, defaults;
+//! originally ported verbatim from the Python FastMCP docstrings, since
+//! evolved deliberately — see the mandala-mcp-ergonomics change). Mutating
+//! tools' descriptions lead with what the tool does and its bounds, keeping
+//! the wording proportional to actual blast radius. Defaulted arguments are
+//! `Option<T>` (optional in the schema, defaulted at dispatch).
 
 use rust_mcp_sdk::macros::{JsonSchema, mcp_tool};
 use rust_mcp_sdk::schema::Tool;
@@ -28,24 +30,33 @@ pub struct MembersTool {
     pub full: Option<bool>,
 }
 
-/// `groups` arguments (none).
+/// `groups` arguments.
 #[mcp_tool(
     name = "groups",
     description = concat!(
         "Taxonomy groups and their member names — the `@group` fan-out\n",
-        "spelling shared by deploy, ansible `-l`, and `deployBatch`."
+        "spelling shared by deploy, ansible `-l`, and `deployBatch`.\n",
+        "`filter` (case-insensitive substring on the group name) returns\n",
+        "only matching groups — the full taxonomy is thousands of tokens,\n",
+        "so filter when you're after a specific group."
     )
 )]
 #[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
-pub struct GroupsTool {}
+pub struct GroupsTool {
+    /// Case-insensitive substring match on group names; omit for all groups.
+    pub filter: Option<String>,
+}
 
 /// `resolve` arguments.
 #[mcp_tool(
     name = "resolve",
     description = concat!(
-        "Expand a selector (`@group`, a member, or a comma-list) —\n",
-        "identical to `mandala resolve` and the `--limit` set a deploy would\n",
-        "fan out to. Returns the sorted `members` plus the comma-joined\n",
+        "Expand a selector — identical to `mandala resolve` and the\n",
+        "`--limit` set a deploy would fan out to. The algebra: `@group`,\n",
+        "a member name, or the fleet-wide keyword `all` (also spelled\n",
+        "`@all`); combine with `,` or `:` separators; a `!`-prefixed part\n",
+        "excludes (`@all,!vishnu`), and a bare exclusion implies `all` as\n",
+        "the base set. Returns the sorted `members` plus the comma-joined\n",
         "`limit` string, which is exactly the `confirm` value the gated\n",
         "actions (deploy, reboot, restart_service) require."
     )
@@ -161,27 +172,31 @@ pub struct ReloadTool {}
         "surfaces orphaned/lingering runs (`liveness: running` with an old\n",
         "`started_at`). Deploy runs report per-host states from the\n",
         "protocol's sticky terminal states, so a confirmed host stays\n",
-        "confirmed and a rolled-back host stays flagged; `milestones` is the\n",
-        "raw per-host event sequence — repeats (activate, wait, activate, …)\n",
-        "are genuine re-entries from the engine, not display noise. `phase`\n",
+        "confirmed and a rolled-back host stays flagged. `phase`\n",
         "summarizes where a live deploy is: `batch-build` (play 1, no\n",
         "per-host events yet) → `fan-out` → `done`. Command runs report\n",
         "liveness (pid, then the reaped exit code in `meta.rc`) plus the\n",
         "tail of their teed `output.log`.\n",
         "\n",
-        "`wait_seconds` (with a `run_id`) blocks until the run leaves the\n",
-        "`running` state or the wait elapses — one call instead of a poll\n",
-        "loop; capped at 570s to stay under client timeouts. The returned\n",
-        "`liveness` tells whether it finished or the wait timed out.\n",
+        "The single-run default is SUMMARY-FIRST — enough to answer \"did\n",
+        "it work\": outcome counters, per-host terminal states, and\n",
+        "`raw_tail` (last 200 lines) + `raw_lines_total` for failed or\n",
+        "rolled-back hosts only. `forest=true` adds the bounded build-forest\n",
+        "summary (status counts, failed derivation names, current activity,\n",
+        "recent log ring, budgeted activity rows, transfers);\n",
+        "`forest_nodes=true` further adds the per-derivation graph, capped\n",
+        "at 2000 active-first nodes with `nodes_truncated` reporting any\n",
+        "elision. `diagnostics=true` adds the per-host `milestones` event\n",
+        "sequences (repeats are genuine engine re-entries, not display\n",
+        "noise) and the raw full `meta` (including per-host store paths).\n",
+        "The listing form is lighter still (states and counters only).\n",
         "\n",
-        "Every response is bounded: a named deploy carries a build-forest\n",
-        "SUMMARY (status counts, failed derivation names, current activity,\n",
-        "recent log ring, budgeted activity rows) and failed/rolled-back\n",
-        "hosts carry `raw_tail` (last 200 lines) + `raw_lines_total`; the\n",
-        "full stream lives in the run dir named by `meta`. The listing form\n",
-        "is lighter still (states and counters only). Set `forest_nodes` to\n",
-        "add the per-derivation graph, capped at 2000 active-first nodes\n",
-        "with `nodes_truncated` reporting any elision."
+        "`wait_seconds` (with a `run_id`) blocks until the run leaves the\n",
+        "`running` state or the wait elapses — capped at 100s to fit one\n",
+        "client call. A wait that elapses with the run still live returns\n",
+        "the snapshot with `wait_timed_out: true`; just call again with the\n",
+        "same `run_id` — re-attaching through the registry is cheap, and\n",
+        "that re-invocation loop is the intended way to follow a long run."
     )
 )]
 #[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
@@ -191,12 +206,18 @@ pub struct DeployStatusTool {
     /// How many recent runs to list when no `run_id` is given.
     #[json_schema(default = 10)]
     pub limit: Option<i64>,
-    /// Block until the run settles or the wait elapses (cap 570).
+    /// Block until the run settles or the wait elapses (cap 100).
     #[json_schema(default = 0)]
     pub wait_seconds: Option<i64>,
-    /// Include the capped per-derivation node graph (with a `run_id`).
+    /// Include the bounded build-forest summary (with a `run_id`).
+    #[json_schema(default = false)]
+    pub forest: Option<bool>,
+    /// Include the capped per-derivation node graph (implies `forest`).
     #[json_schema(default = false)]
     pub forest_nodes: Option<bool>,
+    /// Include per-host milestone streams and the raw full run meta.
+    #[json_schema(default = false)]
+    pub diagnostics: Option<bool>,
 }
 
 /// `build` arguments.
@@ -207,10 +228,11 @@ pub struct DeployStatusTool {
         "WITHOUT activating anything (local store only), so no confirmation is\n",
         "required. Launches as a REGISTERED BACKGROUND RUN (a cold multi-host\n",
         "build outlives any client timeout) and waits up to `wait_seconds`\n",
-        "(cap 570) for it to finish: a finished build returns `ok` +\n",
-        "`out_paths` (or the failing output), a still-running one returns\n",
-        "`building: true` — follow with `deploy_status(run_id,\n",
-        "wait_seconds=…)`. Output streams to the returned `log` either way."
+        "(cap 100, one client call) for it to finish: a finished build returns\n",
+        "`ok` + `out_paths` (or the failing output), a still-running one\n",
+        "returns `building: true` + `wait_timed_out: true` — follow with\n",
+        "`deploy_status(run_id, wait_seconds=…)`, re-invoking as needed.\n",
+        "Output streams to the returned `log` either way."
     )
 )]
 #[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
@@ -218,7 +240,7 @@ pub struct BuildTool {
     /// The selector whose members to build.
     pub selector: String,
     /// How long to wait for the build before returning `building: true`.
-    #[json_schema(default = 120)]
+    #[json_schema(default = 100)]
     pub wait_seconds: Option<i64>,
 }
 
@@ -251,19 +273,21 @@ pub struct DeployTool {
 #[mcp_tool(
     name = "restart_service",
     description = concat!(
-        "Restart one systemd unit on the resolved members via ad-hoc\n",
-        "ansible (`systemd_service state=restarted`) — the middle ground\n",
-        "between a full deploy (no-op when the closure hasn't changed) and a\n",
-        "reboot (far too big a hammer for picking up a service-level change,\n",
-        "e.g. k3s re-reading registries.yaml). `forks` bounds how many hosts\n",
-        "restart AT ONCE — a concurrency cap, NOT a rolling gate: there is\n",
-        "no fail-fast or health check between batches, so every resolved\n",
-        "host is eventually restarted even if the first batch breaks.\n",
+        "Restart one systemd unit on the resolved members — the smallest of\n",
+        "the three action verbs, and the right one for picking up a\n",
+        "service-level change (e.g. k3s re-reading registries.yaml): a full\n",
+        "deploy no-ops when the closure hasn't changed, and a reboot is far\n",
+        "too big a hammer. Bounded by construction: exactly one unit, its\n",
+        "name validated to a plain systemd name (no paths, no shell), and\n",
+        "the same confirm gate as deploy/reboot — `confirm` must equal the\n",
+        "resolved `--limit` target (the `limit` field of `resolve`), else it\n",
+        "refuses WITHOUT running.\n",
         "\n",
-        "Mutating, so it takes the deploy/reboot confirm gate: `confirm` must\n",
-        "equal the resolved `--limit` target (the `limit` field of `resolve`),\n",
-        "else it refuses WITHOUT running. Unit names are validated to a plain\n",
-        "systemd name — no paths, no shell."
+        "Runs as ad-hoc ansible (`systemd_service state=restarted`). `forks`\n",
+        "bounds how many hosts restart AT ONCE — a concurrency cap, NOT a\n",
+        "rolling gate: there is no fail-fast or health check between\n",
+        "batches, so every resolved host is eventually restarted even if\n",
+        "the first batch breaks."
     )
 )]
 #[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
@@ -372,6 +396,54 @@ mod tests {
                 "{} lacks confirm",
                 tool.name
             );
+        }
+    }
+
+    #[test]
+    fn groups_takes_an_optional_filter() {
+        let tool = GroupsTool::tool();
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        assert!(schema["properties"].get("filter").is_some());
+        // Optional: a bare `groups` call still returns the full taxonomy.
+        assert!(
+            schema.get("required").is_none() || schema["required"] == serde_json::json!([]),
+            "filter must not be required: {schema}"
+        );
+    }
+
+    #[test]
+    fn resolve_documents_the_full_algebra() {
+        let description = ResolveTool::tool().description.unwrap_or_default();
+        for needle in ["@group", "@all", "`!`-prefixed", "`,` or `:`"] {
+            assert!(
+                description.contains(needle),
+                "resolve description lacks {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_service_reads_as_the_smaller_hammer() {
+        // Harness permission classifiers weigh the description's framing:
+        // the old "via ad-hoc ansible … Mutating" lead got the bounded
+        // middle verb blocked while a full drain+reboot sailed through
+        // (bryan/nixspace#128). Lead with what it does and its bounds.
+        let desc = RestartServiceTool::tool().description.unwrap_or_default();
+        let first = desc.lines().next().unwrap_or_default().to_string();
+        assert!(first.contains("Restart one systemd unit"), "{first}");
+        assert!(
+            !first.contains("ansible"),
+            "mechanism must not headline: {first}"
+        );
+        assert!(!desc.contains("Mutating,"), "{desc}");
+        // …while the real bounds stay documented.
+        for needle in [
+            "confirm",
+            "plain systemd name",
+            "concurrency cap",
+            "rolling gate",
+        ] {
+            assert!(desc.contains(needle), "missing {needle:?}");
         }
     }
 

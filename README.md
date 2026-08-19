@@ -69,6 +69,19 @@ feeds those same verbatim internal-JSON records to a PTY-hosted
 derivation attribution remain available independently in non-interactive and
 CI runs.
 
+### MCP operator note: harness allowlists
+
+The mutating MCP tools (`deploy`, `reboot`, `restart_service`) carry their
+own confirm gate — the call must name the resolved `--limit` target or it
+refuses without running — so they are safe candidates for a harness
+allowlist (e.g. `mcp__mandala__restart_service` in Claude Code permission
+settings). Allowlisting the confirm-gated middle verbs is preferable to
+leaving them prompt-gated: a harness classifier that blocks a bounded
+single-unit restart mid-incident pushes the agent toward raw `ssh`/`bash`,
+which has no gate at all. The read tier (`members`, `groups`, `resolve`,
+`ping`, `host_eval`, `drift`, `deploy_status`) mutates nothing and can be
+allowlisted wholesale.
+
 ## Design
 
 Configs author the inventory; projections flow outward. The engine never

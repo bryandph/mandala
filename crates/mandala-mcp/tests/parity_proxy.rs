@@ -206,6 +206,12 @@ async fn leader_and_follower_paths_are_byte_identical() {
     read_both(follower, local, "members", &json!({"full": true})).await;
     let groups = read_both(follower, local, "groups", &json!({})).await;
     assert!(groups.get("k3s").is_some(), "groups: {groups}");
+    let filtered = read_both(follower, local, "groups", &json!({"filter": "K3"})).await;
+    assert_eq!(
+        filtered.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["k3s"],
+        "filtered groups: {filtered}"
+    );
     let resolved = read_both(
         follower,
         local,
@@ -214,6 +220,9 @@ async fn leader_and_follower_paths_are_byte_identical() {
     )
     .await;
     assert_eq!(resolved["members"], json!(["cache", "web"]));
+    let fleet_wide = read_both(follower, local, "resolve", &json!({"selector": "@all"})).await;
+    assert_eq!(fleet_wide["members"], json!(["cache", "router", "web"]));
+    assert_eq!(fleet_wide["limit"], "cache,router,web");
 
     // ---- ping ---------------------------------------------------------------
     install(
@@ -632,6 +641,47 @@ async fn leader_and_follower_paths_are_byte_identical() {
         json!(["activation failed; rolling back"])
     );
     assert_eq!(mixed["hosts"]["web"]["raw_lines_total"], 1);
+    // Summary-first default: no forest, no milestones — and no timed-out
+    // marker on a wait-less poll of a settled run.
+    assert!(mixed["build"].get("forest").is_none(), "{mixed}");
+    assert!(mixed["hosts"]["cache"].get("milestones").is_none());
+    assert!(mixed.get("wait_timed_out").is_none());
+    let detailed = read_both(
+        follower,
+        local,
+        "deploy_status",
+        &json!({"run_id": dep_run_id, "forest": true, "diagnostics": true}),
+    )
+    .await;
+    assert!(detailed["build"]["forest"].is_object(), "{detailed}");
+    assert_eq!(
+        detailed["hosts"]["cache"]["milestones"],
+        json!(["eval", "build", "copy", "activate", "confirm"])
+    );
+
+    // A wait that elapses on a live run is marked timed out. The run's meta
+    // carries this test process's own pid (alive for the duration, no rc),
+    // so its liveness is deterministically `running`.
+    let (live_run_id, live_path) = registry::new_run_dir().unwrap();
+    let mut meta = Meta::new();
+    meta.insert("run_id".to_string(), Value::from(live_run_id.clone()));
+    meta.insert("kind".to_string(), Value::from("reboot"));
+    meta.insert(
+        "pid".to_string(),
+        Value::from(i64::from(std::process::id())),
+    );
+    meta.insert("limit".to_string(), Value::from("web"));
+    registry::write_meta(&live_path, &meta).unwrap();
+    std::fs::write(live_path.join(COMMAND_LOG), "$ ans-reboot -l web\n").unwrap();
+    let timed_out = read_both(
+        follower,
+        local,
+        "deploy_status",
+        &json!({"run_id": live_run_id, "wait_seconds": 1}),
+    )
+    .await;
+    assert_eq!(timed_out["liveness"], "running", "{timed_out}");
+    assert_eq!(timed_out["wait_timed_out"], true, "{timed_out}");
 
     let listing = read_both(follower, local, "deploy_status", &json!({"limit": 5})).await;
     assert!(

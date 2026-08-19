@@ -1248,7 +1248,10 @@ pub fn batch_argv(
     group: &str,
 ) -> Result<Vec<String>, InventoryError> {
     if group != "all" && !inv.groups().contains_key(group) {
-        return Err(InventoryError::NoSuchGroup(group.to_string()));
+        return Err(InventoryError::NoSuchGroup {
+            group: group.to_string(),
+            available: inv.groups().keys().cloned().collect(),
+        });
     }
     Ok(vec![
         "nix".to_string(),
@@ -2697,9 +2700,12 @@ exit 0
             batch_argv(&inv(), "/flake", "all").unwrap().last().unwrap(),
             "/flake#deployBatch.all"
         );
-        // Unknown group errors with the Python message text.
+        // Unknown group errors enumerate the available groups.
         let err = batch_argv(&inv(), ".", "nope").unwrap_err();
-        assert_eq!(err.to_string(), "no such group: nope");
+        assert_eq!(
+            err.to_string(),
+            "no such group: nope (available: fleet, gateway, k3s)"
+        );
     }
 
     #[test]

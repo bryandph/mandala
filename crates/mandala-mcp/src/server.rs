@@ -47,14 +47,24 @@ pub fn server_name() -> String {
     format!("mandala-fleet {VERSION}")
 }
 
-/// Blocking waits stay under typical MCP client timeouts.
-const MAX_WAIT_SECONDS: i64 = 570;
+/// Blocking waits fit inside one MCP client call budget. Claude Code's call
+/// timeout is ~120s — the old 570s cap meant every long wait got forcibly
+/// backgrounded and its result arrived detached (bryan/nixspace#128). The
+/// intended long-wait pattern is re-invocation: a timed-out wait returns a
+/// snapshot with `wait_timed_out`, and re-attaching via the run registry is
+/// a cheap idempotent read.
+const MAX_WAIT_SECONDS: i64 = 100;
 
 /// Keep the CLI/TUI native-engine fan-out default at the MCP boundary.
 const DEPLOY_THROTTLE: i64 = 4;
 
-/// Lines of a command run's teed log surfaced in its snapshot.
+/// Lines of a command run's teed log surfaced in its snapshot with the
+/// `diagnostics` opt-in.
 const OUTPUT_TAIL: usize = 120;
+
+/// Default (and listing) command-run tail — enough for "is it alive / how
+/// did it end" without paying the full tail on every poll.
+const COMMAND_TAIL_DEFAULT: usize = 40;
 
 /// Lines of a failed/rolled-back host's raw stream surfaced in a deploy
 /// snapshot. The full stream stays on disk in the run dir; the snapshot says
@@ -277,7 +287,10 @@ impl MandalaHandler {
                 let t: MembersTool = parse(value)?;
                 self.tool_members(t).await
             }
-            n if n == GroupsTool::tool_name() => self.tool_groups().await,
+            n if n == GroupsTool::tool_name() => {
+                let t: GroupsTool = parse(value)?;
+                self.tool_groups(t).await
+            }
             n if n == ResolveTool::tool_name() => {
                 let t: ResolveTool = parse(value)?;
                 self.tool_resolve(t).await
@@ -354,9 +367,21 @@ impl MandalaHandler {
         Ok(Value::Object(compact))
     }
 
-    async fn tool_groups(&self) -> Result<Value, CallToolError> {
+    async fn tool_groups(&self, t: GroupsTool) -> Result<Value, CallToolError> {
         let inv = self.inventory().await?;
-        serde_json::to_value(inv.groups()).map_err(CallToolError::new)
+        match t.filter.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            None => serde_json::to_value(inv.groups()).map_err(CallToolError::new),
+            Some(filter) => {
+                let needle = filter.to_ascii_lowercase();
+                let matching: serde_json::Map<String, Value> = inv
+                    .groups()
+                    .iter()
+                    .filter(|(name, _)| name.to_ascii_lowercase().contains(&needle))
+                    .map(|(name, members)| (name.clone(), json!(members)))
+                    .collect();
+                Ok(Value::Object(matching))
+            }
+        }
     }
 
     async fn tool_resolve(&self, t: ResolveTool) -> Result<Value, CallToolError> {
@@ -571,8 +596,11 @@ impl MandalaHandler {
             let Some(obs) = registry::open_run(run_id) else {
                 return Err(tool_error(format!("no such run: {run_id}")));
             };
+            let forest_nodes = t.forest_nodes.unwrap_or(false);
             let detail = SnapshotDetail::Full {
-                forest_nodes: t.forest_nodes.unwrap_or(false),
+                forest: t.forest.unwrap_or(false) || forest_nodes,
+                forest_nodes,
+                diagnostics: t.diagnostics.unwrap_or(false),
             };
             let wait = t.wait_seconds.unwrap_or(0).clamp(0, MAX_WAIT_SECONDS);
             #[allow(clippy::cast_sign_loss)]
@@ -591,6 +619,15 @@ impl MandalaHandler {
                 (obs, snap) = blocking_snapshot(obs, detail).await?;
             }
             drop(obs);
+            // A wait that elapsed with the run still live is an expected
+            // outcome carrying a useful snapshot — mark it distinguishable
+            // from a settled run (a plain wait-less poll is not "timed out").
+            if wait > 0
+                && snap.get("liveness").and_then(Value::as_str) == Some("running")
+                && let Some(map) = snap.as_object_mut()
+            {
+                map.insert("wait_timed_out".to_string(), Value::Bool(true));
+            }
             return Ok(snap);
         }
         #[allow(clippy::cast_sign_loss)]
@@ -650,14 +687,21 @@ impl MandalaHandler {
         let Some(mut obs) = registry::open_run(&launch.run_id) else {
             return Err(tool_error(format!("no such run: {}", launch.run_id)));
         };
-        let wait = t.wait_seconds.unwrap_or(120).clamp(0, MAX_WAIT_SECONDS);
+        let wait = t
+            .wait_seconds
+            .unwrap_or(MAX_WAIT_SECONDS)
+            .clamp(0, MAX_WAIT_SECONDS);
         #[allow(clippy::cast_sign_loss)]
         let deadline = Instant::now() + Duration::from_secs(wait as u64);
         while obs.liveness() == RunLiveness::Running && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         if obs.liveness() == RunLiveness::Running {
-            return Ok(merged(&base, json!({"building": true})));
+            let mut still = json!({"building": true});
+            if wait > 0 {
+                still["wait_timed_out"] = Value::Bool(true);
+            }
+            return Ok(merged(&base, still));
         }
         let rc = obs.info.meta.get("rc").and_then(Value::as_i64);
         let lines = read_log_lines(&launch.log);
@@ -916,10 +960,17 @@ enum SnapshotDetail {
     /// The no-`run_id` listing: identity, liveness, phase, per-host
     /// state/rc, build counters — no forest, no raw streams, no milestones.
     Listing,
-    /// One named run: bounded forest summary, milestones, and bounded raw
-    /// tails for failed/rolled-back hosts; `forest_nodes` opts into the
-    /// capped node graph.
-    Full { forest_nodes: bool },
+    /// One named run. The default is summary-first — enough to answer "did
+    /// it work" (bryan/nixspace#128): curated meta, per-host states, and
+    /// bounded raw tails for failed/rolled-back hosts. `forest` opts into
+    /// the bounded forest summary, `forest_nodes` into the capped node
+    /// graph (implying `forest`), `diagnostics` into per-host milestones
+    /// and the raw full meta.
+    Full {
+        forest: bool,
+        forest_nodes: bool,
+        diagnostics: bool,
+    },
 }
 
 /// Move one poll+snapshot onto the blocking pool, threading the observer
@@ -944,9 +995,16 @@ async fn blocking_snapshot(
 /// reaped rc) plus the tail of its teed `output.log`.
 fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
     if obs.info.kind() != "deploy" {
-        return command_snapshot(obs);
+        return command_snapshot(obs, detail);
     }
     obs.poll();
+    let diagnostics = matches!(
+        detail,
+        SnapshotDetail::Full {
+            diagnostics: true,
+            ..
+        }
+    );
     let mut hosts = serde_json::Map::new();
     for (name, h) in &obs.tailer.hosts {
         let mut entry = json!({
@@ -954,7 +1012,11 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
             "rc": h.rc,
         });
         if let SnapshotDetail::Full { .. } = detail {
-            entry["milestones"] = Value::from(h.milestones.clone());
+            if diagnostics {
+                entry["milestones"] = Value::from(h.milestones.clone());
+            }
+            // Failure triage is the primary question the tool answers, so
+            // failed-host tails stay in the default shape.
             if matches!(h.state, HostState::Failed | HostState::RolledBack) {
                 let tail: Vec<String> = h
                     .lines
@@ -988,7 +1050,12 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
         "done": b.done,
         "rc": b.rc,
     });
-    if let SnapshotDetail::Full { forest_nodes } = detail {
+    if let SnapshotDetail::Full {
+        forest: true,
+        forest_nodes,
+        ..
+    } = detail
+    {
         let snapshot = obs.tailer.forest.snapshot();
         if forest_nodes {
             let (nodes, elided) = snapshot.capped_nodes(FOREST_NODE_CAP);
@@ -1000,7 +1067,11 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
     json!({
         "run_id": obs.info.run_id,
         "kind": obs.info.kind(),
-        "meta": Value::Object(obs.info.meta.clone()),
+        "meta": if diagnostics {
+            Value::Object(obs.info.meta.clone())
+        } else {
+            curated_meta(&obs.info.meta)
+        },
         "liveness": liveness.as_str(),
         "phase": phase,
         "hosts": hosts,
@@ -1008,11 +1079,52 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
     })
 }
 
-fn command_snapshot(obs: &mut ObservedRun) -> Value {
+/// The default projection of a deploy run's meta: the outcome and identity
+/// keys an agent needs to answer "did it work", without the keys that grow
+/// with fleet size (`profiles` — per-host store paths — was a big chunk of
+/// the ~15k-token terminal snapshots in bryan/nixspace#128). This is a
+/// projection, not a second source of truth: `diagnostics=true` returns the
+/// raw meta verbatim, so nothing is unreachable.
+fn curated_meta(meta: &Meta) -> Value {
+    const KEYS: [&str; 11] = [
+        "summary",
+        "rc",
+        "process_rc",
+        "build_rc",
+        "limit",
+        "dry_activate",
+        "throttle",
+        "pid",
+        "started_at",
+        "finished_at",
+        "error",
+    ];
+    let curated: serde_json::Map<String, Value> = KEYS
+        .iter()
+        .filter_map(|k| meta.get(*k).map(|v| ((*k).to_string(), v.clone())))
+        .collect();
+    Value::Object(curated)
+}
+
+fn command_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
     let liveness = obs.liveness();
     let log_path = obs.info.path.join(COMMAND_LOG);
     let lines = read_log_lines(&log_path);
-    let tail: Vec<&String> = lines.iter().rev().take(OUTPUT_TAIL).rev().collect();
+    // The short default tail covers "is it alive / how did it end"; the
+    // diagnostic opt-in returns the full bounded tail. Command-run meta is
+    // small and identity-bearing (argv, serial, drain) — always verbatim.
+    let take = if matches!(
+        detail,
+        SnapshotDetail::Full {
+            diagnostics: true,
+            ..
+        }
+    ) {
+        OUTPUT_TAIL
+    } else {
+        COMMAND_TAIL_DEFAULT
+    };
+    let tail: Vec<&String> = lines.iter().rev().take(take).rev().collect();
     json!({
         "run_id": obs.info.run_id,
         "kind": obs.info.kind(),
@@ -1123,8 +1235,12 @@ mod tests {
     fn recorded_ansible_and_engine_runs_have_identical_mcp_snapshots() {
         let mut ansible = recorded_run("ansible");
         let mut engine = recorded_run("engine");
+        // Full detail (forest + diagnostics) so the parity assertion covers
+        // the raw meta and milestone streams from both emitters.
         let detail = SnapshotDetail::Full {
+            forest: true,
             forest_nodes: false,
+            diagnostics: true,
         };
         let mut ansible_snapshot = run_snapshot(&mut ansible, detail);
         let mut engine_snapshot = run_snapshot(&mut engine, detail);
@@ -1178,9 +1294,17 @@ mod tests {
     #[test]
     fn snapshot_detail_levels_bound_what_a_run_reports() {
         let mut engine = recorded_run("engine");
-        let with_nodes = run_snapshot(&mut engine, SnapshotDetail::Full { forest_nodes: true });
+        let with_nodes = run_snapshot(
+            &mut engine,
+            SnapshotDetail::Full {
+                forest: true,
+                forest_nodes: true,
+                diagnostics: false,
+            },
+        );
         assert!(with_nodes["build"]["nodes"].is_array());
         assert_eq!(with_nodes["build"]["nodes_truncated"], 0);
+        assert!(with_nodes["build"]["forest"].is_object());
 
         let mut engine = recorded_run("engine");
         let listing = run_snapshot(&mut engine, SnapshotDetail::Listing);
@@ -1191,5 +1315,40 @@ mod tests {
         assert!(listing["hosts"]["beta"].get("milestones").is_none());
         assert_eq!(listing["liveness"], "rolled-back");
         assert_eq!(listing["phase"], "done");
+        // The listing's curated meta never carries per-host store paths.
+        assert!(listing["meta"].get("profiles").is_none());
+    }
+
+    /// The default single-run shape answers "did it work" and nothing more:
+    /// no forest, no milestones, no store paths — failed-host raw tails and
+    /// the outcome counters stay (bryan/nixspace#128).
+    #[test]
+    fn default_single_run_snapshot_is_summary_first() {
+        let mut engine = recorded_run("engine");
+        let snap = run_snapshot(
+            &mut engine,
+            SnapshotDetail::Full {
+                forest: false,
+                forest_nodes: false,
+                diagnostics: false,
+            },
+        );
+        assert!(snap["build"].get("forest").is_none());
+        assert!(snap["build"].get("nodes").is_none());
+        assert!(snap["hosts"]["alpha"].get("milestones").is_none());
+        assert!(snap["meta"].get("profiles").is_none());
+        // Outcome + identity survive the curation…
+        assert_eq!(
+            snap["meta"]["summary"],
+            json!({"confirmed":1,"failed":0,"rolled_back":1,"total":2})
+        );
+        assert_eq!(snap["meta"]["rc"], 1);
+        assert!(snap["build"]["rc"].is_number() || snap["build"]["rc"].is_null());
+        // …and so does failure triage.
+        assert_eq!(
+            snap["hosts"]["beta"]["raw_tail"],
+            json!(["confirmation failed; rolled back"])
+        );
+        assert_eq!(snap["hosts"]["beta"]["raw_lines_total"], 1);
     }
 }

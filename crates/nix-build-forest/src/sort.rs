@@ -16,7 +16,9 @@ pub struct DisplayRow {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ElidedCounts {
-    pub unknown: usize,
+    /// Never-observed nodes elided from the projection (see
+    /// `ForestCounts::untracked` for why this is not labeled "unknown").
+    pub untracked: usize,
     pub planned: usize,
     pub built: usize,
 }
@@ -24,7 +26,7 @@ pub struct ElidedCounts {
 impl ElidedCounts {
     #[must_use]
     pub fn total(&self) -> usize {
-        self.unknown + self.planned + self.built
+        self.untracked + self.planned + self.built
     }
 }
 
@@ -124,7 +126,7 @@ pub fn activity_projection(snapshot: &ForestSnapshot, row_budget: usize) -> Acti
             continue;
         }
         match node.status {
-            DerivationStatus::Unknown => elided.unknown += 1,
+            DerivationStatus::Unknown => elided.untracked += 1,
             DerivationStatus::Planned => elided.planned += 1,
             DerivationStatus::Built => elided.built += 1,
             DerivationStatus::Building

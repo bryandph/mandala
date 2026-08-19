@@ -52,7 +52,9 @@ pub fn is_valid_member_name(name: &str) -> bool {
 /// The parity error type for inventory construction and selector resolution —
 /// the Rust equivalent of the Python `InventoryError`. Each variant's
 /// [`fmt::Display`] reproduces the Python message text verbatim, so callers
-/// (the CLI, the MCP tool layer) surface identical strings.
+/// (the CLI, the MCP tool layer) surface identical strings — except
+/// [`InventoryError::NoSuchGroup`], which additionally enumerates the
+/// available groups (a deliberate post-parity ergonomics change).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryError {
     /// The aggregate's `schemaVersion` is not [`SUPPORTED_SCHEMA_VERSION`].
@@ -71,8 +73,15 @@ pub enum InventoryError {
     EmptySelector,
     /// A selector resolved to the empty set (e.g. `all,!all`).
     ResolvesToNothing(String),
-    /// A `@group` atom named a group not present in the aggregate.
-    NoSuchGroup(String),
+    /// A `@group` atom named a group not present in the aggregate. Carries
+    /// the available group names (sorted) so the error is self-healing —
+    /// recovery needs no separate `groups` round-trip.
+    NoSuchGroup {
+        /// The group name that failed to resolve.
+        group: String,
+        /// Every group name the aggregate does define, sorted.
+        available: Vec<String>,
+    },
     /// A bare atom named neither `all`, a `@group`, nor a known member.
     NoSuchMember(String),
 }
@@ -90,7 +99,17 @@ impl fmt::Display for InventoryError {
             Self::ResolvesToNothing(selector) => {
                 write!(f, "selector resolves to no members: {selector}")
             }
-            Self::NoSuchGroup(group) => write!(f, "no such group: {group}"),
+            Self::NoSuchGroup { group, available } => {
+                if available.is_empty() {
+                    write!(f, "no such group: {group} (no groups defined)")
+                } else {
+                    write!(
+                        f,
+                        "no such group: {group} (available: {})",
+                        available.join(", ")
+                    )
+                }
+            }
             Self::NoSuchMember(member) => write!(f, "no such member: {member}"),
         }
     }
@@ -256,6 +275,14 @@ impl Inventory {
             }
         }
         for (group, members) in &aggregate.groups {
+            // `all` is a reserved selector token (and `@all` its alias); a
+            // group by that name could never be addressed and would shadow
+            // the fleet-wide spelling.
+            if group.eq_ignore_ascii_case("all") {
+                return Err(InventoryError::Malformed(format!(
+                    "group {group:?} is a reserved selector token"
+                )));
+            }
             for member in members {
                 if !aggregate.members.contains_key(member) {
                     return Err(InventoryError::Malformed(format!(
@@ -352,23 +379,26 @@ impl Inventory {
         Ok(resolved)
     }
 
-    /// Resolve one selector atom: `all` → every member; `@group` → the group's
-    /// members (or [`InventoryError::NoSuchGroup`]); otherwise a member name
-    /// (or [`InventoryError::NoSuchMember`]).
+    /// Resolve one selector atom: `all` or `@all` → every member; `@group` →
+    /// the group's members (or [`InventoryError::NoSuchGroup`]); otherwise a
+    /// member name (or [`InventoryError::NoSuchMember`]).
     ///
     /// # Errors
     /// [`InventoryError::NoSuchGroup`] or [`InventoryError::NoSuchMember`].
     fn resolve_part(&self, part: &str) -> Result<Vec<String>, InventoryError> {
-        if part == "all" {
+        // `@all` is an alias for the reserved keyword `all` — it's the
+        // spelling agents naturally try, and `all` can never be a real group
+        // (rejected at aggregate validation) or member name.
+        if part == "all" || part == "@all" {
             return Ok(self.aggregate.members.keys().cloned().collect());
         }
         if let Some(group) = part.strip_prefix('@') {
-            return self
-                .aggregate
-                .groups
-                .get(group)
-                .cloned()
-                .ok_or_else(|| InventoryError::NoSuchGroup(group.to_string()));
+            return self.aggregate.groups.get(group).cloned().ok_or_else(|| {
+                InventoryError::NoSuchGroup {
+                    group: group.to_string(),
+                    available: self.aggregate.groups.keys().cloned().collect(),
+                }
+            });
         }
         if !self.aggregate.members.contains_key(part) {
             return Err(InventoryError::NoSuchMember(part.to_string()));
@@ -479,11 +509,15 @@ mod tests {
         let inv = test_inv();
         assert_eq!(
             inv.resolve("@nope").unwrap_err(),
-            InventoryError::NoSuchGroup("nope".to_string())
+            InventoryError::NoSuchGroup {
+                group: "nope".to_string(),
+                available: vec!["gateway".to_string(), "k3s".to_string()],
+            }
         );
+        // The error enumerates the taxonomy so recovery needs no `groups` call.
         assert_eq!(
             inv.resolve("@nope").unwrap_err().to_string(),
-            "no such group: nope"
+            "no such group: nope (available: gateway, k3s)"
         );
         assert_eq!(
             inv.resolve("ghost").unwrap_err(),
@@ -526,6 +560,50 @@ mod tests {
             "selector resolves to no members: all,!all"
         );
         assert_eq!(inv.resolve("").unwrap_err(), InventoryError::EmptySelector);
+    }
+
+    #[test]
+    fn at_all_aliases_the_fleet_wide_keyword() {
+        let inv = test_inv();
+        // Both spellings resolve to the identical full member set…
+        assert_eq!(inv.resolve("@all").unwrap(), inv.resolve("all").unwrap());
+        assert_eq!(inv.to_limit("@all").unwrap(), "cache,router,web");
+        // …and exclusions compose with either spelling.
+        assert_eq!(inv.resolve("@all,!router").unwrap(), ["cache", "web"]);
+        assert_eq!(
+            inv.resolve("@all,!router").unwrap(),
+            inv.resolve("all,!router").unwrap()
+        );
+    }
+
+    #[test]
+    fn group_named_all_is_rejected_as_reserved() {
+        for spelling in ["all", "ALL", "All"] {
+            let err = Inventory::from_value(json!({
+                "schemaVersion": 1,
+                "members": {"web": {"name": "web"}},
+                "groups": {spelling: ["web"]},
+            }))
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("malformed aggregate: group {spelling:?} is a reserved selector token")
+            );
+        }
+    }
+
+    #[test]
+    fn empty_taxonomy_group_error_says_so() {
+        let inv = Inventory::from_value(json!({
+            "schemaVersion": 1,
+            "members": {"web": {"name": "web"}},
+            "groups": {},
+        }))
+        .unwrap();
+        assert_eq!(
+            inv.resolve("@nope").unwrap_err().to_string(),
+            "no such group: nope (no groups defined)"
+        );
     }
 
     #[test]
