@@ -739,9 +739,16 @@ mod tests {
     }
 
     fn tmp() -> PathBuf {
+        // A process-wide counter, not just (pid, now): the sandbox clock is
+        // coarse enough that two parallel tests can read the same nanos and
+        // silently SHARE a scratch dir — for these Git tests that means one
+        // test's dirty edit lands in another's checkout and `repo_rev` reads
+        // `-dirty` off a commit it just made clean.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mandala-drift-test-{}-{:?}",
+            "mandala-drift-test-{}-{}-{:?}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

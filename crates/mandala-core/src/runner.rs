@@ -1372,9 +1372,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
+        // Counter, not just (pid, now): a coarse clock lets two parallel
+        // tests read the same nanos and silently share a scratch dir.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mandala-runner-test-{}-{:?}",
+            "mandala-runner-test-{}-{}-{:?}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1694,9 +1698,13 @@ mod write_tests {
 
     /// A unique private registry base for one test.
     fn tmp_base() -> PathBuf {
+        // Counter, not just (pid, now): a coarse clock lets two parallel
+        // tests read the same nanos and silently share a scratch dir.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mandala-write-test-{}-{:?}",
+            "mandala-write-test-{}-{}-{:?}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
