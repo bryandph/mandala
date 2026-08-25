@@ -70,7 +70,7 @@ in {
     };
 
     platform = mkOption {
-      type = types.enum ["nixos" "darwin" "wsl" "aws" "hetzner" "gcp" "azure" "oci" "windows" "routeros" "opnsense" "firmware" "android"];
+      type = types.enum ["nixos" "darwin" "wsl" "aws" "hetzner" "gcp" "azure" "oci" "contabo" "windows" "routeros" "opnsense" "firmware" "android"];
       default = "nixos";
       description = "Platform type (OS family or hosting venue)";
     };
