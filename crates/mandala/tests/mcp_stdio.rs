@@ -44,6 +44,31 @@ fn read_response(reader: &mut impl BufRead, id: i64) -> serde_json::Value {
 
 /// A per-test scratch tree: a `flake/` working directory (the context scope),
 /// a `state/` dir, and the injected aggregate. Unique per test AND per run.
+/// Write an executable fixture through a child process so this test binary
+/// never holds a write fd to it (a sibling test's fork would inherit that fd
+/// until exec, and the exec would fail with ETXTBSY). Twin of the helper in
+/// mandala-core's deploy engine tests.
+fn write_program(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let mut child = Command::new("sh")
+        .args(["-c", r#"cat > "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(contents.as_ref())?;
+    if child.wait()?.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "writing fixture {}",
+            path.display()
+        )))
+    }
+}
+
 fn scratch_tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let scratch = std::env::temp_dir().join(format!(
         "mandala-mcp-stdio-{tag}-{}-{}",
@@ -381,7 +406,7 @@ fn native_deploy_survives_leader_death_and_attaches_after_promotion() {
     std::fs::create_dir_all(&fake_bin).unwrap();
     let effects = state.join("effects.log");
     let nix = fake_bin.join("nix");
-    std::fs::write(
+    write_program(
         &nix,
         r#"#!/bin/sh
 set -eu
@@ -409,7 +434,7 @@ esac
     )
     .unwrap();
     let ssh = fake_bin.join("ssh");
-    std::fs::write(
+    write_program(
         &ssh,
         r#"#!/bin/sh
 set -eu

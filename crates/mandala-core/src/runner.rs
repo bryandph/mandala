@@ -1951,15 +1951,23 @@ mod write_tests {
         )
         .unwrap();
         let (prefix, suffix) = run_id.split_at(10);
+        // The fake engine holds the line's suffix until the test releases it,
+        // so "not discoverable yet" is a fact, not a 10ms-vs-50ms wager that a
+        // starved test thread loses.
+        let release = events_dir.join("release-suffix");
         let mut run = DeployRun::new("web");
         run.program = Some(vec![
             "sh".into(),
             "-c".into(),
-            format!("printf '%s' '{prefix}'; sleep 0.05; printf '%s\\n' '{suffix}'"),
+            format!(
+                "printf '%s' '{prefix}'; while [ ! -e '{}' ]; do sleep 0.01; done; printf '%s\\n' '{suffix}'",
+                release.display()
+            ),
         ]);
         run.start().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!run.discover_run().unwrap());
+        std::fs::write(&release, b"").unwrap();
         for _ in 0..100 {
             if run.discover_run().unwrap() {
                 break;

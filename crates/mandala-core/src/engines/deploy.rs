@@ -1387,6 +1387,35 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    /// `std::fs::write` for executable fixtures, WITHOUT this process ever
+    /// holding a write fd to the file. Tests run on parallel threads, and every
+    /// fork (each fake `nix`/`ssh` spawn) inherits the whole fd table until its
+    /// exec; exec'ing a file some process still holds open for writing fails
+    /// with ETXTBSY ("Text file busy"), which surfaced as random `Io` build and
+    /// copy failures in the sandboxed nix check phase. A short-lived `sh` child
+    /// does the write, so the fd never enters this process's table at all.
+    fn write_program(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$1""#, "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(contents.as_ref())?;
+        if child.wait()?.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "writing fixture {}",
+                path.display()
+            )))
+        }
+    }
+
     fn tmp_base(label: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
@@ -1434,7 +1463,7 @@ mod tests {
         let invocations = base.join(format!("invocations-{rc}"));
         let args = base.join(format!("args-{rc}"));
         std::fs::create_dir_all(base).unwrap();
-        std::fs::write(
+        write_program(
             &script,
             format!(
                 r#"#!/bin/sh
@@ -1499,7 +1528,7 @@ done
         let nix = base.join(format!("nix-copy-{copy_rc}"));
         let ssh = base.join(format!("ssh-activate-{confirm_rc}"));
         std::fs::create_dir_all(base).unwrap();
-        std::fs::write(
+        write_program(
             &nix,
             format!(
                 r#"#!/bin/sh
@@ -1513,22 +1542,40 @@ exit {}
             ),
         )
         .unwrap();
-        std::fs::write(
+        write_program(
             &ssh,
             format!(
                 r#"#!/bin/sh
-printf 'ssh USER=%s HOME=%s SSH_AUTH_SOCK=%s args=%s\n' "$USER" "$HOME" "$SSH_AUTH_SOCK" "$*" >> '{}'
+printf 'ssh USER=%s HOME=%s SSH_AUTH_SOCK=%s args=%s\n' "$USER" "$HOME" "$SSH_AUTH_SOCK" "$*" >> '{trace}'
 printf '%s\n' 'ssh-stdout'
 printf '%s\n' 'ssh-stderr' >&2
+wait_for_trace() {{
+  attempt=0
+  until grep -qs -- "$1" '{trace}'; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 500 ]; then
+      exit 99
+    fi
+    sleep 0.01
+  done
+}}
 case "$*" in
-  *' rm -f '*) exit {} ;;
-  *' rm '*) exit {} ;;
+  *' rm -f '*) exit {cleanup_rc} ;;
+  *' rm '*)
+    # The engine stops awaiting the waiter once confirmation settles (and
+    # the activation once the waiter wins), so this exit is the last point
+    # at which the fixture can guarantee both invocations already reached
+    # the trace the tests read after deploy_host_with returns. The children
+    # were spawned before confirmation started; only their first printf may
+    # still be unscheduled under load.
+    wait_for_trace 'activate-rs activate '
+    wait_for_trace 'activate-rs wait '
+    exit {confirm_rc}
+    ;;
 esac
 exit 0
 "#,
-                trace.display(),
-                cleanup_rc,
-                confirm_rc,
+                trace = trace.display(),
             ),
         )
         .unwrap();
@@ -1592,7 +1639,7 @@ exit 0
             "ordered-ssh-activate-{order_name}-{confirm_rc}-{activate_rc}"
         ));
         std::fs::create_dir_all(base).unwrap();
-        std::fs::write(
+        write_program(
             &nix,
             format!(
                 r#"#!/bin/sh
@@ -1614,7 +1661,7 @@ exit 0
         // confirmation echoes a sentinel: `checked_output` forwards it in the
         // same poll that resolves the confirmation branch, on success and on
         // failure alike.
-        std::fs::write(
+        write_program(
             &ssh,
             format!(
                 r#"#!/bin/sh
