@@ -66,7 +66,11 @@ fn reload_observes_a_moved_git_flake() {
         std::env::set_var("XDG_CACHE_HOME", &cache);
     }
 
-    let mut evaluator = Evaluator::new(Backend::Worker).quiet();
+    // NOT `.quiet()`: a worker that dies at init reports only "worker closed
+    // stdout" through the client, so keep its stderr on the test's stderr —
+    // that is the sole place the real reason (store not writable, unknown
+    // setting, …) surfaces in a `nix build` log.
+    let mut evaluator = Evaluator::new(Backend::Worker);
     let first = evaluator
         .aggregate(dir.to_str().unwrap())
         .expect("commit A");

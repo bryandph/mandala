@@ -130,6 +130,21 @@
         # enter the shipped runtime closure.
         nativeCheckInputs = [pkgs.gitMinimal];
 
+        # The eval-worker regression (tests/git_reload.rs) runs the REAL
+        # libnixexpr worker, and `Store::open(None)` needs a writable store to
+        # fetch the temporary git flake into. The build sandbox has neither a
+        # daemon socket nor a writable /nix/var, so libstore's `auto` dies at
+        # init ("creating directory /nix/var/nix/profiles") and the test only
+        # sees "worker closed stdout". Point libstore at a throwaway chroot
+        # store under $TMPDIR for the check phase — the same trick nixpkgs uses
+        # to run nix inside a build. Logical paths stay /nix/store, so
+        # evaluation is unaffected. Outside the sandbox (an unsandboxed remote
+        # builder with the host daemon reachable) it merely stops the tests
+        # from touching the host store.
+        preCheck = ''
+          export NIX_REMOTE="local?root=$TMPDIR/eval-worker-store"
+        '';
+
         # The interactive build tab spawns `nom --json`. Keep the renderer an
         # explicit runtime dependency of the public package instead of relying
         # on the caller's shell PATH.
