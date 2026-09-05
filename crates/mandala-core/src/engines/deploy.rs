@@ -1585,12 +1585,6 @@ exit 0
         let confirmed = base.join(format!(
             "confirmation-attempted-{order_name}-{confirm_rc}-{activate_rc}"
         ));
-        let waited = base.join(format!(
-            "wait-complete-{order_name}-{confirm_rc}-{activate_rc}"
-        ));
-        let activated = base.join(format!(
-            "activation-exited-{order_name}-{confirm_rc}-{activate_rc}"
-        ));
         let nix = base.join(format!(
             "ordered-nix-copy-{order_name}-{confirm_rc}-{activate_rc}"
         ));
@@ -1609,12 +1603,33 @@ exit 0
             ),
         )
         .unwrap();
+        // Every ordering constraint below is "block until the ENGINE has
+        // recorded X in the host's event stream" (`<runs base>/<run>/cache.jsonl`,
+        // which the sink appends every child line and log message to), never
+        // "a sibling script wrote a marker, so sleep a bit". A sibling exiting
+        // says nothing about when the tokio side reaps it: under a starved
+        // sandbox both children become ready in one poll and an unbiased
+        // `select!` picks at random — the flake this replaces. Child stdout
+        // reaches the same stream via `emit_output`, which is why the fake
+        // confirmation echoes a sentinel: `checked_output` forwards it in the
+        // same poll that resolves the confirmation branch, on success and on
+        // failure alike.
         std::fs::write(
             &ssh,
             format!(
                 r#"#!/bin/sh
-printf 'ssh args=%s\n' "$*" >> '{}'
-order='{}'
+printf 'ssh args=%s\n' "$*" >> '{trace}'
+order='{order_name}'
+wait_for_log() {{
+  attempt=0
+  until grep -qs -- "$1" '{base}'/*/cache.jsonl; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 500 ]; then
+      exit 99
+    fi
+    sleep 0.01
+  done
+}}
 wait_for_marker() {{
   attempt=0
   while [ ! -e "$1" ]; do
@@ -1630,58 +1645,55 @@ case "$*" in
   *'activate-rs activate '*)
     case "$order" in
       confirmation-first)
-        wait_for_marker '{}'
-        sleep 0.05
+        # The engine has judged the confirmation (the biased select already
+        # committed to that branch while activation was still pending).
+        wait_for_log 'confirmation exited'
         ;;
       confirmation-after-activation)
-        wait_for_marker '{}'
-        sleep 0.05
-        : > '{}'
+        # The waiter branch won and the confirmation child has actually
+        # started (its trace line is already on disk), so this exit lands
+        # in the second select as a post-wait rollback, not a failure.
+        wait_for_log 'activation waiter complete'
+        wait_for_marker '{confirmed}'
         ;;
       activation-before-wait)
         ;;
     esac
-    exit {}
+    exit {activate_rc}
     ;;
   *'activate-rs wait '*)
     case "$order" in
-      confirmation-after-activation)
-        : > '{}'
-        ;;
       activation-before-wait)
-        sleep 0.15
+        # Stay pending until the engine has already classified the early
+        # activation exit; only then may the waiter settle.
+        wait_for_log 'ssh activation failed'
         ;;
     esac
     exit 0
     ;;
   *' rm '*)
     case "$order" in
-      confirmation-first)
-        : > '{}'
-        ;;
-      confirmation-after-activation)
-        wait_for_marker '{}'
-        sleep 0.05
-        ;;
       activation-before-wait)
         exit 98
         ;;
     esac
-    exit {}
+    : > '{confirmed}'
+    case "$order" in
+      confirmation-after-activation)
+        # Never complete before the activation exit is judged; the engine
+        # kills this child (kill_on_drop) once it returns the rollback.
+        wait_for_log 'activation rolled back'
+        ;;
+    esac
+    echo 'confirmation exited'
+    exit {confirm_rc}
     ;;
 esac
 exit 0
 "#,
-                trace.display(),
-                order_name,
-                confirmed.display(),
-                waited.display(),
-                activated.display(),
-                activate_rc,
-                waited.display(),
-                confirmed.display(),
-                activated.display(),
-                confirm_rc,
+                trace = trace.display(),
+                base = base.display(),
+                confirmed = confirmed.display(),
             ),
         )
         .unwrap();

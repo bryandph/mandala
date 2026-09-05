@@ -301,6 +301,12 @@ pub async fn deploy_profile(
     let mut activation_finished = None;
 
     tokio::select! {
+        // If both children settle in one poll, the waiter is the protocol
+        // authority: activate-rs only creates the canary the waiter is
+        // watching for once the new generation is live, so a non-zero
+        // activation exit alongside a satisfied waiter is a rollback (handled
+        // by the second select), not an activation failure.
+        biased;
         output = &mut wait_output => {
             let output = output.map_err(DeployProfileError::WaitSpawn)?;
             checked_output(output, deploy_data, DeployProfileError::WaitExit)?;
