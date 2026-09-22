@@ -42,12 +42,14 @@ fn main() -> ExitCode {
             TuiRequest::Deploy {
                 limit,
                 dry_activate,
+                halt_on_build_failure,
                 throttle,
             } => {
                 let cfg = DeployConfig {
                     flake: flake.to_string(),
                     limit,
                     dry_activate,
+                    halt_on_build_failure,
                     throttle,
                     program: None,
                 };

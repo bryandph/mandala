@@ -822,6 +822,7 @@ pub struct DeployRun {
     /// Fleet flake passed to the native engine.
     pub flake: String,
     pub dry_activate: bool,
+    pub halt_on_build_failure: bool,
     pub throttle: i64,
     pub events_dir: Option<PathBuf>,
     pub run_id: Option<String>,
@@ -854,6 +855,7 @@ impl DeployRun {
             limit: limit.into(),
             flake: ".".to_string(),
             dry_activate: false,
+            halt_on_build_failure: false,
             throttle: 4,
             events_dir: None,
             run_id: None,
@@ -886,6 +888,10 @@ impl DeployRun {
             .get("dry_activate")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        run.halt_on_build_failure = meta
+            .get("halt_on_build_failure")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         run.events_dir = Some(obs.info.path.clone());
         run.run_id = Some(run_id.to_string());
         run.meta_pid = meta.get("pid").and_then(Value::as_i64);
@@ -914,6 +920,9 @@ impl DeployRun {
             "--throttle".to_string(),
             self.throttle.to_string(),
         ];
+        if self.halt_on_build_failure {
+            argv.push("--halt-on-build-failure".to_string());
+        }
         if self.dry_activate {
             argv.push("--dry-activate".to_string());
         }
@@ -1983,6 +1992,8 @@ mod write_tests {
         run.flake = "github:example/fleet".into();
         run.throttle = 7;
         run.dry_activate = true;
+        assert!(!run.halt_on_build_failure);
+        run.halt_on_build_failure = true;
         let argv = run.argv();
         assert_eq!(
             &argv[1..],
@@ -1995,6 +2006,7 @@ mod write_tests {
                 "web,cache",
                 "--throttle",
                 "7",
+                "--halt-on-build-failure",
                 "--dry-activate",
             ]
         );

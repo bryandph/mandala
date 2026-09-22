@@ -22,6 +22,7 @@ async fn main() {
         flake: ".".to_string(),
         limit: String::new(),
         dry_activate: false,
+        halt_on_build_failure: false,
         throttle: 4,
         program: None,
     };

@@ -88,6 +88,7 @@ pub enum ConfirmAction {
 pub struct ConfirmState {
     pub message: String,
     pub action: ConfirmAction,
+    pub halt_on_build_failure: bool,
 }
 
 impl ConfirmState {
@@ -96,6 +97,7 @@ impl ConfirmState {
         Self {
             message: message.into(),
             action,
+            halt_on_build_failure: false,
         }
     }
 }
@@ -114,6 +116,18 @@ pub fn confirm_lines(state: &ConfirmState) -> Vec<Line<'static>> {
             ))
         })
         .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(format!(
+        "[{}] Halt on build failure (h to toggle)",
+        if state.halt_on_build_failure {
+            "x"
+        } else {
+            " "
+        }
+    )));
+    lines.push(Line::from(
+        "Default: deploy targets that build successfully.",
+    ));
     lines.push(Line::default());
     lines.push(run_cancel_line());
     lines

@@ -209,6 +209,9 @@ fn confirm_modal_renders_message_and_trailer() {
             "Deploy 'web'?",
             "(eval-once batch build, then deploy-rs per host with magic rollback)",
             "",
+            "[ ] Halt on build failure (h to toggle)",
+            "Default: deploy targets that build successfully.",
+            "",
             "y to run   esc to cancel",
         ]
     );

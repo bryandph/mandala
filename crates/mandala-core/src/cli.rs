@@ -101,6 +101,8 @@ pub enum TuiRequest {
         limit: String,
         /// `--dry-activate`: build + copy but do not activate.
         dry_activate: bool,
+        /// Halt before deployment if any profile build fails.
+        halt_on_build_failure: bool,
         /// `--throttle`: per-host deploy parallelism (default 4).
         throttle: i64,
     },
@@ -251,6 +253,12 @@ impl Cli {
                                     .help("Build + copy but do not activate"),
                             )
                             .arg(
+                                Arg::new("halt-on-build-failure")
+                                    .long("halt-on-build-failure")
+                                    .action(ArgAction::SetTrue)
+                                    .help("Stop on a build failure without deploying any targets"),
+                            )
+                            .arg(
                                 Arg::new("throttle")
                                     .long("throttle")
                                     .value_parser(clap::value_parser!(i64))
@@ -353,6 +361,7 @@ fn tui_request(m: &ArgMatches) -> TuiRequest {
         Some(("deploy", d)) => TuiRequest::Deploy {
             limit: d.get_one::<String>("limit").cloned().unwrap_or_default(),
             dry_activate: d.get_flag("dry-activate"),
+            halt_on_build_failure: d.get_flag("halt-on-build-failure"),
             throttle: d.get_one::<i64>("throttle").copied().unwrap_or(4),
         },
         Some(("attach", a)) => TuiRequest::Attach {
@@ -776,6 +785,7 @@ mod tests {
             TuiRequest::Deploy {
                 limit: "@k3s".into(),
                 dry_activate: true,
+                halt_on_build_failure: false,
                 throttle: 4, // the Python default
             }
         );
@@ -787,11 +797,13 @@ mod tests {
                 "--limit",
                 "web",
                 "--throttle",
-                "8"
+                "8",
+                "--halt-on-build-failure"
             ]),
             TuiRequest::Deploy {
                 limit: "web".into(),
                 dry_activate: false,
+                halt_on_build_failure: true,
                 throttle: 8,
             }
         );
@@ -869,6 +881,7 @@ mod tests {
                     TuiRequest::Deploy {
                         limit: "@k3s".into(),
                         dry_activate: false,
+                        halt_on_build_failure: false,
                         throttle: 4,
                     }
                 ),

@@ -670,7 +670,11 @@ impl App {
     ) -> io::Result<()> {
         match self.state.screen.as_mut().expect("screen present") {
             // ConfirmScreen: y confirm, esc/n cancel.
-            ScreenState::Confirm(_) => match code {
+            ScreenState::Confirm(confirm) => match code {
+                KeyCode::Char('h') => {
+                    confirm.halt_on_build_failure = !confirm.halt_on_build_failure;
+                    self.dirty = true;
+                }
                 KeyCode::Char('y') => {
                     let Some(ScreenState::Confirm(confirm)) = self.state.screen.take() else {
                         unreachable!("matched Confirm above");
@@ -680,6 +684,7 @@ impl App {
                         ConfirmAction::Deploy { target } => {
                             let mut run = DeployRun::new(target);
                             run.flake = self.cfg.flake.clone();
+                            run.halt_on_build_failure = confirm.halt_on_build_failure;
                             if let Some(program) = self.cfg.deploy_program.clone() {
                                 run.program = Some(program);
                             }

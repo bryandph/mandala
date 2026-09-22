@@ -69,6 +69,20 @@ feeds those same verbatim internal-JSON records to a PTY-hosted
 derivation attribution remain available independently in non-interactive and
 CI runs.
 
+Deploy builds use best effort by default: independent derivations continue after
+failures, and only successfully built profiles proceed to deployment. Failed
+targets remain visible in the summary and make the run return a nonzero status.
+The build stream includes failed derivation names and log tails; available full
+logs are saved under the run's `build-logs/` directory. Missing local logs are
+reported with a `nix log <derivation>` command for retrieval.
+
+In the Shift+D confirmation dialog, press `h` to enable **Halt on build failure**
+(default off). This stops the build on failure and prevents deployment of every
+target in that run. The equivalent CLI option is
+`mandala deploy run --limit <selection> --halt-on-build-failure`, also supported
+by `mandala tui deploy`. Cancellation and profile-resolution errors always stop
+the run before deployment.
+
 ### MCP operator note: harness allowlists
 
 The mutating MCP tools (`deploy`, `reboot`, `restart_service`) carry their

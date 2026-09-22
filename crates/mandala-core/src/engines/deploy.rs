@@ -58,6 +58,12 @@ pub fn engine() -> Engine {
                         .help("Build + copy but do not activate"),
                 )
                 .arg(
+                    Arg::new("halt-on-build-failure")
+                        .long("halt-on-build-failure")
+                        .action(ArgAction::SetTrue)
+                        .help("Stop on a build failure without deploying any targets"),
+                )
+                .arg(
                     Arg::new("throttle")
                         .long("throttle")
                         .value_parser(value_parser!(i64))
@@ -94,6 +100,8 @@ pub struct DeployPlan {
     pub settings: BTreeMap<String, Value>,
     /// Whether activation is suppressed after copy.
     pub dry_activate: bool,
+    /// Opt-in fail-fast build policy; defaults to best effort.
+    pub halt_on_build_failure: bool,
     /// Maximum per-host concurrency for the later fan-out stage.
     pub throttle: i64,
 }
@@ -114,6 +122,8 @@ pub struct RegisteredDeployRun {
 pub struct BuiltProfiles {
     /// Deploy target -> prebuilt profile store path.
     pub paths: BTreeMap<String, PathBuf>,
+    /// Targets whose profiles could not be built; never passed to deployment.
+    pub failures: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -404,6 +414,7 @@ pub fn plan_run(
         skipped,
         settings,
         dry_activate,
+        halt_on_build_failure: false,
         throttle,
     })
 }
@@ -435,6 +446,10 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
     meta.insert("skipped".into(), Value::from(plan.skipped.clone()));
     meta.insert("dry_activate".into(), Value::from(plan.dry_activate));
     meta.insert("throttle".into(), Value::from(plan.throttle));
+    meta.insert(
+        "halt_on_build_failure".into(),
+        Value::from(plan.halt_on_build_failure),
+    );
     meta.insert("pid".into(), Value::from(i64::from(std::process::id())));
     meta.insert("started_at".into(), Value::from(now_epoch_f64()));
     registry::write_meta(&path, &meta)?;
@@ -578,6 +593,7 @@ pub fn build_run_argv(flake: &str, targets: &[String], out_link: &Path) -> Vec<S
             .map(|host| format!("{flake}#deploy.nodes.{host}.profiles.system.path")),
     );
     argv.extend([
+        "--keep-going".to_string(),
         "--log-format".to_string(),
         "internal-json".to_string(),
         "--impure".to_string(),
@@ -620,6 +636,132 @@ fn map_profile_links(
     Ok(paths)
 }
 
+/// Resolve once, before effects, so recovery never re-evaluates a changing flake.
+/// Nix's dry-run JSON retains installable order, including shared derivations.
+fn resolve_profiles(
+    program: &OsStr,
+    argv: &[String],
+    count: usize,
+) -> Result<Vec<(String, String)>, BuildError> {
+    let output = ProcCommand::new(program)
+        .args(&argv[1..])
+        .args(["--dry-run", "--json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "resolving profiles: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    let values: Vec<Value> = serde_json::from_slice(&output.stdout).map_err(io::Error::other)?;
+    if values.len() != count {
+        return Err(
+            io::Error::other("profile resolution returned an unexpected target count").into(),
+        );
+    }
+    values
+        .iter()
+        .map(|value| {
+            let drv = value["drvPath"].as_str();
+            let outputs = value["outputs"].as_object();
+            match (drv, outputs) {
+                (Some(drv), Some(outputs))
+                    if drv.starts_with("/nix/store/")
+                        && drv.ends_with(".drv")
+                        && outputs.len() == 1 =>
+                {
+                    let (name, path) = outputs.iter().next().expect("one output");
+                    let path = path
+                        .as_str()
+                        .filter(|p| p.starts_with("/nix/store/"))
+                        .ok_or_else(|| {
+                            io::Error::other("profile has no statically known store output")
+                        })?;
+                    Ok((format!("{drv}^{name}"), path.to_string()))
+                }
+                _ => Err(io::Error::other(
+                    "profile resolution requires one derivation output per target",
+                )
+                .into()),
+            }
+        })
+        .collect()
+}
+
+/// Probe exact outputs with all building and substitution disabled. Successful
+/// probes also create GC roots; failed builds cannot accidentally be retried.
+fn recover_profiles(
+    run: &RegisteredDeployRun,
+    program: &OsStr,
+    resolved: &[(String, String)],
+    rc: i32,
+) -> Result<BuiltProfiles, BuildError> {
+    let mut built = BuiltProfiles {
+        paths: BTreeMap::new(),
+        failures: BTreeMap::new(),
+    };
+    for (index, (host, (drv, path))) in run.plan.targets.iter().zip(resolved).enumerate() {
+        let link = profile_link(&run.path.join("profile"), index);
+        let output = ProcCommand::new(program)
+            .args([
+                "build",
+                path,
+                "--offline",
+                "--max-jobs",
+                "0",
+                "--builders",
+                "",
+                "--option",
+                "substitute",
+                "false",
+                "--out-link",
+            ])
+            .arg(&link)
+            .output()?;
+        if output.status.success() {
+            let mapped = map_profile_links(std::slice::from_ref(host), &link)?;
+            if mapped[host] != Path::new(path) {
+                return Err(BuildError::InvalidProfilePath {
+                    host: host.clone(),
+                    path: mapped[host].clone(),
+                });
+            }
+            built.paths.extend(mapped);
+        } else {
+            built.failures.insert(host.clone(), format!("profile build failed (batch rc={rc}): {drv}; see build.jsonl for dependency errors and derivation logs"));
+        }
+    }
+    Ok(built)
+}
+
+fn save_derivation_log(
+    program: &OsStr,
+    run: &RegisteredDeployRun,
+    drv: &str,
+) -> io::Result<PathBuf> {
+    let name = Path::new(drv)
+        .file_name()
+        .ok_or_else(|| io::Error::other("derivation has no filename"))?;
+    let directory = run.path.join("build-logs");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(name).with_extension("log");
+    let file = std::fs::File::create(&path)?;
+    let output = ProcCommand::new(program)
+        .args(["log", "--offline", drv])
+        .stdout(file)
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(path)
+    } else {
+        let _ = std::fs::remove_file(&path);
+        Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
 fn event_fields<const N: usize>(fields: [(&str, Value); N]) -> serde_json::Map<String, Value> {
     fields
         .into_iter()
@@ -636,12 +778,13 @@ fn record_build_failure(run: &RegisteredDeployRun, rc: i32, error: &str) {
     let _ = registry::update_meta(&run.path, fields);
 }
 
-/// Build every selected profile in exactly one Nix process, stream compatible
-/// build events into the registry, and return the prebuilt profile paths.
+/// Resolve selected profiles once, build them together with keep-going, and
+/// return verified successes alongside per-host build failures. Registry events
+/// retain Nix's process result and derivation diagnostics.
 ///
 /// # Errors
-/// A Nix failure, process/event I/O failure, or missing/invalid indexed
-/// out-link. Any failure is terminally recorded in the run metadata.
+/// Resolution, cancellation, process/event I/O, or invalid output mapping.
+/// Ordinary build failures are returned as per-host outcomes for fan-out.
 pub fn build_profiles(run: &RegisteredDeployRun, flake: &str) -> Result<BuiltProfiles, BuildError> {
     build_profiles_with(run, flake, OsStr::new("nix"))
 }
@@ -664,7 +807,21 @@ fn build_profiles_with(
     let duration_estimates = duration_cache
         .as_ref()
         .map_or_else(BTreeMap::new, |(_, cache)| cache.estimates_ms());
-    let argv = build_run_argv(flake, &run.plan.targets, &out_link);
+    let mut argv = build_run_argv(flake, &run.plan.targets, &out_link);
+    if run.plan.halt_on_build_failure {
+        argv.retain(|arg| arg != "--keep-going");
+        argv.extend(["--option".into(), "keep-going".into(), "false".into()]);
+    }
+    let resolved = match resolve_profiles(program, &argv, run.plan.targets.len()) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            record_build_failure(run, error.exit_code(), &error.to_string());
+            return Err(error);
+        }
+    };
+    for (arg, (drv, _)) in argv[2..].iter_mut().zip(&resolved) {
+        arg.clone_from(drv);
+    }
     let mut event_argv = argv.clone();
     event_argv[0] = program.to_string_lossy().into_owned();
     let writer = Arc::new(EventWriter::new(&run.path, "build", "controller", "build")?);
@@ -787,16 +944,25 @@ fn build_profiles_with(
     }
 
     let process_rc = status.code().unwrap_or(1);
-    let outcome = if process_rc != 0 {
-        Err(BuildError::Failed(process_rc))
-    } else if let Some(error) = event_error {
+    let outcome = if let Some(error) = event_error {
         Err(BuildError::Io(error))
+    } else if status.code().is_none()
+        || process_rc == 130
+        || process_rc == 143
+        || (process_rc != 0 && run.plan.halt_on_build_failure)
+    {
+        Err(BuildError::Failed(process_rc))
+    } else if process_rc != 0 {
+        recover_profiles(run, program, &resolved, process_rc)
     } else {
-        map_profile_links(&run.plan.targets, &out_link).map(|paths| BuiltProfiles { paths })
+        map_profile_links(&run.plan.targets, &out_link).map(|paths| BuiltProfiles {
+            paths,
+            failures: BTreeMap::new(),
+        })
     };
     let rc = outcome
         .as_ref()
-        .map_or_else(|error| error.exit_code(), |_| 0);
+        .map_or_else(|error| error.exit_code(), |_| process_rc);
     if let Err(error) = writer.emit("progress", tracker.fields()).and_then(|()| {
         writer.emit(
             "status",
@@ -822,10 +988,39 @@ fn build_profiles_with(
         nix_build_forest::plain::render_final(&final_snapshot)
     );
 
+    for node in final_snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.status == nix_build_forest::DerivationStatus::Failed)
+    {
+        let saved_log = match save_derivation_log(program, run, &node.path) {
+            Ok(path) => format!("Saved log: {}", path.display()),
+            Err(error) => format!("Full log unavailable locally: {error}"),
+        };
+        let message = format!(
+            "failed derivation: {}\n{}\n{saved_log}\nFull log: nix log {}",
+            node.path,
+            node.log_tail.join("\n"),
+            node.path
+        );
+        eprintln!("mandala: {message}");
+        writer.emit(
+            "line",
+            event_fields([
+                ("line", Value::from(message)),
+                ("stream", Value::from("nix")),
+            ]),
+        )?;
+    }
+
     match outcome {
         Ok(built) => {
             let mut fields = Meta::new();
-            fields.insert("build_rc".into(), Value::from(0));
+            fields.insert("build_rc".into(), Value::from(process_rc));
+            fields.insert(
+                "build_failures".into(),
+                serde_json::to_value(&built.failures).map_err(io::Error::other)?,
+            );
             fields.insert(
                 "profiles".into(),
                 serde_json::to_value(&built.paths).map_err(io::Error::other)?,
@@ -1102,7 +1297,11 @@ fn settle_fan_out(
     // settlement means the native controller itself completed successfully;
     // sticky host outcomes synthesize the effective non-zero rc.
     let process_rc = 0;
-    let rc = i32::from(summary.failed > 0 || summary.rolled_back > 0);
+    let build_failed = registry::read_meta(&run.path)
+        .get("build_rc")
+        .and_then(Value::as_i64)
+        .is_some_and(|rc| rc != 0);
+    let rc = i32::from(build_failed || summary.failed > 0 || summary.rolled_back > 0);
     let mut fields = Meta::new();
     fields.insert("process_rc".into(), Value::from(process_rc));
     fields.insert("rc".into(), Value::from(rc));
@@ -1198,7 +1397,12 @@ async fn fan_out_with(
     let semaphore = Arc::new(Semaphore::new(throttle));
     let mut tasks = JoinSet::new();
     let mut task_hosts = HashMap::new();
+    let mut results = BTreeMap::new();
     for host in &run.plan.targets {
+        if let Some(error) = built.failures.get(host) {
+            results.insert(host.clone(), abnormal_host(&run, host, error));
+            continue;
+        }
         let host = host.clone();
         let task_host = host.clone();
         let run = Arc::clone(&run);
@@ -1215,7 +1419,6 @@ async fn fan_out_with(
         task_hosts.insert(handle.id(), host);
     }
 
-    let mut results = BTreeMap::new();
     while let Some(joined) = tasks.join_next_with_id().await {
         match joined {
             Ok((id, result)) => {
@@ -1276,7 +1479,11 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
             let limit = sm.get_one::<String>("limit").map_or("", String::as_str);
             let throttle = *sm.get_one::<i64>("throttle").unwrap_or(&4);
             let dry_activate = sm.get_flag("dry-activate");
-            match prepare_run(inv, limit, throttle, dry_activate) {
+            let prepared = plan_run(inv, limit, throttle, dry_activate).and_then(|mut plan| {
+                plan.halt_on_build_failure = sm.get_flag("halt-on-build-failure");
+                register_run(plan)
+            });
+            match prepared {
                 Ok(run) => {
                     if let Err(error) = publish_run_id(std::io::stdout().lock(), &run.run_id) {
                         let message = format!("publishing deploy run id: {error}");
@@ -1467,6 +1674,29 @@ mod tests {
             &script,
             format!(
                 r#"#!/bin/sh
+if [ "$1" = log ]; then
+  printf '%s\n' 'fixture derivation failure log'
+  exit 0
+fi
+case " $* " in
+  *' --dry-run '*)
+    printf '['
+    sep=
+    for arg in "$@"; do
+      case "$arg" in
+        *#deploy.nodes.*.profiles.system.path)
+          host=${{arg#*#deploy.nodes.}}
+          host=${{host%.profiles.system.path}}
+          printf '%s{{"drvPath":"/nix/store/00000000000000000000000000000000-%s-profile.drv","outputs":{{"out":"/nix/store/00000000000000000000000000000000-%s-profile"}}}}' "$sep" "$host" "$host"
+          sep=,
+          ;;
+      esac
+    done
+    printf ']\n'
+    exit 0
+    ;;
+  *' --offline '*) exit 1 ;;
+esac
 printf 'x\n' >> '{}'
 printf '%s\n' "$@" > '{}'
 printf '%s\n' '@nix {{"action":"start","id":7,"type":105,"fields":["/nix/store/0123456789abcdfghijklmnpqrsvwxyz-profile.drv"]}}' >&2
@@ -1487,9 +1717,9 @@ for arg in "$@"; do
     want_out_link=1
   else
     case "$arg" in
-      *#deploy.nodes.*.profiles.system.path)
-        host=${{arg#*#deploy.nodes.}}
-        host=${{host%.profiles.system.path}}
+      /nix/store/*-profile.drv^out)
+        host=${{arg#/nix/store/00000000000000000000000000000000-}}
+        host=${{host%-profile.drv^out}}
         hosts="$hosts $host"
         ;;
     esac
@@ -1792,6 +2022,7 @@ exit 0
 
     fn built_cache_profile() -> BuiltProfiles {
         BuiltProfiles {
+            failures: BTreeMap::new(),
             paths: BTreeMap::from([(
                 "cache".into(),
                 PathBuf::from("/nix/store/00000000000000000000000000000000-cache-profile"),
@@ -1817,6 +2048,7 @@ exit 0
 
     fn built_k3s_profiles() -> BuiltProfiles {
         BuiltProfiles {
+            failures: BTreeMap::new(),
             paths: BTreeMap::from([
                 (
                     "cache".into(),
@@ -1949,6 +2181,7 @@ exit 0
                 "build",
                 "/fleet#deploy.nodes.cache.profiles.system.path",
                 "/fleet#deploy.nodes.web.profiles.system.path",
+                "--keep-going",
                 "--log-format",
                 "internal-json",
                 "--impure",
@@ -1983,8 +2216,10 @@ exit 0
         );
         assert_eq!(std::fs::read_to_string(invocations).unwrap(), "x\n");
         let args = std::fs::read_to_string(args).unwrap();
-        assert!(args.contains("/fleet#deploy.nodes.cache.profiles.system.path\n"));
-        assert!(args.contains("/fleet#deploy.nodes.web.profiles.system.path\n"));
+        assert!(
+            args.contains("/nix/store/00000000000000000000000000000000-cache-profile.drv^out\n")
+        );
+        assert!(args.contains("/nix/store/00000000000000000000000000000000-web-profile.drv^out\n"));
         assert!(!args.contains("router"));
 
         let build_stream = std::fs::read_to_string(run.path.join("build.jsonl")).unwrap();
@@ -2101,9 +2336,11 @@ exit 0
         assert_eq!(
             meta.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "build_failures",
                 "build_rc",
                 "dry_activate",
                 "finished_at",
+                "halt_on_build_failure",
                 "kind",
                 "limit",
                 "pid",
@@ -2151,23 +2388,133 @@ exit 0
         }
     }
 
+    #[tokio::test]
+    async fn partial_build_deploys_only_the_verified_sibling() {
+        let base = tmp_base("build-partial");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
+        let (stub, invocations, _) = build_stub(&base, 23);
+        // Nix leaves no batch out-links on failure. Only web's exact output
+        // is valid, even though cache appeared first in the selection.
+        let script = std::fs::read_to_string(&stub).unwrap().replace(
+            "*' --offline '*) exit 1 ;;",
+            r#"*' --offline '*)
+              case "$2" in
+                *-web-profile)
+                  path=$2
+                  for arg in "$@"; do link=$arg; done
+                  ln -s "$path" "$link"
+                  exit 0 ;;
+                *) exit 1 ;;
+              esac ;;
+            "#,
+        );
+        write_program(&stub, script).unwrap();
+        let built = build_profiles_with(&run, "/fleet", stub.as_os_str()).unwrap();
+        assert_eq!(built.paths.keys().collect::<Vec<_>>(), ["web"]);
+        assert_eq!(built.failures.keys().collect::<Vec<_>>(), ["cache"]);
+        assert_eq!(std::fs::read_to_string(invocations).unwrap(), "x\n");
+        assert_eq!(
+            std::fs::read_link(run.path.join("profile-1")).unwrap(),
+            built.paths["web"]
+        );
+        let task: HostTask = Arc::new(|run, _, host| {
+            assert_eq!(host, "web", "failed hosts must not start deployment");
+            Box::pin(async move {
+                let writer = EventWriter::new(&run.path, &host, &host, "deploy").unwrap();
+                emit_milestone(&writer, "confirm").unwrap();
+                host_result(&writer, &host, HostState::Confirmed, None)
+            })
+        });
+        let outcome = fan_out_with(&run, &built, task).await.unwrap();
+        assert_eq!(outcome.summary.confirmed, 1);
+        assert_eq!(outcome.summary.failed, 1);
+        assert_eq!(outcome.rc, 1);
+        let mut tailer = crate::runner::EventTailer::new(&run.path);
+        tailer.poll();
+        assert_eq!(tailer.hosts["cache"].state, HostState::Failed);
+        assert_eq!(tailer.hosts["web"].state, HostState::Confirmed);
+        let stream = std::fs::read_to_string(run.path.join("build.jsonl")).unwrap();
+        assert!(stream.contains("failed derivation:"));
+        assert_eq!(
+            std::fs::read_to_string(
+                run.path
+                    .join("build-logs/0123456789abcdfghijklmnpqrsvwxyz-profile.log")
+            )
+            .unwrap(),
+            "fixture derivation failure log\n"
+        );
+        assert!(stream.contains("Full log: nix log /nix/store/"));
+        let meta = registry::read_meta(&run.path);
+        assert_eq!(meta["build_rc"], 23);
+        assert_eq!(meta["process_rc"], 0);
+        assert_eq!(meta["rc"], 1);
+    }
+
     #[test]
-    fn failed_build_is_terminal_with_the_real_rc() {
+    fn halt_on_build_failure_is_opt_in_and_prevents_recovery() {
+        let base = tmp_base("build-halt");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut plan = plan_run(&inv(), "@k3s", 4, false).unwrap();
+        assert!(!plan.halt_on_build_failure);
+        plan.halt_on_build_failure = true;
+        let run = register_run(plan).unwrap();
+        let (stub, _, args) = build_stub(&base, 23);
+        assert!(matches!(
+            build_profiles_with(&run, "/fleet", stub.as_os_str()),
+            Err(BuildError::Failed(23))
+        ));
+        assert!(
+            !std::fs::read_to_string(args)
+                .unwrap()
+                .contains("--keep-going")
+        );
+        let meta = registry::read_meta(&run.path);
+        assert_eq!(meta["halt_on_build_failure"], true);
+        assert_eq!(meta["rc"], 23);
+        assert!(meta.get("profiles").is_none());
+    }
+
+    #[test]
+    fn interrupted_build_never_recovers_or_deploys() {
+        let base = tmp_base("build-interrupted");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
+        let (stub, _, _) = build_stub(&base, 130);
+        assert!(matches!(
+            build_profiles_with(&run, "/fleet", stub.as_os_str()),
+            Err(BuildError::Failed(130))
+        ));
+        assert_eq!(registry::read_meta(&run.path)["rc"], 130);
+    }
+
+    #[tokio::test]
+    async fn failed_build_marks_every_host_without_deploying() {
         let base = tmp_base("build-failure");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
         let run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
         let (stub, invocations, _args) = build_stub(&base, 23);
 
-        let error = build_profiles_with(&run, "/fleet", stub.as_os_str()).unwrap_err();
-        assert!(matches!(error, BuildError::Failed(23)));
+        let built = build_profiles_with(&run, "/fleet", stub.as_os_str()).unwrap();
+        assert!(built.paths.is_empty());
+        assert_eq!(built.failures.len(), 2);
+        let task: HostTask = Arc::new(|_, _, _| panic!("failed build must never deploy"));
+        let outcome = fan_out_with(&run, &built, task).await.unwrap();
+        assert_eq!(outcome.summary.failed, 2);
+        assert_eq!(outcome.rc, 1);
         assert_eq!(std::fs::read_to_string(invocations).unwrap(), "x\n");
 
         let meta = registry::read_meta(&run.path);
         assert_eq!(meta["build_rc"], 23);
-        assert_eq!(meta["rc"], 23);
+        assert_eq!(meta["rc"], 1);
         assert!(meta["finished_at"].as_f64().is_some());
-        assert!(meta["error"].as_str().unwrap().contains("rc=23"));
-        assert!(meta.get("profiles").is_none());
+        assert!(
+            meta["build_failures"]["cache"]
+                .as_str()
+                .unwrap()
+                .contains("rc=23")
+        );
+        assert_eq!(meta["profiles"], json!({}));
 
         let mut tailer = crate::runner::EventTailer::new(&run.path);
         tailer.poll();

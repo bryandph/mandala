@@ -129,6 +129,7 @@ pub struct DeployConfig {
     /// `Inventory::to_limit` (canonical resolution) before anything runs.
     pub limit: String,
     pub dry_activate: bool,
+    pub halt_on_build_failure: bool,
     pub throttle: i64,
     /// Test seam: override the launched argv verbatim (`DeployRun::program`)
     /// — never a real native deploy in tests.
@@ -160,6 +161,7 @@ pub async fn run_deploy(cfg: DeployConfig) -> io::Result<i64> {
     let mut run = DeployRun::new(limit);
     run.flake = cfg.flake.clone();
     run.dry_activate = cfg.dry_activate;
+    run.halt_on_build_failure = cfg.halt_on_build_failure;
     run.throttle = cfg.throttle;
     run.program = cfg.program.clone();
 
