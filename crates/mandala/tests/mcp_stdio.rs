@@ -412,6 +412,13 @@ fn native_deploy_survives_leader_death_and_attaches_after_promotion() {
 set -eu
 case "$1" in
   build)
+    case " $* " in
+      *' --dry-run '*)
+        printf 'resolve %s\n' "$*" >> "$MANDALA_FLEET_STATE/effects.log"
+        printf '%s\n' '[{"drvPath":"/nix/store/00000000000000000000000000000000-cache-profile.drv","outputs":{"out":"/nix/store/00000000000000000000000000000000-cache-profile"}},{"drvPath":"/nix/store/11111111111111111111111111111111-web-profile.drv","outputs":{"out":"/nix/store/11111111111111111111111111111111-web-profile"}}]'
+        exit 0
+        ;;
+    esac
     printf 'build %s\n' "$*" >> "$MANDALA_FLEET_STATE/effects.log"
     out_link=
     while [ "$#" -gt 0 ]; do
@@ -646,6 +653,28 @@ sleep 1
     }
 
     let effects = std::fs::read_to_string(&effects).unwrap();
+    assert_eq!(
+        effects
+            .lines()
+            .filter(|line| line.starts_with("resolve "))
+            .count(),
+        1,
+        "profile resolution must happen exactly once: {effects}"
+    );
+    let build_command = effects
+        .lines()
+        .find(|line| line.starts_with("build "))
+        .unwrap();
+    for host in ["cache", "web"] {
+        assert!(
+            build_command.contains(&format!("-{host}-profile.drv^out")),
+            "{effects}"
+        );
+    }
+    assert!(
+        !build_command.contains("#deploy.nodes."),
+        "build must not re-evaluate the flake: {effects}"
+    );
     assert_eq!(
         effects
             .lines()
