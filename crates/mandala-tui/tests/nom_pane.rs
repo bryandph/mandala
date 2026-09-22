@@ -118,6 +118,7 @@ fn stand_in_pipeline_renders_colored_lines() {
 fn resize_propagates_to_pty_and_emulator() {
     let mut pane = NomPane::new();
     pane.spawn_cmd("sh", &["-c", "while IFS= read -r l; do :; done"], 12, 60);
+    pane.feed("start renderer");
     assert!(pane.failure().is_none());
     assert_eq!(pane.pty_size(), Some((12, 60)));
 
@@ -146,7 +147,8 @@ fn fixture_renders_through_real_nom() {
         return;
     }
     let mut pane = NomPane::new();
-    pane.spawn_cmd("nom", &["--json"], 15, 100);
+    pane.spawn(15, 100);
+    assert!(pane.pty_size().is_none(), "nom must wait for input");
     assert!(
         pane.failure().is_none(),
         "nom spawn failed: {:?}",
@@ -164,4 +166,42 @@ fn fixture_renders_through_real_nom() {
     let terminal = draw(&pane, 100, 15);
     let text = format!("{}", terminal.backend());
     assert!(text.contains("mandala-nom-fixture"), "buffer:\n{text}");
+}
+
+/// No renderer process exists during a quiet evaluation, regardless of its
+/// duration. First input starts it using the latest pane dimensions.
+#[test]
+fn quiet_evaluation_defers_spawn_and_preserves_first_input() {
+    let mut pane = NomPane::new();
+    pane.spawn_cmd(
+        "sh",
+        &[
+            "-c",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\"; done; printf DONE",
+        ],
+        12,
+        60,
+    );
+    assert!(pane.pty_size().is_none());
+    assert!(pane.emulator_size().is_none());
+    assert!(format!("{}", draw(&pane, 80, 12).backend()).contains("Waiting for Nix output"));
+    pane.resize(20, 100);
+    pane.feed("first real input");
+    pane.feed("second real input");
+    assert_eq!(pane.pty_size(), Some((20, 100)));
+    pane.finish();
+    let contents = wait_for_contents(&pane, "DONE", Duration::from_secs(5));
+    assert!(contents.contains("first real input"), "{contents}");
+    assert!(contents.contains("second real input"), "{contents}");
+}
+
+#[test]
+fn finish_before_first_input_never_spawns_renderer() {
+    let mut pane = NomPane::new();
+    pane.spawn_cmd("mandala-definitely-not-a-binary", &[], 12, 60);
+    pane.finish();
+    pane.feed("late input");
+    assert!(pane.pty_size().is_none());
+    assert!(pane.failure().is_none());
+    assert!(format!("{}", draw(&pane, 80, 12).backend()).contains("No Nix build output received"));
 }

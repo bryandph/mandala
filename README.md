@@ -67,7 +67,9 @@ dependency forest for headless CLI output and MCP status. The interactive TUI
 feeds those same verbatim internal-JSON records to a PTY-hosted
 `nix-output-monitor` build tab; structured counts, current activity, and failed
 derivation attribution remain available independently in non-interactive and
-CI runs.
+CI runs. While evaluation is quiet, the build tab shows a waiting message.
+The nom process starts with the first Nix log record, avoiding its no-input
+warning during long evaluations.
 
 Deploy builds use best effort by default: independent derivations continue after
 failures, and only successfully built profiles proceed to deployment. Failed

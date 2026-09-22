@@ -53,7 +53,7 @@ impl DeployJob {
         }
     }
 
-    /// Spawn `nom --json` on a pane-sized PTY.
+    /// Prepare nom on a pane-sized PTY, deferring spawn until Nix emits output.
     pub fn spawn_nom(&mut self, rows: u16, cols: u16) {
         if let Ok(mut nom) = self.nom.lock() {
             nom.spawn(rows, cols);
@@ -91,19 +91,20 @@ impl DeployJob {
         let _ = self.run.discover_run();
         self.attach_nixlog_sink();
         self.run.poll();
+        let finished = self.run.finished();
         if !self.nom_finished
-            && self
-                .run
-                .tailer
-                .as_ref()
-                .is_some_and(|tailer| tailer.build.done)
+            && (finished
+                || self
+                    .run
+                    .tailer
+                    .as_ref()
+                    .is_some_and(|tailer| tailer.build.done))
         {
             self.nom_finished = true;
             if let Ok(mut nom) = self.nom.lock() {
                 nom.finish();
             }
         }
-        let finished = self.run.finished();
         let returncode = self.run.returncode();
         let elapsed = self
             .started_at

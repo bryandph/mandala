@@ -11,7 +11,8 @@
 //! - A drain thread reads the pty master and feeds a shared
 //!   `vt100::Parser`; rendering locks the parser briefly and blits the
 //!   screen through tui-term's `PseudoTerminal`.
-//! - Lines fed before spawn buffer in `pending` and flush after spawn.
+//! - Spawn is deferred until the first input line, so long evaluation does
+//!   not trigger nom's no-input warning. Early lines flush after spawn.
 //! - [`NomPane::finish`] closes stdin (EOF) so nom draws its final summary.
 //! - nom absent from PATH → a dim notice, never a crash (the summary pane
 //!   still tracks the build).
@@ -65,6 +66,9 @@ pub struct NomPane {
     failed: Option<String>,
     /// `Some` until spawn: lines fed early buffer here (nom.py parity).
     pending: Option<Vec<String>>,
+    /// Requested renderer and latest dimensions while waiting for real input.
+    launch: Option<(String, Vec<String>, u16, u16)>,
+    finished: bool,
 }
 
 impl Default for NomPane {
@@ -83,10 +87,12 @@ impl NomPane {
             master: None,
             failed: None,
             pending: Some(Vec::new()),
+            launch: None,
+            finished: false,
         }
     }
 
-    /// Spawn `nom --json` on a `rows`×`cols` pty.
+    /// Prepare `nom --json`; create its PTY when the first Nix record arrives.
     pub fn spawn(&mut self, rows: u16, cols: u16) {
         self.spawn_cmd("nom", &["--json"], rows, cols);
     }
@@ -94,6 +100,29 @@ impl NomPane {
     /// Spawn an arbitrary command on the pty — the test seam (a stand-in
     /// script proves the pty+emulator path where nom isn't installed).
     pub fn spawn_cmd(&mut self, cmd: &str, args: &[&str], rows: u16, cols: u16) {
+        if self.finished || self.failed.is_some() || self.child.is_some() {
+            return;
+        }
+        self.launch = Some((
+            cmd.to_string(),
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+            rows,
+            cols,
+        ));
+        self.dirty.store(true, Ordering::Release);
+        self.start_if_ready();
+    }
+
+    fn start_if_ready(&mut self) {
+        if self.pending.as_ref().is_none_or(Vec::is_empty) {
+            return;
+        }
+        if let Some((cmd, args, rows, cols)) = self.launch.take() {
+            self.spawn_now(&cmd, &args, rows, cols);
+        }
+    }
+
+    fn spawn_now(&mut self, cmd: &str, args: &[String], rows: u16, cols: u16) {
         let rows = rows.max(MIN_ROWS);
         let cols = cols.max(MIN_COLS);
         let ws = winsize(rows, cols);
@@ -164,6 +193,8 @@ impl NomPane {
     }
 
     fn fail(&mut self, notice: String) {
+        self.dirty.store(true, Ordering::Release);
+        self.launch = None;
         self.failed = Some(notice);
         self.pending = None;
         self.stdin = None;
@@ -177,8 +208,12 @@ impl NomPane {
 
     /// One raw `@nix {...}` line into nom's stdin (buffered until spawn).
     pub fn feed(&mut self, line: &str) {
+        if self.finished {
+            return;
+        }
         if let Some(pending) = self.pending.as_mut() {
             pending.push(line.to_string());
+            self.start_if_ready();
             return;
         }
         self.write_line(line);
@@ -197,11 +232,19 @@ impl NomPane {
 
     /// EOF nom's stdin so it draws its final summary and exits.
     pub fn finish(&mut self) {
+        self.finished = true;
+        self.launch = None;
+        self.pending = None;
         self.stdin = None;
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// Propagate a pane resize: emulator screen, pty winsize, SIGWINCH.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        if let Some((_, _, pending_rows, pending_cols)) = self.launch.as_mut() {
+            *pending_rows = rows;
+            *pending_cols = cols;
+        }
         let rows = rows.max(MIN_ROWS);
         let cols = cols.max(MIN_COLS);
         if let Some(parser) = self.parser.as_ref() {
@@ -300,7 +343,15 @@ impl Widget for &NomPane {
             return;
         }
         let Some(parser) = self.parser.as_ref() else {
-            // Not spawned yet: nothing to show.
+            let message = if self.finished {
+                "No Nix build output received. See the summary and run log."
+            } else {
+                "Waiting for Nix output — evaluation may take several minutes."
+            };
+            Paragraph::new(message)
+                .style(Style::new().add_modifier(Modifier::DIM))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
             return;
         };
         let parser = parser.lock().expect("nom pane emulator lock poisoned");
