@@ -92,6 +92,8 @@ impl DeployJob {
         self.attach_nixlog_sink();
         self.run.poll();
         let finished = self.run.finished();
+        // returncode drains final events after exit; deliver them before EOF.
+        let returncode = self.run.returncode();
         if !self.nom_finished
             && (finished
                 || self
@@ -105,7 +107,6 @@ impl DeployJob {
                 nom.finish();
             }
         }
-        let returncode = self.run.returncode();
         let elapsed = self
             .started_at
             .map_or(0, |started| started.elapsed().as_secs());
