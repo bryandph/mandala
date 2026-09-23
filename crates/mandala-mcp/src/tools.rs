@@ -252,7 +252,10 @@ pub struct BuildTool {
         "`--limit`, throttle, and deploy-rs magic rollback are never\n",
         "bypassed. Defaults to dry-activate (build + copy, no switch). A REAL\n",
         "activation (`dry_activate=false`) requires `confirm` to equal the\n",
-        "resolved `--limit` target — take it from `resolve`'s `limit` field, a\n",
+        "resolved `--limit` target whether `boot` is true or false. `boot=true` uses\n",
+        "boot activation for every selected member; with the default\n",
+        "`dry_activate=true` it remains a non-activating preview.\n",
+        "Take the confirmation target from `resolve`'s `limit` field, a\n",
         "prior run's `limit`, or this tool's refusal (`required_confirm`) —\n",
         "else it refuses WITHOUT launching. Returns the engine-owned run id; follow with\n",
         "`deploy_status` (its `wait_seconds` blocks until the run settles)."
@@ -265,6 +268,9 @@ pub struct DeployTool {
     /// Build + copy only, no switch (the ungated default).
     #[json_schema(default = true)]
     pub dry_activate: Option<bool>,
+    /// Use boot activation for every selected member (default false).
+    #[json_schema(default = false)]
+    pub boot: Option<bool>,
     /// For a real activation: must equal the resolved `--limit` target.
     pub confirm: Option<String>,
 }
@@ -455,6 +461,7 @@ mod tests {
         assert!(!description.contains("deploy playbook"));
         let schema = serde_json::to_value(&tool.input_schema).unwrap();
         assert_eq!(schema["properties"]["dry_activate"]["default"], true);
+        assert_eq!(schema["properties"]["boot"]["default"], false);
         assert!(schema["properties"].get("confirm").is_some());
         assert_eq!(schema["required"], serde_json::json!(["selector"]));
     }

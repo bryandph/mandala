@@ -675,6 +675,10 @@ impl App {
                     confirm.halt_on_build_failure = !confirm.halt_on_build_failure;
                     self.dirty = true;
                 }
+                KeyCode::Char('b') => {
+                    confirm.boot = !confirm.boot;
+                    self.dirty = true;
+                }
                 KeyCode::Char('y') => {
                     let Some(ScreenState::Confirm(confirm)) = self.state.screen.take() else {
                         unreachable!("matched Confirm above");
@@ -684,6 +688,7 @@ impl App {
                         ConfirmAction::Deploy { target } => {
                             let mut run = DeployRun::new(target);
                             run.flake = self.cfg.flake.clone();
+                            run.boot = confirm.boot;
                             run.halt_on_build_failure = confirm.halt_on_build_failure;
                             if let Some(program) = self.cfg.deploy_program.clone() {
                                 run.program = Some(program);
@@ -1181,9 +1186,10 @@ impl App {
             }
         }
         job.attach_nixlog_sink();
-        let mut view = screen::DeployViewState::new(
+        let mut view = screen::DeployViewState::new_with_boot(
             job.run.limit.clone(),
             job.run.dry_activate,
+            job.run.boot,
             standalone,
             attached,
             after_mutation,

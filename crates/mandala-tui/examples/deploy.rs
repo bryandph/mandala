@@ -22,6 +22,7 @@ async fn main() {
         flake: ".".to_string(),
         limit: String::new(),
         dry_activate: false,
+        boot: false,
         halt_on_build_failure: false,
         throttle: 4,
         program: None,
@@ -31,6 +32,7 @@ async fn main() {
         match arg.as_str() {
             "-l" | "--limit" => cfg.limit = args.next().unwrap_or_default(),
             "--dry-activate" => cfg.dry_activate = true,
+            "--boot" => cfg.boot = true,
             "--throttle" => {
                 cfg.throttle = args
                     .next()

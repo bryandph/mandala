@@ -114,6 +114,7 @@ pub trait Effects: Send + Sync {
         flake: &str,
         limit: &str,
         dry_activate: bool,
+        boot: bool,
         throttle: i64,
     ) -> io::Result<DeployLaunch>;
 
@@ -284,11 +285,13 @@ impl Effects for RealEffects {
         flake: &str,
         limit: &str,
         dry_activate: bool,
+        boot: bool,
         throttle: i64,
     ) -> io::Result<DeployLaunch> {
         let mut run = DeployRun::new(limit);
         run.flake = flake.to_string();
         run.dry_activate = dry_activate;
+        run.boot = boot;
         run.throttle = throttle;
         run.start().await?;
         loop {

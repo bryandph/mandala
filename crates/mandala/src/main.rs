@@ -42,6 +42,7 @@ fn main() -> ExitCode {
             TuiRequest::Deploy {
                 limit,
                 dry_activate,
+                boot,
                 halt_on_build_failure,
                 throttle,
             } => {
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
                     flake: flake.to_string(),
                     limit,
                     dry_activate,
+                    boot,
                     halt_on_build_failure,
                     throttle,
                     program: None,

@@ -384,13 +384,14 @@ async fn leader_and_follower_paths_are_byte_identical() {
             follower,
             local,
             "deploy",
-            &json!({"selector": "@k3s", "dry_activate": false, "confirm": "web"}),
+            &json!({"selector": "@k3s", "dry_activate": false, "boot": true, "confirm": "web"}),
         )
         .await
         .expect("deploy refusal is a structured result"),
     );
     assert_shaped("deploy", &refused);
     assert_eq!(refused["required_confirm"], "cache,web");
+    assert_eq!(refused["boot"], true);
     assert_eq!(
         registry::list_runs().len(),
         runs_before_refusal,
@@ -433,18 +434,24 @@ async fn leader_and_follower_paths_are_byte_identical() {
         ),
     );
     let actual = structured(
-        &fcall(follower, "deploy", &json!({"selector": "@k3s"}))
-            .await
-            .expect("dry deploy ok"),
+        &fcall(
+            follower,
+            "deploy",
+            &json!({"selector": "@k3s", "boot": true}),
+        )
+        .await
+        .expect("dry deploy ok"),
     );
     assert_shaped("deploy", &actual);
     assert_eq!(actual["limit"], "cache,web");
     assert_eq!(actual["dry_activate"], true);
+    assert_eq!(actual["boot"], true);
     let dry_run_id = actual["run_id"].as_str().expect("engine run id");
     let dry_run = registry::open_run(dry_run_id).expect("engine-owned run is attachable");
     assert_eq!(dry_run.info.meta["run_id"], dry_run_id);
     assert_eq!(dry_run.info.meta["limit"], "cache,web");
     assert_eq!(dry_run.info.meta["dry_activate"], true);
+    assert_eq!(dry_run.info.meta["boot"], true);
     assert_eq!(dry_run.info.meta["throttle"], 4);
     assert_eq!(
         actual["events_dir"],
@@ -478,6 +485,7 @@ async fn leader_and_follower_paths_are_byte_identical() {
             &json!({
                 "selector": "@k3s",
                 "dry_activate": false,
+                "boot": true,
                 "confirm": "cache,web",
             }),
         )
@@ -486,8 +494,10 @@ async fn leader_and_follower_paths_are_byte_identical() {
     );
     assert_eq!(activated["ok"], true);
     assert_eq!(activated["dry_activate"], false);
+    assert_eq!(activated["boot"], true);
     let activated_run = registry::open_run(activated["run_id"].as_str().unwrap()).unwrap();
     assert_eq!(activated_run.info.meta["dry_activate"], false);
+    assert_eq!(activated_run.info.meta["boot"], true);
     spacer().await;
 
     install(

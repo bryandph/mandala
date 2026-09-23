@@ -738,6 +738,7 @@ impl MandalaHandler {
             .to_limit(&t.selector)
             .map_err(|e| tool_error(e.to_string()))?;
         let dry_activate = t.dry_activate.unwrap_or(true);
+        let boot = t.boot.unwrap_or(false);
         if !dry_activate && t.confirm.as_deref() != Some(target.as_str()) {
             return Ok(json!({
                 "ok": false,
@@ -745,12 +746,19 @@ impl MandalaHandler {
                 "reason": "real activation requires `confirm` to equal the resolved target",
                 "required_confirm": target,
                 "dry_activate": dry_activate,
+                "boot": boot,
             }));
         }
         let launch = self
             .state
             .effects
-            .launch_deploy(&self.state.flake, &target, dry_activate, DEPLOY_THROTTLE)
+            .launch_deploy(
+                &self.state.flake,
+                &target,
+                dry_activate,
+                boot,
+                DEPLOY_THROTTLE,
+            )
             .await
             .map_err(|e| tool_error(e.to_string()))?;
         Ok(json!({
@@ -758,6 +766,7 @@ impl MandalaHandler {
             "run_id": launch.run_id,
             "limit": target,
             "dry_activate": dry_activate,
+            "boot": boot,
             "events_dir": launch.events_dir.display().to_string(),
         }))
     }
@@ -1086,13 +1095,14 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
 /// projection, not a second source of truth: `diagnostics=true` returns the
 /// raw meta verbatim, so nothing is unreachable.
 fn curated_meta(meta: &Meta) -> Value {
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 12] = [
         "summary",
         "rc",
         "process_rc",
         "build_rc",
         "limit",
         "dry_activate",
+        "boot",
         "throttle",
         "pid",
         "started_at",
@@ -1224,6 +1234,19 @@ mod tests {
     fn round3_matches_python_round() {
         assert_eq!(round3(1.234_567), 1.235);
         assert_eq!(round3(0.0004), 0.0);
+    }
+
+    #[test]
+    fn curated_deploy_meta_keeps_boot_intent() {
+        let meta = Meta::from_iter([
+            ("boot".into(), Value::from(true)),
+            ("dry_activate".into(), Value::from(false)),
+            ("profiles".into(), json!({"web": "/nix/store/profile"})),
+        ]);
+        let curated = curated_meta(&meta);
+        assert_eq!(curated["boot"], true);
+        assert_eq!(curated["dry_activate"], false);
+        assert!(curated.get("profiles").is_none());
     }
 
     /// MCP observes the same durable build/host state from both emitter paths.

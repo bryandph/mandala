@@ -101,6 +101,8 @@ pub enum TuiRequest {
         limit: String,
         /// `--dry-activate`: build + copy but do not activate.
         dry_activate: bool,
+        /// `--boot`: use boot activation for every selected member.
+        boot: bool,
         /// Halt before deployment if any profile build fails.
         halt_on_build_failure: bool,
         /// `--throttle`: per-host deploy parallelism (default 4).
@@ -253,6 +255,12 @@ impl Cli {
                                     .help("Build + copy but do not activate"),
                             )
                             .arg(
+                                Arg::new("boot")
+                                    .long("boot")
+                                    .action(ArgAction::SetTrue)
+                                    .help("Use boot activation for every selected member"),
+                            )
+                            .arg(
                                 Arg::new("halt-on-build-failure")
                                     .long("halt-on-build-failure")
                                     .action(ArgAction::SetTrue)
@@ -361,6 +369,7 @@ fn tui_request(m: &ArgMatches) -> TuiRequest {
         Some(("deploy", d)) => TuiRequest::Deploy {
             limit: d.get_one::<String>("limit").cloned().unwrap_or_default(),
             dry_activate: d.get_flag("dry-activate"),
+            boot: d.get_flag("boot"),
             halt_on_build_failure: d.get_flag("halt-on-build-failure"),
             throttle: d.get_one::<i64>("throttle").copied().unwrap_or(4),
         },
@@ -779,12 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn tui_deploy_parses_limit_dry_activate_throttle() {
+    fn tui_deploy_parses_limit_dry_activate_boot_throttle() {
         assert_eq!(
             parse_tui(&["mandala", "tui", "deploy", "-l", "@k3s", "--dry-activate"]),
             TuiRequest::Deploy {
                 limit: "@k3s".into(),
                 dry_activate: true,
+                boot: false,
                 halt_on_build_failure: false,
                 throttle: 4, // the Python default
             }
@@ -798,11 +808,13 @@ mod tests {
                 "web",
                 "--throttle",
                 "8",
+                "--boot",
                 "--halt-on-build-failure"
             ]),
             TuiRequest::Deploy {
                 limit: "web".into(),
                 dry_activate: false,
+                boot: true,
                 halt_on_build_failure: true,
                 throttle: 8,
             }
@@ -881,6 +893,7 @@ mod tests {
                     TuiRequest::Deploy {
                         limit: "@k3s".into(),
                         dry_activate: false,
+                        boot: false,
                         halt_on_build_failure: false,
                         throttle: 4,
                     }

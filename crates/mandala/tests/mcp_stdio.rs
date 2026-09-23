@@ -234,13 +234,14 @@ fn stdio_handshake_lists_and_calls_resolve() {
             "id": 4,
             "method": "tools/call",
             "params": {"name": "deploy",
-                       "arguments": {"selector": "@k3s", "dry_activate": false}}
+                       "arguments": {"selector": "@k3s", "dry_activate": false, "boot": true}}
         }),
     );
     let refusal = read_response(&mut stdout, 4);
     let body = &refusal["result"]["structuredContent"];
     assert_eq!(body["refused"], true, "deploy refusal: {refusal}");
     assert_eq!(body["required_confirm"], "cache,web");
+    assert_eq!(body["boot"], true);
     assert!(
         !state.join("runs").is_dir()
             || std::fs::read_dir(state.join("runs"))
@@ -514,13 +515,14 @@ sleep 1
             "method": "tools/call",
             "params": {
                 "name": "deploy",
-                "arguments": {"selector": "@k3s"}
+                "arguments": {"selector": "@k3s", "boot": true}
             }
         }),
     );
     let launch = read_response(&mut follower_out, 10);
     let launched = &launch["result"]["structuredContent"];
     assert_eq!(launched["ok"], true, "deploy launch: {launch}");
+    assert_eq!(launched["boot"], true);
     let run_id = launched["run_id"].as_str().expect("run id").to_string();
     let run_dir =
         std::path::PathBuf::from(launched["events_dir"].as_str().expect("events directory"));
@@ -538,6 +540,7 @@ sleep 1
     assert_eq!(published_meta["run_id"], run_id);
     assert_eq!(published_meta["limit"], "cache,web");
     assert_eq!(published_meta["dry_activate"], true);
+    assert_eq!(published_meta["boot"], true);
     assert_eq!(published_meta["throttle"], 4);
     assert!(published_meta.get("rc").is_none(), "work must be in flight");
 

@@ -88,6 +88,7 @@ pub enum ConfirmAction {
 pub struct ConfirmState {
     pub message: String,
     pub action: ConfirmAction,
+    pub boot: bool,
     pub halt_on_build_failure: bool,
 }
 
@@ -97,6 +98,7 @@ impl ConfirmState {
         Self {
             message: message.into(),
             action,
+            boot: false,
             halt_on_build_failure: false,
         }
     }
@@ -117,6 +119,10 @@ pub fn confirm_lines(state: &ConfirmState) -> Vec<Line<'static>> {
         })
         .collect();
     lines.push(Line::default());
+    lines.push(Line::from(format!(
+        "[{}] Use boot activation for every target (b to toggle)",
+        if state.boot { "x" } else { " " }
+    )));
     lines.push(Line::from(format!(
         "[{}] Halt on build failure (h to toggle)",
         if state.halt_on_build_failure {
@@ -643,7 +649,7 @@ pub struct SummaryState {
     /// `deploy succeeded` / `deploy FAILED (exit rc)`.
     pub head: String,
     pub ok: bool,
-    /// `   -l <limit>   <m>m<ss>s` + `   dry-activate`.
+    /// `   -l <limit>   <m>m<ss>s` + run-option labels.
     pub meta: String,
     /// `batch build: built …, fetched …, errors …, rc …`.
     pub build_line: String,
@@ -662,6 +668,7 @@ pub struct SummaryState {
 pub struct DeployViewState {
     pub limit: String,
     pub dry_activate: bool,
+    pub boot: bool,
     /// Standalone (`mandala tui deploy` / `mandala tui attach`): esc exits
     /// the app with the rc (0 while the run continues detached).
     pub standalone: bool,
@@ -694,9 +701,29 @@ impl DeployViewState {
         attached: bool,
         after_mutation: bool,
     ) -> Self {
+        Self::new_with_boot(
+            limit,
+            dry_activate,
+            false,
+            standalone,
+            attached,
+            after_mutation,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_boot(
+        limit: impl Into<String>,
+        dry_activate: bool,
+        boot: bool,
+        standalone: bool,
+        attached: bool,
+        after_mutation: bool,
+    ) -> Self {
         Self {
             limit: limit.into(),
             dry_activate,
+            boot,
             standalone,
             attached,
             kill_armed: false,
@@ -720,6 +747,9 @@ impl DeployViewState {
         let mut title = format!("-l {}", self.limit);
         if self.dry_activate {
             title.push_str(" (dry-activate)");
+        }
+        if self.boot {
+            title.push_str(" (boot)");
         }
         if self.finished {
             title.push_str(&format!(" — exit {}", fmt_rc(self.returncode)));
@@ -801,6 +831,9 @@ impl DeployViewState {
         let mut meta = format!("   -l {}   {minutes}m{seconds:02}s", self.limit);
         if self.dry_activate {
             meta.push_str("   dry-activate");
+        }
+        if self.boot {
+            meta.push_str("   boot");
         }
         let (build_line, build_bad) = match tailer {
             Some(t) => {

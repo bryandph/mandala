@@ -195,6 +195,35 @@ async fn deploy_halt_option_defaults_off_toggles_and_resets_on_reopen() {
     }
 }
 
+#[tokio::test]
+async fn deploy_boot_option_defaults_off_toggles_and_resets_on_reopen() {
+    registry_env();
+    for (keys, expected) in [
+        (vec![KeyCode::Char('D')], false),
+        (vec![KeyCode::Char('D'), KeyCode::Char('b')], true),
+        (
+            vec![
+                KeyCode::Char('D'),
+                KeyCode::Char('b'),
+                KeyCode::Esc,
+                KeyCode::Char('D'),
+            ],
+            false,
+        ),
+    ] {
+        let app = drive(
+            App::new(filled_state(), stub_cfg(&["sh", "-c", "exit 0"])),
+            keys.into_iter().map(|key| (0, key)).collect(),
+            10,
+        )
+        .await;
+        let Some(ScreenState::Confirm(confirm)) = &app.state.screen else {
+            panic!("deploy confirmation missing");
+        };
+        assert_eq!(confirm.boot, expected);
+    }
+}
+
 // ---- owned mode (confirm-gated launch from the explorer) --------------------
 
 /// The confirm-gated launch streams the run's own event files back into the

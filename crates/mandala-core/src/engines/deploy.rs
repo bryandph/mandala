@@ -58,6 +58,12 @@ pub fn engine() -> Engine {
                         .help("Build + copy but do not activate"),
                 )
                 .arg(
+                    Arg::new("boot")
+                        .long("boot")
+                        .action(ArgAction::SetTrue)
+                        .help("Use boot activation for every selected member"),
+                )
+                .arg(
                     Arg::new("halt-on-build-failure")
                         .long("halt-on-build-failure")
                         .action(ArgAction::SetTrue)
@@ -100,6 +106,8 @@ pub struct DeployPlan {
     pub settings: BTreeMap<String, Value>,
     /// Whether activation is suppressed after copy.
     pub dry_activate: bool,
+    /// Whether every selected member uses boot activation for this run.
+    pub boot: bool,
     /// Opt-in fail-fast build policy; defaults to best effort.
     pub halt_on_build_failure: bool,
     /// Maximum per-host concurrency for the later fan-out stage.
@@ -384,6 +392,21 @@ pub fn plan_run(
     throttle: i64,
     dry_activate: bool,
 ) -> Result<DeployPlan, DeployRunError> {
+    plan_run_with_boot(inv, limit, throttle, dry_activate, false)
+}
+
+/// Resolve and validate a native deploy with an invocation-time boot override.
+///
+/// # Errors
+/// Selector errors, a zero-deployable selection, or a missing/malformed
+/// flattened-settings projection.
+pub fn plan_run_with_boot(
+    inv: &Inventory,
+    limit: &str,
+    throttle: i64,
+    dry_activate: bool,
+    boot: bool,
+) -> Result<DeployPlan, DeployRunError> {
     if throttle <= 0 {
         return Err(DeployRunError::InvalidThrottle(throttle));
     }
@@ -414,6 +437,7 @@ pub fn plan_run(
         skipped,
         settings,
         dry_activate,
+        boot,
         halt_on_build_failure: false,
         throttle,
     })
@@ -445,6 +469,7 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
     meta.insert("targets".into(), Value::from(plan.targets.clone()));
     meta.insert("skipped".into(), Value::from(plan.skipped.clone()));
     meta.insert("dry_activate".into(), Value::from(plan.dry_activate));
+    meta.insert("boot".into(), Value::from(plan.boot));
     meta.insert("throttle".into(), Value::from(plan.throttle));
     meta.insert(
         "halt_on_build_failure".into(),
@@ -470,7 +495,28 @@ pub fn prepare_run(
     throttle: i64,
     dry_activate: bool,
 ) -> Result<RegisteredDeployRun, DeployRunError> {
-    register_run(plan_run(inv, limit, throttle, dry_activate)?)
+    prepare_run_with_boot(inv, limit, throttle, dry_activate, false)
+}
+
+/// Perform native deploy preflight with an invocation-time boot override and
+/// create its registry run.
+///
+/// # Errors
+/// Any error from [`plan_run_with_boot`] or [`register_run`].
+pub fn prepare_run_with_boot(
+    inv: &Inventory,
+    limit: &str,
+    throttle: i64,
+    dry_activate: bool,
+    boot: bool,
+) -> Result<RegisteredDeployRun, DeployRunError> {
+    register_run(plan_run_with_boot(
+        inv,
+        limit,
+        throttle,
+        dry_activate,
+        boot,
+    )?)
 }
 
 const NIX_JSON_PREFIX: &str = "@nix ";
@@ -1193,7 +1239,7 @@ async fn deploy_host_with(
             format!("writing activation milestone: {error}"),
         );
     }
-    let boot = settings.activation == ActivationMode::Boot;
+    let boot = run.plan.boot || settings.activation == ActivationMode::Boot;
     if !run.plan.dry_activate
         && !boot
         && settings.magic_rollback.unwrap_or(true)
@@ -1479,10 +1525,13 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
             let limit = sm.get_one::<String>("limit").map_or("", String::as_str);
             let throttle = *sm.get_one::<i64>("throttle").unwrap_or(&4);
             let dry_activate = sm.get_flag("dry-activate");
-            let prepared = plan_run(inv, limit, throttle, dry_activate).and_then(|mut plan| {
-                plan.halt_on_build_failure = sm.get_flag("halt-on-build-failure");
-                register_run(plan)
-            });
+            let boot = sm.get_flag("boot");
+            let prepared = plan_run_with_boot(inv, limit, throttle, dry_activate, boot).and_then(
+                |mut plan| {
+                    plan.halt_on_build_failure = sm.get_flag("halt-on-build-failure");
+                    register_run(plan)
+                },
+            );
             match prepared {
                 Ok(run) => {
                     if let Err(error) = publish_run_id(std::io::stdout().lock(), &run.run_id) {
@@ -2092,6 +2141,7 @@ exit 0
         );
         assert_eq!(plan.throttle, 8);
         assert!(plan.dry_activate);
+        assert!(!plan.boot);
         assert_eq!(
             plan.settings["cache"]["sshUser"],
             Value::from("cache-admin")
@@ -2162,6 +2212,7 @@ exit 0
         assert_eq!(meta["targets"], json!(["cache", "web"]));
         assert_eq!(meta["skipped"], json!(["router"]));
         assert_eq!(meta["dry_activate"], Value::from(true));
+        assert_eq!(meta["boot"], Value::from(false));
         assert_eq!(meta["throttle"], Value::from(8));
         assert!(meta["started_at"].as_f64().is_some());
         assert_eq!(meta["pid"], Value::from(i64::from(std::process::id())));
@@ -2336,6 +2387,7 @@ exit 0
         assert_eq!(
             meta.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "boot",
                 "build_failures",
                 "build_rc",
                 "dry_activate",
@@ -2360,6 +2412,7 @@ exit 0
         assert_eq!(meta["targets"], json!(["cache", "web"]));
         assert_eq!(meta["skipped"], json!([]));
         assert_eq!(meta["dry_activate"], true);
+        assert_eq!(meta["boot"], false);
         assert_eq!(meta["throttle"], 2);
         assert_eq!(meta["build_rc"], 0);
         assert_eq!(meta["process_rc"], 0);
@@ -2586,6 +2639,25 @@ exit 0
     }
 
     #[tokio::test]
+    async fn run_boot_override_uses_boot_mode_for_switch_member() {
+        let base = tmp_base("host-run-boot");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run_with_boot(&inv(), "cache", 4, false, true).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = effect_programs(&base, 0, 0);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Confirmed);
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(trace.contains("activate-rs activate"));
+        assert!(trace.contains("--boot"));
+        assert!(!trace.contains(" activate-rs wait "));
+        assert!(!trace.contains(" rm "));
+    }
+
+    #[tokio::test]
     async fn omitted_empty_ssh_opts_deserializes_and_reaches_effects() {
         let settings = minimal_parent_deploy_settings();
         let parsed = serde_json::from_value::<FlattenedDeploySettings>(settings.clone()).unwrap();
@@ -2615,6 +2687,7 @@ exit 0
         let base = tmp_base("host-dry");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
         let mut run = prepare_run(&inv(), "cache", 4, true).unwrap();
+        run.plan.boot = true;
         run.plan
             .settings
             .insert("cache".into(), deploy_settings("switch"));
@@ -2624,6 +2697,7 @@ exit 0
         assert_eq!(result.state, HostState::Confirmed);
         let trace = std::fs::read_to_string(trace).unwrap();
         assert!(trace.contains("--dry-activate"));
+        assert!(trace.contains("--boot"));
         assert!(!trace.contains(" activate-rs wait "));
         assert!(!trace.contains(" rm "));
     }

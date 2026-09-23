@@ -822,6 +822,7 @@ pub struct DeployRun {
     /// Fleet flake passed to the native engine.
     pub flake: String,
     pub dry_activate: bool,
+    pub boot: bool,
     pub halt_on_build_failure: bool,
     pub throttle: i64,
     pub events_dir: Option<PathBuf>,
@@ -855,6 +856,7 @@ impl DeployRun {
             limit: limit.into(),
             flake: ".".to_string(),
             dry_activate: false,
+            boot: false,
             halt_on_build_failure: false,
             throttle: 4,
             events_dir: None,
@@ -888,6 +890,7 @@ impl DeployRun {
             .get("dry_activate")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        run.boot = meta.get("boot").and_then(Value::as_bool).unwrap_or(false);
         run.halt_on_build_failure = meta
             .get("halt_on_build_failure")
             .and_then(Value::as_bool)
@@ -925,6 +928,9 @@ impl DeployRun {
         }
         if self.dry_activate {
             argv.push("--dry-activate".to_string());
+        }
+        if self.boot {
+            argv.push("--boot".to_string());
         }
         argv
     }
@@ -1992,6 +1998,7 @@ mod write_tests {
         run.flake = "github:example/fleet".into();
         run.throttle = 7;
         run.dry_activate = true;
+        run.boot = true;
         assert!(!run.halt_on_build_failure);
         run.halt_on_build_failure = true;
         let argv = run.argv();
@@ -2008,6 +2015,7 @@ mod write_tests {
                 "7",
                 "--halt-on-build-failure",
                 "--dry-activate",
+                "--boot",
             ]
         );
     }
@@ -2054,6 +2062,7 @@ mod write_tests {
         meta.insert("run_id".into(), Value::from(run_id.clone()));
         meta.insert("limit".into(), Value::from("web,db"));
         meta.insert("dry_activate".into(), Value::from(false));
+        meta.insert("boot".into(), Value::from(true));
         meta.insert("pid".into(), Value::from(4242));
         registry::write_meta(&dir, &meta).unwrap();
         write_events(
@@ -2067,6 +2076,7 @@ mod write_tests {
 
         let mut run = DeployRun::attach(&run_id).unwrap();
         assert_eq!(run.limit, "web,db");
+        assert!(run.boot);
         run.poll();
 
         // pid alive → still running: not finished, no returncode.
@@ -2096,6 +2106,7 @@ mod write_tests {
             &milestones("web", &["eval", "activate", "confirm"]),
         );
         let mut ok = DeployRun::attach(&ok_id).unwrap();
+        assert!(!ok.boot, "pre-boot-option metadata defaults to false");
         ok.poll();
         let _dead = registry::test_hooks::install(|_| false);
         assert!(ok.finished());

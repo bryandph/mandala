@@ -122,7 +122,7 @@ impl DeployJob {
     }
 }
 
-/// What `mandala tui deploy -l <sel> [--dry-activate] [--throttle N]` needs.
+/// What `mandala tui deploy -l <sel> [--dry-activate] [--boot] [--throttle N]` needs.
 #[derive(Debug, Clone)]
 pub struct DeployConfig {
     /// The fleet flake reference (selector resolution).
@@ -131,6 +131,7 @@ pub struct DeployConfig {
     /// `Inventory::to_limit` (canonical resolution) before anything runs.
     pub limit: String,
     pub dry_activate: bool,
+    pub boot: bool,
     pub halt_on_build_failure: bool,
     pub throttle: i64,
     /// Test seam: override the launched argv verbatim (`DeployRun::program`)
@@ -163,6 +164,7 @@ pub async fn run_deploy(cfg: DeployConfig) -> io::Result<i64> {
     let mut run = DeployRun::new(limit);
     run.flake = cfg.flake.clone();
     run.dry_activate = cfg.dry_activate;
+    run.boot = cfg.boot;
     run.halt_on_build_failure = cfg.halt_on_build_failure;
     run.throttle = cfg.throttle;
     run.program = cfg.program.clone();

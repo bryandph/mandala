@@ -131,6 +131,7 @@ impl Effects for FakeEffects {
         flake: &str,
         limit: &str,
         dry_activate: bool,
+        boot: bool,
         throttle: i64,
     ) -> io::Result<DeployLaunch> {
         assert!(self.fake_deploy, "unexpected launch_deploy call");
@@ -145,6 +146,7 @@ impl Effects for FakeEffects {
                 ("run_id".into(), Value::from(run_id.clone())),
                 ("limit".into(), Value::from(limit)),
                 ("dry_activate".into(), Value::from(dry_activate)),
+                ("boot".into(), Value::from(boot)),
                 ("throttle".into(), Value::from(throttle)),
                 ("pid".into(), Value::Null),
                 ("rc".into(), Value::from(0)),

@@ -209,12 +209,21 @@ fn confirm_modal_renders_message_and_trailer() {
             "Deploy 'web'?",
             "(eval-once batch build, then deploy-rs per host with magic rollback)",
             "",
+            "[ ] Use boot activation for every target (b to toggle)",
             "[ ] Halt on build failure (h to toggle)",
             "Default: deploy targets that build successfully.",
             "",
             "y to run   esc to cancel",
         ]
     );
+}
+
+#[test]
+fn boot_mode_is_visible_in_deploy_view_and_summary() {
+    let mut view = DeployViewState::new_with_boot("web", false, true, false, false, true);
+    view.sync(None, &[], true, Some(0), 3);
+    assert_eq!(view.sub_title(), "-l web (boot) — exit 0");
+    assert_eq!(view.summary.unwrap().meta, "   -l web   0m03s   boot");
 }
 
 // ---- the after-mutation drift rule ------------------------------------------

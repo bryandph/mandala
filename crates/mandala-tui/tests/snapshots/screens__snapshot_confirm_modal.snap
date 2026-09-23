@@ -1,5 +1,6 @@
 ---
 source: crates/mandala-tui/tests/screens.rs
+assertion_line: 595
 expression: terminal.backend()
 ---
 "mandala — fleet                                                                           "
@@ -7,10 +8,10 @@ expression: terminal.backend()
 "  member  │Deploy 'web'?                                                       │       ads"
 "          │(eval-once batch build, then deploy-rs per host with magic rollback)│          "
 "          │                                                                    │          "
+"          │[ ] Use boot activation for every target (b to toggle)              │          "
 "          │[ ] Halt on build failure (h to toggle)                             │          "
 "          │Default: deploy targets that build successfully.                    │          "
 "          │                                                                    │          "
 "          │y to run   esc to cancel                                            │          "
 "          └────────────────────────────────────────────────────────────────────┘          "
-"                                                                                          "
 "tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D "

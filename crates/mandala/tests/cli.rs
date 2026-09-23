@@ -182,11 +182,21 @@ fn tui_deploy_help_shows_the_runner_flags() {
     assert_eq!(code, 0);
     assert!(stdout.contains("--limit"), "{stdout}");
     assert!(stdout.contains("--dry-activate"), "{stdout}");
+    assert!(stdout.contains("--boot"), "{stdout}");
     assert!(stdout.contains("--throttle"), "{stdout}");
     assert!(
         stdout.contains("[default: 4]"),
         "throttle default: {stdout}"
     );
+    let _ = std::fs::remove_file(&fx);
+}
+
+#[test]
+fn deploy_run_help_shows_boot_override() {
+    let fx = fixture_file();
+    let (stdout, _e, code) = run(&fx, &["deploy", "run", "--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("--boot"), "{stdout}");
     let _ = std::fs::remove_file(&fx);
 }
 
