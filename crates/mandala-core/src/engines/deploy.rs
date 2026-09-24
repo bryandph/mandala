@@ -21,7 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use mandala_deploy::data::{GenericSettings, Node, NodeSettings, Profile, ProfileSettings};
-use mandala_deploy::deploy::deploy_profile;
+use mandala_deploy::deploy::{
+    ActivationDisposition, deploy_profile, resolve_activation_disposition, stage_profile_for_boot,
+};
 use mandala_deploy::push::push_profile;
 use mandala_deploy::{CmdOverrides, EventSink, Level, make_deploy_data};
 use serde::{Deserialize, Serialize};
@@ -200,6 +202,7 @@ pub struct HostDeployResult {
 pub struct DeploySummary {
     pub total: usize,
     pub confirmed: usize,
+    pub reboot_pending: usize,
     pub failed: usize,
     pub rolled_back: usize,
 }
@@ -1232,6 +1235,37 @@ async fn deploy_host_with(
         return failed_host(&writer, host, format!("writing copied output: {error}"));
     }
 
+    let boot = run.plan.boot || settings.activation == ActivationMode::Boot;
+    let disposition =
+        match resolve_activation_disposition(&deploy, &defs, run.plan.dry_activate, boot).await {
+            Ok(disposition) => disposition,
+            Err(error) => return failed_host(&writer, host, error.to_string()),
+        };
+    if let Some(error) = sink.error() {
+        return failed_host(&writer, host, format!("writing preflight output: {error}"));
+    }
+
+    if disposition.reboot_pending() && run.plan.dry_activate {
+        let _ = writer.emit(
+            "line",
+            event_fields([
+                (
+                    "line",
+                    Value::from("dry activation: a real deployment would be staged for reboot"),
+                ),
+                ("stream", Value::from("deploy")),
+            ]),
+        );
+        if let Err(error) = emit_milestone(&writer, "reboot-pending") {
+            return failed_host(
+                &writer,
+                host,
+                format!("writing reboot-pending milestone: {error}"),
+            );
+        }
+        return host_result(&writer, host, HostState::RebootPending, None);
+    }
+
     if let Err(error) = emit_milestone(&writer, "activate") {
         return failed_host(
             &writer,
@@ -1239,9 +1273,7 @@ async fn deploy_host_with(
             format!("writing activation milestone: {error}"),
         );
     }
-    let boot = run.plan.boot || settings.activation == ActivationMode::Boot;
-    if !run.plan.dry_activate
-        && !boot
+    if matches!(disposition, ActivationDisposition::LiveSwitch)
         && settings.magic_rollback.unwrap_or(true)
         && let Err(error) = emit_milestone(&writer, "wait")
     {
@@ -1251,19 +1283,34 @@ async fn deploy_host_with(
             format!("writing activation-wait milestone: {error}"),
         );
     }
-    match deploy_profile(&deploy, &defs, run.plan.dry_activate, boot).await {
+    let deployment = match disposition {
+        ActivationDisposition::BootStaging => stage_profile_for_boot(&deploy, &defs).await,
+        ActivationDisposition::LiveSwitch
+        | ActivationDisposition::DryPreview {
+            reboot_pending: false,
+        } => deploy_profile(&deploy, &defs, run.plan.dry_activate).await,
+        ActivationDisposition::DryPreview {
+            reboot_pending: true,
+        } => unreachable!("reboot-pending dry previews return before activation"),
+    };
+    match deployment {
         Ok(()) => {
             if let Some(error) = sink.error() {
                 return failed_host(&writer, host, format!("writing activation output: {error}"));
             }
-            if let Err(error) = emit_milestone(&writer, "confirm") {
+            let (milestone, state) = if matches!(disposition, ActivationDisposition::BootStaging) {
+                ("reboot-pending", HostState::RebootPending)
+            } else {
+                ("confirm", HostState::Confirmed)
+            };
+            if let Err(error) = emit_milestone(&writer, milestone) {
                 return failed_host(
                     &writer,
                     host,
-                    format!("writing confirmation milestone: {error}"),
+                    format!("writing {milestone} milestone: {error}"),
                 );
             }
-            host_result(&writer, host, HostState::Confirmed, None)
+            host_result(&writer, host, state, None)
         }
         Err(error) if error.rolled_back() => {
             let message = error.to_string();
@@ -1323,6 +1370,10 @@ fn summarize(results: &BTreeMap<String, HostDeployResult>) -> DeploySummary {
             .values()
             .filter(|result| result.state == HostState::Confirmed)
             .count(),
+        reboot_pending: results
+            .values()
+            .filter(|result| result.state == HostState::RebootPending)
+            .count(),
         failed: results
             .values()
             .filter(|result| result.state == HostState::Failed)
@@ -1380,9 +1431,10 @@ fn skipped_notice(host: &str) -> String {
 
 fn outcome_lines(outcome: &DeployOutcome) -> Vec<String> {
     let mut lines = vec![format!(
-        "mandala: deploy summary: total={} confirmed={} failed={} rolled-back={}",
+        "mandala: deploy summary: total={} confirmed={} reboot-pending={} failed={} rolled-back={}",
         outcome.summary.total,
         outcome.summary.confirmed,
+        outcome.summary.reboot_pending,
         outcome.summary.failed,
         outcome.summary.rolled_back
     )];
@@ -1398,8 +1450,13 @@ fn outcome_lines(outcome: &DeployOutcome) -> Vec<String> {
             result.error.as_deref().unwrap_or("no diagnostic")
         ));
     }
-    if outcome.rc == 0 {
+    if outcome.rc == 0 && outcome.summary.reboot_pending == 0 {
         lines.push("mandala: deploy: all hosts confirmed".to_string());
+    } else if outcome.rc == 0 {
+        lines.push(format!(
+            "mandala: deploy: {} host(s) staged successfully and require reboot",
+            outcome.summary.reboot_pending
+        ));
     } else {
         lines.push(
             "mandala: deploy: PARTIAL FAILURE — healthy siblings were not revoked".to_string(),
@@ -1826,6 +1883,12 @@ exit {}
             format!(
                 r#"#!/bin/sh
 printf 'ssh USER=%s HOME=%s SSH_AUTH_SOCK=%s args=%s\n' "$USER" "$HOME" "$SSH_AUTH_SOCK" "$*" >> '{trace}'
+case "$*" in
+  *'readlink -e /nix/var/nix/profiles/'*)
+    printf '%s\n' '/nix/store/99999999999999999999999999999999-previous-system'
+    exit 0
+    ;;
+esac
 printf '%s\n' 'ssh-stdout'
 printf '%s\n' 'ssh-stderr' >&2
 wait_for_trace() {{
@@ -1879,6 +1942,44 @@ exit 0
 
     fn effect_programs(base: &Path, copy_rc: i32, confirm_rc: i32) -> (DeployPrograms, PathBuf) {
         effect_programs_with_cleanup(base, copy_rc, 0, confirm_rc)
+    }
+
+    fn inhibitor_programs(
+        base: &Path,
+        capability_rc: i32,
+        check_rc: i32,
+        boot_rc: i32,
+    ) -> (DeployPrograms, PathBuf) {
+        let (programs, trace) = effect_programs(base, 0, 0);
+        let ssh = programs.ssh.as_ref().unwrap();
+        write_program(
+            ssh,
+            format!(
+                r#"#!/bin/sh
+printf 'ssh args=%s\n' "$*" >> '{trace}'
+case "$*" in
+  *switch-inhibitors*) exit {capability_rc} ;;
+  *'switch-to-configuration check'*) echo 'inhibitor-refused' >&2; exit {check_rc} ;;
+  *'readlink -e '*) echo /nix/store/99999999999999999999999999999999-previous-system; exit 0 ;;
+  *'nix-env --profile '*'-new-system'*) exit 0 ;;
+  *'nix-env --profile '*'-profile'*) exit 0 ;;
+  *'-profile/bin/switch-to-configuration boot'*) exit {boot_rc} ;;
+  *'-previous-system/bin/switch-to-configuration boot'*) exit 0 ;;
+  *' rm -f '*) exit 0 ;;
+  *'activate-rs wait '*) exit 0 ;;
+  *' rm '*) exit 0 ;;
+  *'activate-rs activate '*) exit 0 ;;
+esac
+exit 99
+"#,
+                trace = trace.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(ssh, permissions).unwrap();
+        (programs, trace)
     }
 
     #[derive(Clone, Copy)]
@@ -2419,7 +2520,7 @@ exit 0
         assert_eq!(meta["rc"], 0);
         assert_eq!(
             meta["summary"],
-            json!({"confirmed":2,"failed":0,"rolled_back":0,"total":2})
+            json!({"confirmed":2,"failed":0,"reboot_pending":0,"rolled_back":0,"total":2})
         );
         assert_eq!(meta["run_id"], run.run_id);
         assert_eq!(meta["pid"], i64::from(std::process::id()));
@@ -2603,14 +2704,16 @@ exit 0
         let (programs, trace) = effect_programs(&base, 0, 0);
 
         let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
-        assert_eq!(result.state, HostState::Confirmed);
+        assert_eq!(result.state, HostState::RebootPending);
         assert_eq!(result.error, None);
 
         let trace = std::fs::read_to_string(trace).unwrap();
         assert!(trace.contains(
             "nix USER=ambient-user-must-not-win HOME=/ambient/home/must-not-win SSH_AUTH_SOCK=/ambient/agent/must-not-win NIX_SSHOPTS=-p 2222 -i /keys/mandala-test -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no args=copy --substitute-on-destination --no-check-sigs --to ssh://deployer@cache.example.test /nix/store/00000000000000000000000000000000-cache-profile"
         ));
-        assert!(trace.contains("ssh USER=ambient-user-must-not-win HOME=/ambient/home/must-not-win SSH_AUTH_SOCK=/ambient/agent/must-not-win args=deployer@cache.example.test -p 2222 -i /keys/mandala-test -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no doas -u app /nix/store/00000000000000000000000000000000-cache-profile/activate-rs activate '/nix/store/00000000000000000000000000000000-cache-profile' --profile-user app --profile-name system --temp-path '/run/mandala' --confirm-timeout 41 --magic-rollback --auto-rollback --boot"));
+        assert!(trace.contains("nix-env --profile /nix/var/nix/profiles/per-user/app/system --set /nix/store/00000000000000000000000000000000-cache-profile"));
+        assert!(trace.contains("cache-profile/bin/switch-to-configuration boot"));
+        assert!(!trace.contains("activate-rs activate"));
         assert!(!trace.contains(" activate-rs wait "));
         assert!(!trace.contains(" rm "));
 
@@ -2630,11 +2733,11 @@ exit 0
         }
         let mut tailer = crate::runner::EventTailer::new(&run.path);
         tailer.poll();
-        assert_eq!(tailer.hosts["cache"].state, HostState::Confirmed);
+        assert_eq!(tailer.hosts["cache"].state, HostState::RebootPending);
         assert_eq!(tailer.hosts["cache"].rc, Some(0));
         assert_eq!(
             tailer.hosts["cache"].milestones,
-            ["copy", "activate", "confirm"]
+            ["copy", "activate", "reboot-pending"]
         );
     }
 
@@ -2649,12 +2752,137 @@ exit 0
         let (programs, trace) = effect_programs(&base, 0, 0);
 
         let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
-        assert_eq!(result.state, HostState::Confirmed);
+        assert_eq!(result.state, HostState::RebootPending);
         let trace = std::fs::read_to_string(trace).unwrap();
-        assert!(trace.contains("activate-rs activate"));
-        assert!(trace.contains("--boot"));
+        assert!(trace.contains("nix-env --profile"));
+        assert!(trace.contains("switch-to-configuration boot"));
+        assert!(!trace.contains("activate-rs activate"));
         assert!(!trace.contains(" activate-rs wait "));
         assert!(!trace.contains(" rm "));
+    }
+
+    #[tokio::test]
+    async fn inhibitor_refusal_stages_and_dry_preview_never_mutates() {
+        let base = tmp_base("host-inhibitor");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = inhibitor_programs(&base, 0, 42, 0);
+
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::RebootPending);
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(trace.contains("switch-to-configuration check"));
+        assert!(trace.contains("nix-env --profile"));
+        assert!(trace.contains("switch-to-configuration boot"));
+        assert!(!trace.contains("activate-rs activate"));
+        let events = jsonl(&run.path.join("cache.jsonl"));
+        assert!(
+            events
+                .iter()
+                .any(|event| { event["event"] == "line" && event["line"] == "inhibitor-refused" })
+        );
+
+        let dry_base = tmp_base("host-inhibitor-dry");
+        let _dry_guard = registry::test_hooks::install_runs_base(dry_base.clone());
+        let mut dry = prepare_run(&inv(), "cache", 4, true).unwrap();
+        dry.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = inhibitor_programs(&dry_base, 0, 42, 0);
+        let result = deploy_host_with(&dry, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::RebootPending);
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(trace.contains("switch-to-configuration check"));
+        assert!(!trace.contains("nix-env --profile"));
+        assert!(!trace.contains("switch-to-configuration boot"));
+        assert!(!trace.contains("activate-rs"));
+    }
+
+    #[tokio::test]
+    async fn legacy_closure_without_marker_preserves_live_switch() {
+        let base = tmp_base("host-legacy-switch");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        run.plan
+            .settings
+            .insert("cache".into(), deploy_settings("switch"));
+        let (programs, trace) = inhibitor_programs(&base, 1, 99, 99);
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Confirmed);
+        let trace = std::fs::read_to_string(trace).unwrap();
+        assert!(!trace.contains("switch-to-configuration check"));
+        assert!(trace.contains("activate-rs activate"));
+        assert!(!trace.contains("switch-to-configuration boot"));
+    }
+
+    #[tokio::test]
+    async fn mixed_confirmed_and_reboot_pending_is_successful_but_not_all_confirmed() {
+        let base = tmp_base("fanout-mixed-disposition");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = configured_k3s_run(&base, 2);
+        run.plan.dry_activate = false;
+        let (cache, _) = inhibitor_programs(&base.join("cache-effects"), 0, 42, 0);
+        let (web, _) = inhibitor_programs(&base.join("web-effects"), 0, 0, 0);
+        let task = program_task(BTreeMap::from([
+            ("cache".into(), cache),
+            ("web".into(), web),
+        ]));
+
+        let outcome = fan_out_with(&run, &built_k3s_profiles(), task)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results["cache"].state, HostState::RebootPending);
+        assert_eq!(outcome.results["web"].state, HostState::Confirmed);
+        assert_eq!(outcome.summary.confirmed, 1);
+        assert_eq!(outcome.summary.reboot_pending, 1);
+        assert_eq!(outcome.rc, 0);
+        let lines = outcome_lines(&outcome);
+        assert!(lines.iter().any(|line| line.contains("require reboot")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("all hosts confirmed"))
+        );
+        let meta = registry::read_meta(&run.path);
+        assert_eq!(meta["summary"]["confirmed"], 1);
+        assert_eq!(meta["summary"]["reboot_pending"], 1);
+    }
+
+    #[tokio::test]
+    async fn reboot_pending_with_rolled_back_sibling_remains_a_failed_run() {
+        let base = tmp_base("fanout-staged-and-rollback");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut run = configured_k3s_run(&base, 2);
+        run.plan.dry_activate = false;
+        let (cache, _) = inhibitor_programs(&base.join("cache-effects"), 0, 42, 0);
+        let (web, _) = effect_programs(&base.join("web-effects"), 0, 42);
+        let task = program_task(BTreeMap::from([
+            ("cache".into(), cache),
+            ("web".into(), web),
+        ]));
+
+        let outcome = fan_out_with(&run, &built_k3s_profiles(), task)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results["cache"].state, HostState::RebootPending);
+        assert_eq!(outcome.results["web"].state, HostState::RolledBack);
+        assert_eq!(outcome.summary.reboot_pending, 1);
+        assert_eq!(outcome.summary.rolled_back, 1);
+        assert_eq!(outcome.rc, 1);
+        let lines = outcome_lines(&outcome);
+        assert!(lines.iter().any(|line| line.contains("PARTIAL FAILURE")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("all hosts confirmed"))
+        );
+        let meta = registry::read_meta(&run.path);
+        assert_eq!(meta["rc"], 1);
+        assert_eq!(meta["summary"]["reboot_pending"], 1);
+        assert_eq!(meta["summary"]["rolled_back"], 1);
     }
 
     #[tokio::test]
@@ -2694,10 +2922,10 @@ exit 0
         let (programs, trace) = effect_programs(&base, 0, 0);
 
         let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
-        assert_eq!(result.state, HostState::Confirmed);
+        assert_eq!(result.state, HostState::RebootPending);
         let trace = std::fs::read_to_string(trace).unwrap();
-        assert!(trace.contains("--dry-activate"));
-        assert!(trace.contains("--boot"));
+        assert!(!trace.contains("ssh USER="));
+        assert!(!trace.contains("nix-env --profile"));
         assert!(!trace.contains(" activate-rs wait "));
         assert!(!trace.contains(" rm "));
     }
@@ -3014,7 +3242,7 @@ exit 0
                 .lines()
                 .filter(|line| line.starts_with("ssh "))
                 .count(),
-            2
+            6
         );
 
         let meta = registry::read_meta(&run.path);
@@ -3026,6 +3254,7 @@ exit 0
             json!({
                 "total": 2,
                 "confirmed": 2,
+                "reboot_pending": 0,
                 "failed": 0,
                 "rolled_back": 0
             })

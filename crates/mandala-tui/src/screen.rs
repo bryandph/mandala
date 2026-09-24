@@ -591,7 +591,7 @@ pub fn host_state_style_spec(state: HostState) -> &'static str {
         HostState::Pending => "dim",
         HostState::Evaluating | HostState::Building => "cyan",
         HostState::Copying => "blue",
-        HostState::Activating | HostState::Waiting => "yellow",
+        HostState::Activating | HostState::Waiting | HostState::RebootPending => "yellow",
         HostState::Confirmed => "green",
         HostState::RolledBack | HostState::Failed => "bold red",
     }
@@ -615,6 +615,7 @@ pub fn host_state_glyph(state: HostState) -> &'static str {
         HostState::Activating => "⚡",
         HostState::Waiting => "⏳",
         HostState::Confirmed => "✓",
+        HostState::RebootPending => "↻",
         HostState::RolledBack => "↩",
         HostState::Failed => "✗",
     }
@@ -822,7 +823,14 @@ impl DeployViewState {
     fn make_summary(&self, tailer: Option<&EventTailer>, elapsed_secs: u64) -> SummaryState {
         let rc = self.returncode;
         let ok = rc == Some(0);
-        let head = if ok {
+        let reboot_pending = self
+            .hosts
+            .iter()
+            .filter(|host| host.state == HostState::RebootPending)
+            .count();
+        let head = if ok && reboot_pending > 0 {
+            format!("deploy succeeded — {reboot_pending} host(s) require reboot")
+        } else if ok {
             "deploy succeeded".to_string()
         } else {
             format!("deploy FAILED (exit {})", fmt_rc(rc))
@@ -1235,6 +1243,7 @@ mod tests {
             HostState::Activating,
             HostState::Waiting,
             HostState::Confirmed,
+            HostState::RebootPending,
             HostState::RolledBack,
             HostState::Failed,
         ] {
@@ -1251,6 +1260,7 @@ mod tests {
         use ratatui::style::Color;
         // Spot the table values (deploy.py `_STATE_STYLE` / `_STATE_GLYPH`).
         assert_eq!(host_state_glyph(HostState::Confirmed), "✓");
+        assert_eq!(host_state_glyph(HostState::RebootPending), "↻");
         assert_eq!(host_state_glyph(HostState::RolledBack), "↩");
         assert_eq!(host_state_glyph(HostState::Copying), "⇄");
         let rolled = host_state_style(HostState::RolledBack);
@@ -1258,6 +1268,8 @@ mod tests {
         assert!(rolled.add_modifier.contains(Modifier::BOLD));
         let copying = host_state_style(HostState::Copying);
         assert_eq!(copying.fg, Some(Color::Blue));
+        let reboot_pending = host_state_style(HostState::RebootPending);
+        assert_eq!(reboot_pending.fg, Some(Color::Yellow));
         let pending = host_state_style(HostState::Pending);
         assert!(pending.add_modifier.contains(Modifier::DIM));
     }

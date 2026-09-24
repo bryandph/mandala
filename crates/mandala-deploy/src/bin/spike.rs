@@ -71,7 +71,7 @@ async fn run_host(host: HostConfig, sink: &dyn EventSink) -> Result<(), String> 
         .await
         .map_err(|error| error.to_string())?;
     sink.emit(Level::Info, "milestone=activate");
-    deploy_profile(&deploy, &defs, true, false)
+    deploy_profile(&deploy, &defs, true)
         .await
         .map_err(|error| error.to_string())?;
     sink.emit(Level::Info, "milestone=complete");

@@ -198,6 +198,8 @@ pub enum HostState {
     Waiting,
     #[serde(rename = "confirmed")]
     Confirmed,
+    #[serde(rename = "reboot-pending")]
+    RebootPending,
     #[serde(rename = "rolled-back")]
     RolledBack,
     #[serde(rename = "failed")]
@@ -216,6 +218,7 @@ impl HostState {
             HostState::Activating => "activating",
             HostState::Waiting => "waiting",
             HostState::Confirmed => "confirmed",
+            HostState::RebootPending => "reboot-pending",
             HostState::RolledBack => "rolled-back",
             HostState::Failed => "failed",
         }
@@ -238,6 +241,7 @@ fn milestone_state(name: &str) -> Option<HostState> {
         "activate" => Some(HostState::Activating),
         "wait" => Some(HostState::Waiting),
         "confirm" => Some(HostState::Confirmed),
+        "reboot-pending" => Some(HostState::RebootPending),
         "rollback" => Some(HostState::RolledBack),
         _ => None,
     }
@@ -250,7 +254,7 @@ fn milestone_state(name: &str) -> Option<HostState> {
 pub fn is_terminal(state: HostState) -> bool {
     matches!(
         state,
-        HostState::Confirmed | HostState::RolledBack | HostState::Failed
+        HostState::Confirmed | HostState::RebootPending | HostState::RolledBack | HostState::Failed
     )
 }
 
@@ -1599,6 +1603,19 @@ mod tests {
         tailer.poll();
         assert_eq!(tailer.hosts["gamma"].state, HostState::Confirmed);
         assert_eq!(tailer.hosts["beta"].state, HostState::RolledBack);
+    }
+
+    #[test]
+    fn reboot_pending_is_successful_sticky_and_rollback_still_wins() {
+        let mut host = HostRun::new("staged");
+        host.feed(&serde_json::json!({"event":"milestone","milestone":"reboot-pending"}));
+        host.feed(&serde_json::json!({"event":"milestone","milestone":"activate"}));
+        host.feed(&serde_json::json!({"event":"status","state":"done","rc":0}));
+        assert_eq!(host.state, HostState::RebootPending);
+        assert!(is_terminal(host.state));
+
+        host.feed(&serde_json::json!({"event":"milestone","milestone":"rollback"}));
+        assert_eq!(host.state, HostState::RolledBack);
     }
 
     /// Port of `test_nixlog_routes_to_sink_and_nowhere_else`: a v2 `nixlog`

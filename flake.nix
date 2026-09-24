@@ -170,6 +170,14 @@
     # validates and the derived fields compute correctly without any
     # operator-specific value entering this repo.
     checks = eachSystem (pkgs: {
+      switch-inhibitor-staging =
+        if pkgs.stdenv.isLinux
+        then
+          pkgs.testers.runNixOSTest (
+            import ./nixos-tests/switch-inhibitor-staging.nix {inherit lib pkgs;}
+          )
+        else pkgs.runCommand "mandala-switch-inhibitor-staging-skipped" {} "touch $out";
+
       fake-fleet = let
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);

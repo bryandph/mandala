@@ -455,6 +455,26 @@ fn summary_flags_a_bad_build_rc_and_success_head() {
     assert!(summary.recap.is_empty()); // no PLAY RECAP in the mirror
 }
 
+#[test]
+fn reboot_pending_summary_is_successful_but_names_the_required_reboot() {
+    let dir = tmp();
+    write_events(
+        &dir.join("alpha.jsonl"),
+        &[
+            json!({"host":"alpha","plugin":"deploy","event":"milestone","milestone":"reboot-pending"}),
+            json!({"host":"alpha","plugin":"deploy","event":"status","state":"done","rc":0}),
+        ],
+    );
+    let mut tailer = EventTailer::new(&dir);
+    tailer.poll();
+    let mut view = DeployViewState::new("alpha", false, false, false, true);
+    view.sync(Some(&tailer), &[], true, Some(0), 43);
+    let summary = view.summary.unwrap();
+    assert!(summary.ok);
+    assert_eq!(summary.head, "deploy succeeded — 1 host(s) require reboot");
+    assert_eq!(summary.hosts[0].1, HostState::RebootPending);
+}
+
 // ---- attached-log screen (private run registry) -----------------------------
 
 fn make_run(meta_pairs: &[(&str, Value)]) -> (String, PathBuf) {

@@ -92,7 +92,7 @@ impl Theme {
             HostState::Pending => "dim",
             HostState::Evaluating | HostState::Building => "cyan",
             HostState::Copying => "blue",
-            HostState::Activating | HostState::Waiting => "yellow",
+            HostState::Activating | HostState::Waiting | HostState::RebootPending => "yellow",
             HostState::Confirmed => "green",
             HostState::RolledBack | HostState::Failed => "bold red",
         };

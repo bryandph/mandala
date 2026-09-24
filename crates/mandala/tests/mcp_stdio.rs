@@ -624,10 +624,10 @@ sleep 1
     assert_eq!(settled["meta"]["process_rc"], 0);
     assert_eq!(
         settled["meta"]["summary"],
-        serde_json::json!({"total": 2, "confirmed": 2, "failed": 0, "rolled_back": 0})
+        serde_json::json!({"total": 2, "confirmed": 0, "reboot_pending": 2, "failed": 0, "rolled_back": 0})
     );
-    assert_eq!(settled["hosts"]["cache"]["state"], "confirmed");
-    assert_eq!(settled["hosts"]["web"]["state"], "confirmed");
+    assert_eq!(settled["hosts"]["cache"]["state"], "reboot-pending");
+    assert_eq!(settled["hosts"]["web"]["state"], "reboot-pending");
     assert_eq!(
         std::fs::read_dir(state.join("runs")).unwrap().count(),
         1,
@@ -646,13 +646,19 @@ sleep 1
         .unwrap()
         .path();
     let log = std::fs::read_to_string(launch.join("output.log")).unwrap();
-    assert!(log.contains("deploy summary: total=2 confirmed=2"), "{log}");
+    assert!(
+        log.contains("deploy summary: total=2 confirmed=0 reboot-pending=2"),
+        "{log}"
+    );
     let build = std::fs::read_to_string(run_dir.join("build.jsonl")).unwrap();
     assert!(build.contains("\"event\":\"nixlog\""), "{build}");
     for host in ["cache", "web"] {
         let stream = std::fs::read_to_string(run_dir.join(format!("{host}.jsonl"))).unwrap();
         assert!(stream.contains("\"milestone\":\"copy\""), "{stream}");
-        assert!(stream.contains("\"milestone\":\"confirm\""), "{stream}");
+        assert!(
+            stream.contains("\"milestone\":\"reboot-pending\""),
+            "{stream}"
+        );
     }
 
     let effects = std::fs::read_to_string(&effects).unwrap();
@@ -698,7 +704,7 @@ sleep 1
             .lines()
             .filter(|line| line.starts_with("ssh "))
             .count(),
-        2
+        0
     );
     let audit = std::fs::read_to_string(state.join("mcp/audit.jsonl")).unwrap();
     assert_eq!(

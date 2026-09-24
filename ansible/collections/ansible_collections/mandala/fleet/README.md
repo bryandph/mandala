@@ -7,7 +7,8 @@ Rust CLI; this collection does not activate hosts.
 ## Playbook: `mandala.fleet.state`
 
 `playbooks/state.yml` fans out over the projected inventory's `deploy_rs`
-guard group, reads each member's current and booted NixOS generation facts,
+guard group, reads each member's current, booted, and installed system-profile
+generation facts,
 and writes one JSON snapshot per host on the controller. Unreachable hosts
 are represented in their snapshots instead of failing the entire survey.
 

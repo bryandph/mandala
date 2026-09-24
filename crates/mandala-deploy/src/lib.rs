@@ -151,7 +151,7 @@ impl DeployData<'_> {
     }
 }
 
-fn shell_word(value: &str) -> String {
+pub(crate) fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()

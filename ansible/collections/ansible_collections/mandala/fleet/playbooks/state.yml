@@ -43,9 +43,18 @@
       delegate_to: localhost
       run_once: true
 
-    - name: Read current and booted system links
-      ansible.builtin.command:
-        argv: [readlink, -f, /run/current-system, /run/booted-system]
+    - name: Read current, booted, and installed system-profile links
+      # Emit exactly one line per path so a missing middle link cannot shift
+      # the positional snapshot fields.
+      ansible.builtin.shell: |
+        for link in \
+          /run/current-system \
+          /run/booted-system \
+          /nix/var/nix/profiles/system
+        do
+          resolved="$(readlink -f "$link" 2>/dev/null || true)"
+          printf '%s\n' "$resolved"
+        done
       register: system_links
       changed_when: false
       failed_when: false
@@ -76,8 +85,9 @@
           {{ {
             'host': inventory_hostname,
             'unreachable': system_links is unreachable,
-            'current': system_links.stdout_lines | default([]) | first | default(None),
-            'booted': system_links.stdout_lines | default([]) | last | default(None),
+            'current': system_links.stdout_lines[0] if system_links.stdout_lines | default([]) | length > 0 else None,
+            'booted': system_links.stdout_lines[1] if system_links.stdout_lines | default([]) | length > 1 else None,
+            'system_profile': system_links.stdout_lines[2] if system_links.stdout_lines | default([]) | length > 2 else None,
             'current_boot': {
               'kernel': boot_lines[0],
               'kernel_modules': boot_lines[1],

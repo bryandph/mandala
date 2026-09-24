@@ -1374,4 +1374,66 @@ mod tests {
         );
         assert_eq!(snap["hosts"]["beta"]["raw_lines_total"], 1);
     }
+
+    #[test]
+    fn reboot_pending_snapshot_is_successful_and_distinct_from_confirmed() {
+        let path =
+            std::env::temp_dir().join(format!("mandala-mcp-reboot-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let meta = Meta::from_iter([
+            ("kind".into(), Value::from("deploy")),
+            ("rc".into(), Value::from(0)),
+            ("process_rc".into(), Value::from(0)),
+            (
+                "summary".into(),
+                json!({"confirmed":1,"reboot_pending":1,"failed":0,"rolled_back":0,"total":2}),
+            ),
+        ]);
+        registry::write_meta(&path, &meta).unwrap();
+        for (host, milestone) in [("live", "confirm"), ("staged", "reboot-pending")] {
+            let writer =
+                mandala_core::runner::EventWriter::new(&path, host, host, "deploy").unwrap();
+            writer
+                .emit(
+                    "milestone",
+                    [("milestone".into(), Value::from(milestone))]
+                        .into_iter()
+                        .collect(),
+                )
+                .unwrap();
+            writer
+                .emit(
+                    "status",
+                    [
+                        ("state".into(), Value::from("done")),
+                        ("rc".into(), Value::from(0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .unwrap();
+        }
+        let mut observed = ObservedRun {
+            info: registry::RunInfo {
+                run_id: "reboot-pending".into(),
+                meta,
+                path: path.clone(),
+            },
+            tailer: mandala_core::runner::EventTailer::new(&path),
+        };
+        let snap = run_snapshot(
+            &mut observed,
+            SnapshotDetail::Full {
+                forest: false,
+                forest_nodes: false,
+                diagnostics: true,
+            },
+        );
+        assert_eq!(snap["liveness"], "finished");
+        assert_eq!(snap["hosts"]["live"]["state"], "confirmed");
+        assert_eq!(snap["hosts"]["staged"]["state"], "reboot-pending");
+        assert_eq!(snap["meta"]["summary"]["reboot_pending"], 1);
+        let _ = std::fs::remove_dir_all(path);
+    }
 }

@@ -938,7 +938,8 @@ mod tests {
     fn drift_json_is_python_byte_parity() {
         // A single no-snapshot entry, serialized as the Python asdict list.
         // json.dumps([{ "booted":None,"captured_at":None,"current":None,
-        //   "expected":None,"host":"web","status":"no-snapshot"}], indent=2,
+        //   "expected":None,"host":"web","status":"no-snapshot",
+        //   "system_profile":None}], indent=2,
         //   sort_keys=True)
         let entries = drift::compare(
             &["web".to_string()],
@@ -947,7 +948,7 @@ mod tests {
             Some(drift::default_max_age()),
             Utc::now(),
         );
-        let expected = "[\n  {\n    \"booted\": null,\n    \"captured_at\": null,\n    \"current\": null,\n    \"expected\": null,\n    \"host\": \"web\",\n    \"status\": \"no-snapshot\"\n  }\n]";
+        let expected = "[\n  {\n    \"booted\": null,\n    \"captured_at\": null,\n    \"current\": null,\n    \"expected\": null,\n    \"host\": \"web\",\n    \"status\": \"no-snapshot\",\n    \"system_profile\": null\n  }\n]";
         assert_eq!(to_pretty_2space(&entries), expected);
     }
 

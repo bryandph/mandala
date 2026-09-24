@@ -2,12 +2,13 @@
 //!
 //! A parity port of the retired Python `mandala_fleet.drift`. The data path mirrors the
 //! survey pattern: the read-only state playbook (`mandala.fleet.state`) fans
-//! out, reads each member's `/run/current-system` and `/run/booted-system`
-//! links plus each system's boot-critical facts, and writes one JSON snapshot
-//! per host on the controller. This module compares those snapshots against the
-//! locally evaluated toplevels (`nixosConfigurations.<h>.config.system.build
-//! .toplevel.outPath` — what `/run/current-system` points at after a successful
-//! deploy), routing the expected-eval through [`crate::eval::Evaluator`].
+//! out, reads each member's `/run/current-system`, `/run/booted-system`, and
+//! installed `/nix/var/nix/profiles/system` links plus each system's
+//! boot-critical facts, and writes one JSON snapshot per host on the controller.
+//! This module compares those snapshots against the locally evaluated toplevels
+//! (`nixosConfigurations.<h>.config.system.build.toplevel.outPath` — what
+//! `/run/current-system` points at after a successful deploy), routing the
+//! expected-eval through [`crate::eval::Evaluator`].
 //!
 //! Everything here is read-only: snapshots are files, expectations are a nix
 //! eval, refresh is a fact-gather playbook. Nothing mutates a host.
@@ -220,6 +221,8 @@ pub struct DriftEntry {
     pub current: Option<String>,
     /// The host's reported `/run/booted-system` target.
     pub booted: Option<String>,
+    /// The installed system-profile target used as the next boot generation.
+    pub system_profile: Option<String>,
     /// The snapshot's capture timestamp (ISO-8601), if recorded.
     pub captured_at: Option<String>,
 }
@@ -238,6 +241,9 @@ pub struct Snapshot {
     /// `/run/booted-system` target.
     #[serde(default)]
     pub booted: Option<String>,
+    /// `/nix/var/nix/profiles/system` target (absent in legacy snapshots).
+    #[serde(default)]
+    pub system_profile: Option<String>,
     /// ISO-8601 capture time (naive assumed UTC — the playbook writes UTC).
     #[serde(default)]
     pub captured_at: Option<String>,
@@ -598,7 +604,9 @@ fn normalize_tokens(s: &str) -> String {
 /// The status decision tree per host: no snapshot → [`DriftStatus::NoSnapshot`];
 /// `unreachable` → [`DriftStatus::Unreachable`]; no `current` link →
 /// [`DriftStatus::Incomplete`]; too old → [`DriftStatus::Stale`]; `expected`
-/// known and `current != expected` → [`DriftStatus::Drift`]; a booted/current
+/// known, `current != expected`, and the installed system profile equals the
+/// expectation → [`DriftStatus::RebootPending`]; another current/expected
+/// mismatch → [`DriftStatus::Drift`]; a booted/current
 /// split → [`DriftStatus::RebootPending`] if a boot-critical fact moved else
 /// [`DriftStatus::Activated`]; otherwise [`DriftStatus::InSync`].
 ///
@@ -626,12 +634,14 @@ pub fn compare(
                 expected: None,
                 current: None,
                 booted: None,
+                system_profile: None,
                 captured_at: None,
             });
             continue;
         };
         let current = snap.current.clone();
         let booted = snap.booted.clone();
+        let system_profile = snap.system_profile.clone();
         let captured_at = snap.captured_at.clone();
         let exp = expected.get(&host).cloned();
 
@@ -643,6 +653,8 @@ pub fn compare(
             DriftStatus::Incomplete
         } else if too_old(captured_at.as_deref(), max_age, now) {
             DriftStatus::Stale
+        } else if exp.is_some() && current != exp && system_profile == exp {
+            DriftStatus::RebootPending
         } else if exp.is_some() && current != exp {
             DriftStatus::Drift
         } else if booted.as_ref().is_some_and(|b| !b.is_empty()) && booted != current {
@@ -661,6 +673,7 @@ pub fn compare(
             expected: exp,
             current,
             booted,
+            system_profile,
             captured_at,
         });
     }
@@ -1032,10 +1045,39 @@ mod tests {
             "pending",
             json!({"current": "/nix/store/aaa-x", "booted": "/nix/store/zzz-old"}),
         );
+        write_snap(
+            &dir,
+            "staged",
+            json!({
+                "current": "/nix/store/bbb-x",
+                "booted": "/nix/store/bbb-x",
+                "system_profile": "/nix/store/aaa-x"
+            }),
+        );
+        write_snap(
+            &dir,
+            "unstaged",
+            json!({
+                "current": "/nix/store/bbb-x",
+                "booted": "/nix/store/bbb-x",
+                "system_profile": "/nix/store/ccc-x"
+            }),
+        );
+        write_snap(
+            &dir,
+            "legacy-drift",
+            json!({"current": "/nix/store/bbb-x", "booted": "/nix/store/bbb-x"}),
+        );
         let entries: BTreeMap<String, DriftEntry> = compare(
-            &["moved", "pending"].map(String::from),
+            &["moved", "pending", "staged", "unstaged", "legacy-drift"].map(String::from),
             &read_snapshots(&dir),
-            Some(&expect(&["moved", "pending"])),
+            Some(&expect(&[
+                "moved",
+                "pending",
+                "staged",
+                "unstaged",
+                "legacy-drift",
+            ])),
             Some(default_max_age()),
             now(),
         )
@@ -1044,6 +1086,13 @@ mod tests {
         .collect();
         assert_eq!(entries["moved"].status, DriftStatus::Drift);
         assert_eq!(entries["pending"].status, DriftStatus::RebootPending);
+        assert_eq!(entries["staged"].status, DriftStatus::RebootPending);
+        assert_eq!(
+            entries["staged"].system_profile.as_deref(),
+            Some("/nix/store/aaa-x")
+        );
+        assert_eq!(entries["unstaged"].status, DriftStatus::Drift);
+        assert_eq!(entries["legacy-drift"].status, DriftStatus::Drift);
     }
 
     // ---- test_activated_only_when_nothing_boot_critical_moved ---------------
