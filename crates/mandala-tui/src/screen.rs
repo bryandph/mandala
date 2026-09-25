@@ -26,17 +26,15 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Gauge, Paragraph};
 
 use crate::ansi;
+use crate::hit::{DeployTabTarget, HitMap, ScrollPane, Target};
+use crate::keymap::{Action as KeyAction, Hint};
 #[cfg(test)]
 use crate::render::rich_style;
-use crate::scroll::ScrollState;
+use crate::scroll::{SCROLLBACK_MAX, ScrollState, content_area, render_scrollbar};
 use crate::theme::Theme;
-
-/// Scrollback kept by the task/attached log screens (Python
-/// `deque(maxlen=8000)` / `RichLog(max_lines=8000)`).
-pub const SCROLLBACK_MAX: usize = 8000;
 
 /// The reboot-unavailable status message, verbatim from `action_reboot`.
 pub const REBOOT_UNAVAILABLE: &str =
@@ -501,7 +499,13 @@ impl RunsState {
 }
 
 /// The runs list: header, one row per run (cursor reversed), attach hint.
-pub fn render_runs(state: &RunsState, frame: &mut Frame, theme: &Theme) {
+pub fn render_runs(
+    state: &RunsState,
+    frame: &mut Frame,
+    theme: &Theme,
+    hints: &[Hint],
+    hit_map: &mut HitMap,
+) {
     let [header, body, footer] = screen_chrome(frame.area());
     render_header(
         frame,
@@ -510,12 +514,20 @@ pub fn render_runs(state: &RunsState, frame: &mut Frame, theme: &Theme) {
         &format!("{} in registry", state.rows.len()),
         theme,
     );
+    let body = render_focused_pane(frame, body, "run registry", theme);
+    hit_map.insert(body, Target::RunsTable);
     let mut lines: Vec<Line> = Vec::with_capacity(state.rows.len() + 1);
     lines.push(Line::from(Span::styled(
         format!("{:<30} {:<8} {:<9} target", "run", "kind", "status"),
         theme.footer_label,
     )));
     for (i, row) in state.rows.iter().enumerate() {
+        if i + 1 < body.height as usize {
+            hit_map.insert(
+                Rect::new(body.x, body.y.saturating_add(i as u16 + 1), body.width, 1),
+                Target::RunsRow(i),
+            );
+        }
         let style = if row.live {
             theme
                 .rich_style("bold green")
@@ -548,17 +560,7 @@ pub fn render_runs(state: &RunsState, frame: &mut Frame, theme: &Theme) {
         )));
     }
     frame.render_widget(Paragraph::new(lines), body);
-    render_footer_hint(
-        frame,
-        footer,
-        &[
-            ("enter", "attach"),
-            ("j/k", "move"),
-            ("r", "refresh"),
-            ("esc", "back"),
-        ],
-        theme,
-    );
+    render_footer_hint(frame, footer, hints, theme);
 }
 
 /// Tail-read a file from `*offset`, advancing it by the bytes read
@@ -921,7 +923,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Render a modal box (bordered, cleared background) with its text lines.
-fn render_modal(frame: &mut Frame, lines: Vec<Line<'static>>, width: u16, theme: &Theme) {
+fn render_modal(frame: &mut Frame, lines: Vec<Line<'static>>, width: u16, theme: &Theme) -> Rect {
     let area = frame.area();
     // +2 borders; width capped at 90% of the screen (the CSS max-width).
     let box_w = width.min(area.width * 9 / 10);
@@ -929,19 +931,95 @@ fn render_modal(frame: &mut Frame, lines: Vec<Line<'static>>, width: u16, theme:
     let rect = centered(area, box_w, box_h);
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().border_style(theme.modal)),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(theme.focused_chrome)
+                .title(Span::styled(" action ", theme.modal)),
+        ),
         rect,
     );
+    rect
 }
 
 /// The confirm modal over whatever is behind it.
-pub fn render_confirm(state: &ConfirmState, frame: &mut Frame, theme: &Theme) {
-    render_modal(frame, confirm_lines(state), 70, theme);
+pub fn render_confirm(
+    state: &ConfirmState,
+    frame: &mut Frame,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let message_lines = state.message.lines().count() as u16;
+    let rect = render_modal(frame, confirm_lines(state), 70, theme);
+    let inner_x = rect.x.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_y = rect.y.saturating_add(1);
+    hit_map.insert(
+        Rect::new(
+            inner_x,
+            inner_y.saturating_add(message_lines + 1),
+            inner_width,
+            1,
+        ),
+        Target::Action(KeyAction::ToggleBoot),
+    );
+    hit_map.insert(
+        Rect::new(
+            inner_x,
+            inner_y.saturating_add(message_lines + 2),
+            inner_width,
+            1,
+        ),
+        Target::Action(KeyAction::ToggleHalt),
+    );
+    let trailer_y = rect.y.saturating_add(rect.height.saturating_sub(2));
+    let run_width = 10.min(inner_width);
+    hit_map.insert(
+        Rect::new(inner_x, trailer_y, run_width, 1),
+        Target::Action(KeyAction::Confirm),
+    );
+    hit_map.insert(
+        Rect::new(
+            inner_x.saturating_add(run_width),
+            trailer_y,
+            inner_width.saturating_sub(run_width),
+            1,
+        ),
+        Target::Action(KeyAction::Cancel),
+    );
 }
 
 /// The reboot options modal.
-pub fn render_reboot(state: &RebootState, frame: &mut Frame, theme: &Theme) {
-    render_modal(frame, reboot_lines(state), 76, theme);
+pub fn render_reboot(state: &RebootState, frame: &mut Frame, theme: &Theme, hit_map: &mut HitMap) {
+    let rect = render_modal(frame, reboot_lines(state), 76, theme);
+    let inner_x = rect.x.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_y = rect.y.saturating_add(1);
+    for (line, action) in [
+        (3, KeyAction::OrderOne),
+        (4, KeyAction::OrderTwo),
+        (5, KeyAction::OrderThree),
+        (8, KeyAction::ToggleDrain),
+    ] {
+        hit_map.insert(
+            Rect::new(inner_x, inner_y.saturating_add(line), inner_width, 1),
+            Target::Action(action),
+        );
+    }
+    let trailer_y = rect.y.saturating_add(rect.height.saturating_sub(2));
+    let run_width = 10.min(inner_width);
+    hit_map.insert(
+        Rect::new(inner_x, trailer_y, run_width, 1),
+        Target::Action(KeyAction::Confirm),
+    );
+    hit_map.insert(
+        Rect::new(
+            inner_x.saturating_add(run_width),
+            trailer_y,
+            inner_width.saturating_sub(run_width),
+            1,
+        ),
+        Target::Action(KeyAction::Cancel),
+    );
 }
 
 /// Full-screen layout for the task/attached screens: header, log, footer.
@@ -962,16 +1040,33 @@ fn render_header(frame: &mut Frame, area: Rect, title: &str, sub: &str, theme: &
     frame.render_widget(Line::from(spans), area);
 }
 
-fn render_footer_hint(frame: &mut Frame, area: Rect, hints: &[(&str, &str)], theme: &Theme) {
+fn render_footer_hint(frame: &mut Frame, area: Rect, hints: &[Hint], theme: &Theme) {
     let mut spans = Vec::new();
-    for (i, (key, label)) in hints.iter().enumerate() {
+    for (i, hint) in hints.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ·  ", theme.footer_label));
         }
-        spans.push(Span::styled((*key).to_string(), theme.footer_key));
-        spans.push(Span::styled(format!(" {label}"), theme.footer_label));
+        spans.push(Span::styled(hint.key, theme.footer_key));
+        spans.push(Span::styled(format!(" {}", hint.label), theme.footer_label));
     }
     frame.render_widget(Line::from(spans), area);
+}
+
+fn render_focused_pane(
+    frame: &mut Frame,
+    area: Rect,
+    title: impl Into<String>,
+    theme: &Theme,
+) -> Rect {
+    let block = Block::bordered()
+        .border_style(theme.focused_chrome)
+        .title(Span::styled(
+            format!(" {} ", title.into()),
+            theme.focused_chrome,
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 /// Render the visible tail of a line buffer through the ANSI helper.
@@ -980,6 +1075,7 @@ fn render_log_tail<'a>(
     area: Rect,
     lines: impl ExactSizeIterator<Item = &'a str>,
     scroll: &ScrollState,
+    theme: &Theme,
 ) {
     let height = area.height as usize;
     let range = scroll.visible_range(height);
@@ -988,32 +1084,50 @@ fn render_log_tail<'a>(
         .take(range.len())
         .map(ansi::to_line)
         .collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    frame.render_widget(Paragraph::new(visible), content_area(area, scroll));
+    render_scrollbar(frame, area, scroll, theme.chrome, theme.focused_chrome);
 }
 
 /// The task screen: title, streamed log tail, close hint.
-pub fn render_task(state: &TaskState, frame: &mut Frame, theme: &Theme) {
+pub fn render_task(
+    state: &TaskState,
+    frame: &mut Frame,
+    theme: &Theme,
+    hints: &[Hint],
+    hit_map: &mut HitMap,
+) {
     let [header, log, footer] = screen_chrome(frame.area());
     render_header(frame, header, &state.title, "", theme);
+    let log = render_focused_pane(frame, log, "output", theme);
     render_log_tail(
         frame,
         log,
         state.lines.iter().map(String::as_str),
         &state.scroll,
-    );
-    render_footer_hint(
-        frame,
-        footer,
-        &[("esc", "back (terminates if running)")],
         theme,
     );
+    hit_map.insert(
+        log,
+        Target::ScrollPane {
+            pane: ScrollPane::Task,
+            viewport: log.height as usize,
+        },
+    );
+    render_footer_hint(frame, footer, hints, theme);
 }
 
 /// The attached-log screen: title, tailed log + liveness notices, detach
 /// hint (an observer never terminates the run).
-pub fn render_attached(state: &AttachedLogState, frame: &mut Frame, theme: &Theme) {
+pub fn render_attached(
+    state: &AttachedLogState,
+    frame: &mut Frame,
+    theme: &Theme,
+    hints: &[Hint],
+    hit_map: &mut HitMap,
+) {
     let [header, log, footer] = screen_chrome(frame.area());
     render_header(frame, header, &state.title, "", theme);
+    let log = render_focused_pane(frame, log, "attached log", theme);
     let range = state.scroll.visible_range(log.height as usize);
     let visible: Vec<Line> = state
         .lines
@@ -1034,17 +1148,31 @@ pub fn render_attached(state: &AttachedLogState, frame: &mut Frame, theme: &Them
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(visible), log);
-    render_footer_hint(frame, footer, &[("esc", "detach (run keeps going)")], theme);
+    frame.render_widget(Paragraph::new(visible), content_area(log, &state.scroll));
+    render_scrollbar(
+        frame,
+        log,
+        &state.scroll,
+        theme.chrome,
+        theme.focused_chrome,
+    );
+    hit_map.insert(
+        log,
+        Target::ScrollPane {
+            pane: ScrollPane::AttachedLog,
+            viewport: log.height as usize,
+        },
+    );
+    render_footer_hint(frame, footer, hints, theme);
 }
 
 /// The deploy screen's content area.
 #[must_use]
 pub fn deploy_content_area(area: Rect) -> Rect {
-    deploy_areas(area)[3]
+    Block::bordered().inner(deploy_areas(area)[3])
 }
 
-/// [header, build line, tab bar, content, recap strip, footer].
+/// [header, build/progress, tab bar, content, recap strip, footer].
 fn deploy_areas(area: Rect) -> [Rect; 6] {
     Layout::vertical([
         Constraint::Length(1),
@@ -1079,19 +1207,52 @@ fn deploy_tab_label(view: &DeployViewState, tab: &DeployTab, theme: &Theme) -> S
 
 /// The pure deploy screen. The runtime overlays the PTY-hosted nom widget on
 /// the build content area because terminal-emulator state owns process handles.
-pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
+pub fn render_deploy(
+    view: &DeployViewState,
+    frame: &mut Frame,
+    theme: &Theme,
+    hints: &[Hint],
+    hit_map: &mut HitMap,
+) {
     let [header, build, tab_bar, content, recap, footer] = deploy_areas(frame.area());
     render_header(frame, header, "deploy runner", &view.sub_title(), theme);
-    frame.render_widget(Line::from(view.build_line.clone()), build);
+    let [build_status, progress] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(24)]).areas(build);
+    frame.render_widget(Line::from(view.build_line.clone()), build_status);
+
+    let (done, total) = deploy_progress(view);
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        done as f64 / total as f64
+    };
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(theme.status_live)
+            .label(format!("hosts {done}/{total}"))
+            .ratio(ratio),
+        progress,
+    );
 
     // Tab bar: active reversed on top of the label's own style.
     let mut spans = Vec::new();
+    let mut x = tab_bar.x;
     for (i, tab) in deploy_tabs(view).into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("│"));
+            x = x.saturating_add(1);
         }
         let mut label = deploy_tab_label(view, &tab, theme);
         label.content = format!(" {} ", label.content).into();
+        let width = u16::try_from(label.content.chars().count()).unwrap_or(u16::MAX);
+        let target = match &tab {
+            DeployTab::Build => DeployTabTarget::Build,
+            DeployTab::Playbook => DeployTabTarget::Playbook,
+            DeployTab::Summary => DeployTabTarget::Summary,
+            DeployTab::Host(name) => DeployTabTarget::Host(name.clone()),
+        };
+        hit_map.insert(Rect::new(x, tab_bar.y, width, 1), Target::DeployTab(target));
+        x = x.saturating_add(width);
         if tab == view.active {
             label.style = label
                 .style
@@ -1103,17 +1264,42 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
     }
     frame.render_widget(Line::from(spans), tab_bar);
 
+    let pane_title = match &view.active {
+        DeployTab::Build => "build".to_string(),
+        DeployTab::Playbook => "ansible".to_string(),
+        DeployTab::Summary => "summary".to_string(),
+        DeployTab::Host(name) => name.clone(),
+    };
+    let content = render_focused_pane(frame, content, pane_title, theme);
+
     match &view.active {
-        DeployTab::Build => frame.render_widget(
-            Paragraph::new("starting nix-output-monitor…").style(theme.footer_label),
-            content,
-        ),
+        DeployTab::Build => {
+            frame.render_widget(
+                Paragraph::new("starting nix-output-monitor…").style(theme.footer_label),
+                content,
+            );
+            hit_map.insert(
+                content,
+                Target::ScrollPane {
+                    pane: ScrollPane::Build,
+                    viewport: content.height as usize,
+                },
+            );
+        }
         DeployTab::Playbook => {
             render_log_tail(
                 frame,
                 content,
                 view.playbook_lines.iter().map(String::as_str),
                 &view.playbook_scroll,
+                theme,
+            );
+            hit_map.insert(
+                content,
+                Target::ScrollPane {
+                    pane: ScrollPane::Deploy,
+                    viewport: content.height as usize,
+                },
             );
         }
         DeployTab::Host(name) => {
@@ -1124,6 +1310,14 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
                     content,
                     host.lines.iter().map(String::as_str),
                     &scroll,
+                    theme,
+                );
+                hit_map.insert(
+                    content,
+                    Target::ScrollPane {
+                        pane: ScrollPane::Deploy,
+                        viewport: content.height as usize,
+                    },
                 );
             }
         }
@@ -1152,30 +1346,25 @@ pub fn render_deploy(view: &DeployViewState, frame: &mut Frame, theme: &Theme) {
     }
     frame.render_widget(Line::from(recap_spans), recap);
 
-    // Esc ALWAYS detaches (runs are engine-owned and survive their
-    // frontends); termination is the explicit armed ctrl-k → y sequence.
-    if view.kill_armed {
-        render_footer_hint(
-            frame,
-            footer,
-            &[("y", "TERMINATE the run"), ("any other key", "cancel")],
-            theme,
-        );
-        return;
-    }
-    let mut hints = vec![
-        ("b", "nom build tab"),
-        ("p", "playbook output tab"),
-        ("s", "summary tab"),
-        ("tab", "cycle tabs"),
-    ];
-    if view.finished {
-        hints.push(("esc", "close"));
-    } else {
-        hints.push(("esc", "detach (run keeps going)"));
-        hints.push(("ctrl-k", "terminate…"));
-    }
-    render_footer_hint(frame, footer, &hints, theme);
+    render_footer_hint(frame, footer, hints, theme);
+}
+
+#[must_use]
+pub fn deploy_progress(view: &DeployViewState) -> (usize, usize) {
+    let done = view
+        .hosts
+        .iter()
+        .filter(|host| {
+            matches!(
+                host.state,
+                HostState::Confirmed
+                    | HostState::RebootPending
+                    | HostState::RolledBack
+                    | HostState::Failed
+            )
+        })
+        .count();
+    (done, view.hosts.len())
 }
 
 /// The summary tab body: head + build line, host table, PLAY RECAP verbatim.
@@ -1201,7 +1390,6 @@ fn render_summary(summary: &SummaryState, frame: &mut Frame, area: Rect, theme: 
             ),
         ]),
         Line::from(Span::styled(summary.build_line.clone(), build_style)),
-        Line::default(),
         Line::from(Span::styled(
             format!("{:<24} {:<12} {:>4}", "host", "state", "rc"),
             Style::new().add_modifier(Modifier::BOLD),
@@ -1220,7 +1408,6 @@ fn render_summary(summary: &SummaryState, frame: &mut Frame, area: Rect, theme: 
         )));
     }
     if !summary.recap.is_empty() {
-        lines.push(Line::default());
         lines.extend(summary.recap.iter().map(|l| ansi::to_line(l)));
     }
     frame.render_widget(Paragraph::new(lines), area);

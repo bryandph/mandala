@@ -4,7 +4,7 @@ assertion_line: 595
 expression: terminal.backend()
 ---
 "mandala — fleet                                                                           "
-" members │┌────────────────────────────────────────────────────────────────────┐          "
+" members │┌ action ────────────────────────────────────────────────────────────┐          "
 "  member  │Deploy 'web'?                                                       │       ads"
 "          │(eval-once batch build, then deploy-rs per host with magic rollback)│          "
 "          │                                                                    │          "
@@ -14,4 +14,4 @@ expression: terminal.backend()
 "          │                                                                    │          "
 "          │y to run   esc to cancel                                            │          "
 "          └────────────────────────────────────────────────────────────────────┘          "
-"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D "
+"tab views  ·  space select  ·  shift+drag terminal select  ·  r reload  ·  S refresh drift"

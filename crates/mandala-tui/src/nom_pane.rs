@@ -30,11 +30,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
+
+use crate::scroll::SCROLLBACK_MAX;
 
 nix::ioctl_write_ptr_bad!(tiocswinsz, nix::libc::TIOCSWINSZ, Winsize);
 nix::ioctl_read_bad!(tiocgwinsz, nix::libc::TIOCGWINSZ, Winsize);
@@ -167,7 +170,7 @@ impl NomPane {
         self.stdin = child.stdin.take();
         self.child = Some(child);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_MAX)));
         self.parser = Some(parser.clone());
 
         match pty.master.try_clone() {
@@ -302,6 +305,78 @@ impl NomPane {
     /// The fallback notice, when spawning failed.
     pub fn failure(&self) -> Option<&str> {
         self.failed.as_deref()
+    }
+
+    /// Move upward through the terminal emulator's retained history.
+    pub fn scroll_up(&self, rows: usize) -> bool {
+        self.set_scrollback(|current| current.saturating_add(rows))
+    }
+
+    /// Move toward the live tail; reaching zero resumes tail-follow.
+    pub fn scroll_down(&self, rows: usize) -> bool {
+        self.set_scrollback(|current| current.saturating_sub(rows))
+    }
+
+    pub fn scroll_to_top(&self) -> bool {
+        self.set_scrollback(|_| usize::MAX)
+    }
+
+    pub fn scroll_to_bottom(&self) -> bool {
+        self.set_scrollback(|_| 0)
+    }
+
+    fn set_scrollback(&self, update: impl FnOnce(usize) -> usize) -> bool {
+        let Some(parser) = self.parser.as_ref() else {
+            return false;
+        };
+        let mut parser = parser.lock().expect("nom pane emulator lock poisoned");
+        let screen = parser.screen_mut();
+        let before = screen.scrollback();
+        screen.set_scrollback(update(before));
+        let changed = screen.scrollback() != before;
+        if changed {
+            self.dirty.store(true, Ordering::Release);
+        }
+        changed
+    }
+
+    /// Current offset from the live tail and the retained maximum.
+    fn scrollback_position(&self) -> Option<(usize, usize)> {
+        let parser = self.parser.as_ref()?;
+        let mut parser = parser.lock().expect("nom pane emulator lock poisoned");
+        let screen = parser.screen_mut();
+        let current = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let maximum = screen.scrollback();
+        screen.set_scrollback(current);
+        Some((current, maximum))
+    }
+
+    pub fn render_scrollbar(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        track_style: Style,
+        thumb_style: Style,
+    ) {
+        let Some((offset, maximum)) = self.scrollback_position() else {
+            return;
+        };
+        if maximum == 0 || area.is_empty() {
+            return;
+        }
+        let viewport = area.height as usize;
+        let mut state = ScrollbarState::new(maximum.saturating_add(viewport))
+            .position(maximum.saturating_sub(offset))
+            .viewport_content_length(viewport);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(track_style)
+            .thumb_style(thumb_style);
+        frame.render_stateful_widget(scrollbar, area, &mut state);
     }
 }
 

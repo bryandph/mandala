@@ -443,8 +443,7 @@ impl AppState {
             return self.status.clone();
         }
         let frame = SPINNER_FRAMES[self.spin % SPINNER_FRAMES.len()];
-        let spun: Vec<String> = jobs.iter().map(|j| format!("{frame} {j}")).collect();
-        format!("running   {}", spun.join("   ·   "))
+        format!("{frame} running   {}", jobs.join("   ·   "))
     }
 
     // -- load / reload ---------------------------------------------------

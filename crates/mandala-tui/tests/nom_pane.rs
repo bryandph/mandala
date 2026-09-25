@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use mandala_tui::nom_pane::NomPane;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style};
 
 const FIXTURE: &str = include_str!("fixtures/nix-internal-json.txt");
 
@@ -108,6 +108,52 @@ fn stand_in_pipeline_renders_colored_lines() {
         matches!(style.fg, Some(Color::Red) | Some(Color::Indexed(1))),
         "expected red fg, got {:?}",
         style.fg
+    );
+}
+
+#[test]
+fn terminal_history_scrolls_holds_position_and_renders_a_scrollbar() {
+    let script = r#"while IFS= read -r l; do printf '%s\r\n' "$l"; done; printf 'DONE'"#;
+    let mut pane = NomPane::new();
+    pane.spawn_cmd("sh", &["-c", script], 10, 40);
+    for i in 0..30 {
+        pane.feed(&format!("line-{i:02}"));
+    }
+    pane.finish();
+    let tail = wait_for_contents(&pane, "DONE", Duration::from_secs(5));
+    assert!(
+        tail.contains("line-29"),
+        "tail missing latest line:\n{tail}"
+    );
+
+    assert!(pane.scroll_to_top());
+    let top = pane.screen_contents().expect("emulator screen");
+    assert!(top.contains("line-00"), "top missing oldest line:\n{top}");
+    assert!(
+        !top.contains("line-29"),
+        "top unexpectedly follows tail:\n{top}"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(&pane, area);
+            pane.render_scrollbar(frame, area, Style::new(), Style::new());
+        })
+        .expect("render scrolled pane");
+    assert!((0..10).any(|y| {
+        terminal
+            .backend()
+            .buffer()
+            .cell((39, y))
+            .is_some_and(|cell| cell.symbol() == "┃")
+    }));
+
+    assert!(pane.scroll_to_bottom());
+    assert!(
+        pane.screen_contents()
+            .is_some_and(|contents| contents.contains("line-29"))
     );
 }
 

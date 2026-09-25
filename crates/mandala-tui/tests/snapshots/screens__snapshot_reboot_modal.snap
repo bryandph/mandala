@@ -3,7 +3,7 @@ source: crates/mandala-tui/tests/screens.rs
 expression: terminal.backend()
 ---
 "mandala — fleet                                                                           "
-" member┌──────────────────────────────────────────────────────────────────────────┐       "
+" member┌ action ──────────────────────────────────────────────────────────────────┐       "
 "  membe│Reboot 'web,cache'?                                                       │    ads"
 "       │                                                                          │       "
 "       │Order (1/2/3)                                                             │       "
@@ -17,4 +17,4 @@ expression: terminal.backend()
 "       │y to run   esc to cancel                                                  │       "
 "       └──────────────────────────────────────────────────────────────────────────┘       "
 "                                                                                          "
-"tab views  ·  space select  ·  r reload  ·  S refresh drift  ·  p ping  ·  R reboot  ·  D "
+"tab views  ·  space select  ·  shift+drag terminal select  ·  r reload  ·  S refresh drift"

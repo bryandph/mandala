@@ -8,14 +8,20 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use futures_util::stream;
 use mandala_core::drift::Snapshot;
 use mandala_core::inventory::Inventory;
 use mandala_tui::app::App;
 use mandala_tui::explorer::ExplorerConfig;
-use mandala_tui::render::render;
+use mandala_tui::hit::Target;
+use mandala_tui::keymap::Action;
+use mandala_tui::render::{render, render_with_theme};
+use mandala_tui::screen::{ScreenState, TaskState};
 use mandala_tui::state::{AppState, LoadedInventory, Tab};
+use mandala_tui::theme::Theme;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
@@ -178,6 +184,26 @@ fn snapshot_concurrent_jobs_spinner_line() {
     insta::assert_snapshot!(terminal.backend());
 }
 
+#[test]
+fn render_builds_hit_targets_for_tabs_and_visible_rows() {
+    let state = filled_state();
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("test terminal");
+    let mut hits = None;
+    terminal
+        .draw(|frame| hits = Some(render_with_theme(&state, frame, &Theme::default())))
+        .expect("render explorer hit map");
+    let hits = hits.expect("hit map returned");
+
+    assert_eq!(hits.hit(11, 1), Some(&Target::Action(Action::TabTwo)));
+    assert_eq!(
+        hits.hit(4, 4),
+        Some(&Target::ExplorerRow {
+            tab: Tab::Members,
+            index: 0,
+        })
+    );
+}
+
 // ---- buffer-cell style assertions (snapshots can't see styles) --------------
 
 #[test]
@@ -185,15 +211,14 @@ fn drift_status_cell_carries_the_core_style() {
     let state = drift_state();
     let terminal = draw(&state, 120, 12);
     let buf = terminal.backend().buffer();
-    // Layout: row 0 header, 1 tab bar, 2 column headers, 3 first drift row
-    // (cache — status "drift"). Status column starts after marker(1)+gap(1)
-    // +member(16)+gap(1) = x 19.
-    let cell = buf.cell((19, 3)).expect("status cell");
+    // The focused pane border shifts the table one cell right/down. The
+    // first drift status begins at x=20, y=4.
+    let cell = buf.cell((20, 4)).expect("status cell");
     assert_eq!(cell.symbol(), "d"); // "drift"
     assert_eq!(cell.style().fg, Some(Color::Red));
     assert!(cell.style().add_modifier.contains(Modifier::BOLD));
     // Second row (web) is in-sync: green, not bold.
-    let cell = buf.cell((19, 4)).expect("status cell");
+    let cell = buf.cell((20, 5)).expect("status cell");
     assert_eq!(cell.symbol(), "i"); // "in-sync"
     assert_eq!(cell.style().fg, Some(Color::Green));
     assert!(!cell.style().add_modifier.contains(Modifier::BOLD));
@@ -205,12 +230,31 @@ fn selection_marker_cell_is_bold_cyan() {
     state.members_table.toggle(); // cursor row 0 = "cache"
     let terminal = draw(&state, 100, 12);
     let buf = terminal.backend().buffer();
-    // Row 3 is the first member row; the marker is column 0. The cursor row
-    // is REVERSED on top of the marker style.
-    let cell = buf.cell((0, 3)).expect("marker cell");
+    // The focused pane border shifts the first member row to (1, 4). The
+    // cursor row is REVERSED on top of the marker style.
+    let cell = buf.cell((1, 4)).expect("marker cell");
     assert_eq!(cell.symbol(), "●");
     assert_eq!(cell.style().fg, Some(Color::Cyan));
     assert!(cell.style().add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn explorer_focus_is_distinct_from_the_inactive_activity_pane() {
+    let mut state = filled_state();
+    state.debug_mcp = true;
+    state.mcp_panel = true;
+    let terminal = draw(&state, 100, 12);
+    let buf = terminal.backend().buffer();
+
+    let focused = buf.cell((0, 2)).expect("focused explorer border");
+    assert_eq!(focused.symbol(), "┌");
+    assert_eq!(focused.style().fg, Some(Color::LightCyan));
+    assert!(focused.style().add_modifier.contains(Modifier::BOLD));
+
+    let inactive = buf.cell((48, 0)).expect("inactive activity border");
+    assert_eq!(inactive.symbol(), "┌");
+    assert_eq!(inactive.style().fg, Some(Color::DarkGray));
+    assert!(!inactive.style().add_modifier.contains(Modifier::BOLD));
 }
 
 // ---- the REAL loop under TestBackend ----------------------------------------
@@ -221,6 +265,24 @@ fn key(code: KeyCode) -> std::io::Result<Event> {
 
 fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> std::io::Result<Event> {
     Ok(Event::Key(KeyEvent::new(code, modifiers)))
+}
+
+fn click(column: u16, row: u16) -> std::io::Result<Event> {
+    Ok(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }))
+}
+
+fn wheel(kind: MouseEventKind, column: u16, row: u16) -> std::io::Result<Event> {
+    Ok(Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }))
 }
 
 async fn run_keys(state: AppState, events: Vec<std::io::Result<Event>>) -> App {
@@ -280,6 +342,78 @@ async fn loop_tab_keys_switch_views() {
     )
     .await;
     assert_eq!(app.state.tab, Tab::Groups);
+}
+
+#[tokio::test]
+async fn loop_hjkl_and_vim_motions_drive_the_active_view() {
+    let app = run_keys(
+        filled_state(),
+        vec![
+            key(KeyCode::Right),
+            key(KeyCode::Char('h')),
+            key(KeyCode::Char('G')),
+            key(KeyCode::Char('g')),
+            key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('q')),
+        ],
+    )
+    .await;
+    assert_eq!(app.state.tab, Tab::Members);
+    assert_eq!(app.state.members_table.cursor(), 2);
+}
+
+#[tokio::test]
+async fn loop_mouse_clicks_select_rows_and_activate_tabs() {
+    let app = run_keys(filled_state(), vec![click(4, 4), click(11, 1)]).await;
+    assert_eq!(app.state.members_table.selected_names(), ["cache"]);
+    assert_eq!(app.state.tab, Tab::Groups);
+}
+
+#[tokio::test]
+async fn loop_mouse_wheel_scrolls_the_hovered_text_pane() {
+    let mut task = TaskState::new("ping web", 1, false);
+    for i in 0..20 {
+        task.push_line(format!("line {i:02}"));
+    }
+    let mut state = AppState::new();
+    state.screen = Some(ScreenState::Task(task));
+
+    let app = run_keys(state, vec![wheel(MouseEventKind::ScrollUp, 4, 2)]).await;
+    let Some(ScreenState::Task(task)) = app.state.screen else {
+        panic!("task screen missing");
+    };
+    assert!(!task.scroll.follow());
+    assert_eq!(task.scroll.offset_from_tail(), 3);
+}
+
+#[tokio::test]
+async fn loop_task_scrollback_unpins_and_bottom_repins() {
+    let task_state = || {
+        let mut task = TaskState::new("ping web", 1, false);
+        for i in 0..20 {
+            task.push_line(format!("line {i:02}"));
+        }
+        let mut state = AppState::new();
+        state.screen = Some(ScreenState::Task(task));
+        state
+    };
+
+    let app = run_keys(task_state(), vec![key(KeyCode::PageUp)]).await;
+    let Some(ScreenState::Task(task)) = app.state.screen else {
+        panic!("task screen missing");
+    };
+    assert!(!task.scroll.follow());
+    assert!(task.scroll.offset_from_tail() > 0);
+
+    let app = run_keys(
+        task_state(),
+        vec![key(KeyCode::PageUp), key(KeyCode::Char('G'))],
+    )
+    .await;
+    let Some(ScreenState::Task(task)) = app.state.screen else {
+        panic!("task screen missing");
+    };
+    assert!(task.scroll.follow());
 }
 
 /// esc clears the selection (it does NOT quit the explorer); ctrl+down

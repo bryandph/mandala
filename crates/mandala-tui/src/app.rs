@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::Utc;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use futures_util::{Stream, StreamExt};
 use mandala_core::drift;
 use mandala_core::registry;
@@ -40,11 +40,15 @@ use crate::context::{
 use crate::deploy::DeployJob;
 use crate::event::{AppEvent, Deadlines, LoopEvent, TimerId};
 use crate::explorer::{ExplorerConfig, pump_lines, spawn_eval_expected, spawn_load, spawn_survey};
+use crate::hit::{DeployTabTarget, HitMap, Target};
+use crate::keymap::{self, Action as KeyAction, Context as KeyContext};
+use crate::nom_pane::NomPane;
 use crate::render::render_with_theme;
 use crate::screen::{
     self, AttachedLogState, ConfirmAction, ConfirmState, DeployTab, RebootState, RunRow, RunsState,
     ScreenState, TaskState,
 };
+use crate::scroll::ScrollState;
 use crate::state::{AppState, ContextRole, LoadRequest, McpFollowUp, Tab};
 use crate::term::TerminalGuard;
 use crate::theme::Theme;
@@ -66,11 +70,40 @@ const ATTACHED_POLL: Duration = Duration::from_millis(500);
 /// The detached-run settlement watch cadence (meta-only reads — cheap).
 const RUN_WATCH_POLL: Duration = Duration::from_secs(2);
 
+fn apply_scroll_action(scroll: &mut ScrollState, action: KeyAction, viewport: usize) -> bool {
+    match action {
+        KeyAction::MoveUp => scroll.scroll_up(1, viewport),
+        KeyAction::MoveDown => scroll.scroll_down(1),
+        KeyAction::PageUp => scroll.scroll_up(viewport, viewport),
+        KeyAction::PageDown => scroll.scroll_down(viewport),
+        KeyAction::HalfPageUp => scroll.scroll_up((viewport / 2).max(1), viewport),
+        KeyAction::HalfPageDown => scroll.scroll_down((viewport / 2).max(1)),
+        KeyAction::Top => scroll.to_top(viewport),
+        KeyAction::Bottom => scroll.to_bottom(),
+        _ => return false,
+    }
+    true
+}
+
+fn apply_nom_scroll_action(nom: &NomPane, action: KeyAction, viewport: usize) -> bool {
+    match action {
+        KeyAction::MoveUp => nom.scroll_up(1),
+        KeyAction::MoveDown => nom.scroll_down(1),
+        KeyAction::PageUp => nom.scroll_up(viewport),
+        KeyAction::PageDown => nom.scroll_down(viewport),
+        KeyAction::HalfPageUp => nom.scroll_up((viewport / 2).max(1)),
+        KeyAction::HalfPageDown => nom.scroll_down((viewport / 2).max(1)),
+        KeyAction::Top => nom.scroll_to_top(),
+        KeyAction::Bottom => nom.scroll_to_bottom(),
+        _ => false,
+    }
+}
+
 /// Operator actions above plain navigation — the explicit Action enum of
 /// the design's loop decision. Each variant computes the target
 /// (selection-else-cursor) and pushes its screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
+enum FleetAction {
     /// `p`: ansible ad-hoc ping of the selection (TaskScreen).
     Ping,
     /// `R`: reboot the selection behind options + availability pre-check.
@@ -116,6 +149,7 @@ pub struct App {
     watched_runs: Vec<(String, bool)>,
     cfg: ExplorerConfig,
     dirty: bool,
+    hit_map: HitMap,
     quit: bool,
     deadlines: Deadlines,
     tx: mpsc::Sender<AppEvent>,
@@ -141,6 +175,7 @@ impl App {
             watched_runs: Vec::new(),
             cfg,
             dirty: true,
+            hit_map: HitMap::default(),
             quit: false,
             deadlines: Deadlines::default(),
             tx,
@@ -155,6 +190,11 @@ impl App {
     /// Sender for background tasks feeding the internal channel.
     pub fn sender(&self) -> mpsc::Sender<AppEvent> {
         self.tx.clone()
+    }
+
+    #[must_use]
+    pub fn hit_map(&self) -> &HitMap {
+        &self.hit_map
     }
 
     /// Adopt a joined fleet context: record the role + self-filter identity
@@ -219,9 +259,10 @@ impl App {
                 let state = &self.state;
                 let theme = &self.theme;
                 let deploy = self.deploy.as_ref();
+                let mut hit_map = HitMap::default();
                 terminal
                     .draw(|frame| {
-                        render_with_theme(state, frame, theme);
+                        hit_map = render_with_theme(state, frame, theme);
                         if let (Some(ScreenState::Deploy(view)), Some(job)) =
                             (state.screen.as_ref(), deploy)
                             && view.active == DeployTab::Build
@@ -229,9 +270,11 @@ impl App {
                         {
                             let area = screen::deploy_content_area(frame.area());
                             frame.render_widget(&*nom, area);
+                            nom.render_scrollbar(frame, area, theme.chrome, theme.focused_chrome);
                         }
                     })
                     .map_err(io::Error::other)?;
+                self.hit_map = hit_map;
                 self.dirty = false;
             }
 
@@ -252,7 +295,7 @@ impl App {
                 ), if deadline.is_some() => Wake::Deadline,
             };
             match wake {
-                Wake::Term(ev) => self.handle(LoopEvent::Term(ev), terminal).await?,
+                Wake::Term(ev) => self.handle(ev.into(), terminal).await?,
                 Wake::App(ev) => self.handle(LoopEvent::App(ev), terminal).await?,
                 Wake::Deadline => {
                     for id in self.deadlines.pop_due(Instant::now()) {
@@ -297,7 +340,7 @@ impl App {
     {
         match event {
             LoopEvent::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                self.on_key(key.code, key.modifiers, terminal).await?;
+                self.on_key(key, terminal).await?;
             }
             LoopEvent::Term(Event::Resize(width, height)) => {
                 if let Some(job) = self.deploy.as_ref()
@@ -309,6 +352,10 @@ impl App {
                 self.dirty = true;
             }
             LoopEvent::Term(_) => {}
+            LoopEvent::Mouse(mouse) => {
+                let size = terminal.size().map_err(io::Error::other)?;
+                self.on_mouse(mouse, (size.width, size.height)).await?;
+            }
             LoopEvent::Timer(TimerId::SpinnerTick) => {
                 if self.state.tick_spinner() {
                     self.dirty = true;
@@ -524,20 +571,19 @@ impl App {
 
     async fn on_key<B: Backend>(
         &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
+        key: KeyEvent,
         terminal: &mut Terminal<B>,
     ) -> io::Result<()>
     where
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         // Global keys work everywhere, screens or not.
-        match code {
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+        match keymap::resolve(KeyContext::Global, key) {
+            Some(KeyAction::Quit) => {
                 self.quit = true;
                 return Ok(());
             }
-            KeyCode::Char('z') if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(KeyAction::Suspend) => {
                 if let Some(guard) = self.guard.as_mut() {
                     guard.suspend_to_shell()?;
                     // The shell scribbled over our screen while we slept.
@@ -549,82 +595,111 @@ impl App {
             _ => {}
         }
 
+        let context = match self.state.screen.as_ref() {
+            None => KeyContext::Explorer,
+            Some(ScreenState::Confirm(_)) => KeyContext::Confirm,
+            Some(ScreenState::Reboot(_)) => KeyContext::Reboot,
+            Some(ScreenState::Task(_)) => KeyContext::Task,
+            Some(ScreenState::AttachedLog(_)) => KeyContext::AttachedLog,
+            Some(ScreenState::Deploy(view)) if view.kill_armed => KeyContext::DeployKillArmed,
+            Some(ScreenState::Deploy(_)) => KeyContext::Deploy,
+            Some(ScreenState::Runs(_)) => KeyContext::Runs,
+        };
+        let action = keymap::resolve(context, key);
+
         if self.state.screen.is_some() {
             let size = terminal.size().map_err(io::Error::other)?;
             return self
-                .on_screen_key(code, modifiers, (size.width, size.height))
+                .on_screen_action(action, (size.width, size.height))
                 .await;
         }
 
-        match code {
-            KeyCode::Char('q') => self.quit = true,
-
-            // -- tabs -----------------------------------------------------
-            KeyCode::Tab => {
+        match action {
+            Some(KeyAction::Quit) => self.quit = true,
+            Some(KeyAction::NextTab) => {
                 self.state.tab = self.state.tab.next();
                 self.dirty = true;
             }
-            KeyCode::BackTab => {
+            Some(KeyAction::PreviousTab) => {
                 self.state.tab = self.state.tab.prev();
                 self.dirty = true;
             }
-            KeyCode::Char('1') => {
+            Some(KeyAction::TabOne) => {
                 self.state.tab = Tab::Members;
                 self.dirty = true;
             }
-            KeyCode::Char('2') => {
+            Some(KeyAction::TabTwo) => {
                 self.state.tab = Tab::Groups;
                 self.dirty = true;
             }
-            KeyCode::Char('3') => {
+            Some(KeyAction::TabThree) => {
                 self.state.tab = Tab::Drift;
                 self.dirty = true;
             }
-
-            // -- select-table semantics (select_table.py) -----------------
-            KeyCode::Up | KeyCode::Down => {
-                let delta = if code == KeyCode::Up { -1 } else { 1 };
-                let table = self.state.active_table_mut();
-                if modifiers.contains(KeyModifiers::SHIFT) {
-                    table.extend(delta);
-                } else if modifiers.contains(KeyModifiers::CONTROL) {
-                    table.skip(delta);
-                } else {
-                    table.move_cursor(delta);
-                }
-                self.dirty = true;
-            }
-            KeyCode::Char('k') => {
+            Some(KeyAction::MoveUp) => {
                 self.state.active_table_mut().move_cursor(-1);
                 self.dirty = true;
             }
-            KeyCode::Char('j') => {
+            Some(KeyAction::MoveDown) => {
                 self.state.active_table_mut().move_cursor(1);
                 self.dirty = true;
             }
-            KeyCode::PageUp | KeyCode::PageDown => {
-                let delta = if code == KeyCode::PageUp { -10 } else { 10 };
-                self.state.active_table_mut().move_cursor(delta);
+            Some(KeyAction::ExtendUp) => {
+                self.state.active_table_mut().extend(-1);
                 self.dirty = true;
             }
-            KeyCode::Char(' ') => {
+            Some(KeyAction::ExtendDown) => {
+                self.state.active_table_mut().extend(1);
+                self.dirty = true;
+            }
+            Some(KeyAction::SkipUp) => {
+                self.state.active_table_mut().skip(-1);
+                self.dirty = true;
+            }
+            Some(KeyAction::SkipDown) => {
+                self.state.active_table_mut().skip(1);
+                self.dirty = true;
+            }
+            Some(KeyAction::PageUp) => {
+                self.state.active_table_mut().move_cursor(-10);
+                self.dirty = true;
+            }
+            Some(KeyAction::PageDown) => {
+                self.state.active_table_mut().move_cursor(10);
+                self.dirty = true;
+            }
+            Some(KeyAction::HalfPageUp) => {
+                self.state.active_table_mut().move_cursor(-5);
+                self.dirty = true;
+            }
+            Some(KeyAction::HalfPageDown) => {
+                self.state.active_table_mut().move_cursor(5);
+                self.dirty = true;
+            }
+            Some(KeyAction::Top) => {
+                self.state.active_table_mut().move_cursor(isize::MIN);
+                self.dirty = true;
+            }
+            Some(KeyAction::Bottom) => {
+                self.state.active_table_mut().move_cursor(isize::MAX);
+                self.dirty = true;
+            }
+            Some(KeyAction::ToggleSelection) => {
                 self.state.active_table_mut().toggle();
                 self.dirty = true;
             }
-            KeyCode::Esc => {
+            Some(KeyAction::ClearSelection) => {
                 self.state.active_table_mut().clear_selection();
                 self.dirty = true;
             }
-
-            // -- data refresh ---------------------------------------------
-            KeyCode::Char('r') => {
+            Some(KeyAction::Reload) => {
                 if let Some(req) = self.state.request_reload() {
                     self.start_load(req);
                 }
                 self.sync_spinner();
                 self.dirty = true;
             }
-            KeyCode::Char('S') => {
+            Some(KeyAction::RefreshDrift) => {
                 let (eval, survey) = self.state.refresh_drift();
                 if eval {
                     self.start_eval_expected();
@@ -635,22 +710,14 @@ impl App {
                 self.sync_spinner();
                 self.dirty = true;
             }
-
-            // -- action tier (pushed screens; views stay read-only) -------
-            KeyCode::Char('p') => self.dispatch(Action::Ping),
-            KeyCode::Char('R') => self.dispatch(Action::Reboot),
-            KeyCode::Char('D') => self.dispatch(Action::Deploy),
-
-            // -- runs list: every registry run is (re-)attachable ---------
-            KeyCode::Char('a') => {
+            Some(KeyAction::Ping) => self.dispatch(FleetAction::Ping),
+            Some(KeyAction::Reboot) => self.dispatch(FleetAction::Reboot),
+            Some(KeyAction::Deploy) => self.dispatch(FleetAction::Deploy),
+            Some(KeyAction::OpenRuns) => {
                 self.state.screen = Some(ScreenState::Runs(RunsState::load()));
                 self.dirty = true;
             }
-
-            // -- mcp activity panel (`--debug-mcp` only: without the flag
-            // the binding does not exist — the key is inert and the footer
-            // never hints it, the `check_action` mechanism) ----------------
-            KeyCode::Char('m') if self.state.debug_mcp => {
+            Some(KeyAction::ToggleMcp) if self.state.debug_mcp => {
                 self.state.mcp_panel = !self.state.mcp_panel;
                 self.dirty = true;
             }
@@ -662,24 +729,23 @@ impl App {
     /// Keys while a screen is up. Modals are keyboard-driven exactly like
     /// the Python bindings; task/attached/deploy close on esc/q with their
     /// per-screen dismissal semantics.
-    async fn on_screen_key(
+    async fn on_screen_action(
         &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
+        action: Option<KeyAction>,
         size: (u16, u16),
     ) -> io::Result<()> {
         match self.state.screen.as_mut().expect("screen present") {
             // ConfirmScreen: y confirm, esc/n cancel.
-            ScreenState::Confirm(confirm) => match code {
-                KeyCode::Char('h') => {
+            ScreenState::Confirm(confirm) => match action {
+                Some(KeyAction::ToggleHalt) => {
                     confirm.halt_on_build_failure = !confirm.halt_on_build_failure;
                     self.dirty = true;
                 }
-                KeyCode::Char('b') => {
+                Some(KeyAction::ToggleBoot) => {
                     confirm.boot = !confirm.boot;
                     self.dirty = true;
                 }
-                KeyCode::Char('y') => {
+                Some(KeyAction::Confirm) => {
                     let Some(ScreenState::Confirm(confirm)) = self.state.screen.take() else {
                         unreachable!("matched Confirm above");
                     };
@@ -697,7 +763,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Esc | KeyCode::Char('n') => {
+                Some(KeyAction::Cancel) => {
                     self.state.screen = None;
                     self.dirty = true;
                 }
@@ -705,16 +771,22 @@ impl App {
             },
 
             // RebootScreen: 1/2/3 order, d drain, y run, esc/n cancel.
-            ScreenState::Reboot(reboot) => match code {
-                KeyCode::Char(key @ ('1' | '2' | '3')) => {
-                    reboot.set_order(key);
+            ScreenState::Reboot(reboot) => match action {
+                Some(KeyAction::OrderOne | KeyAction::OrderTwo | KeyAction::OrderThree) => {
+                    let order = match action {
+                        Some(KeyAction::OrderOne) => '1',
+                        Some(KeyAction::OrderTwo) => '2',
+                        Some(KeyAction::OrderThree) => '3',
+                        _ => unreachable!(),
+                    };
+                    reboot.set_order(order);
                     self.dirty = true;
                 }
-                KeyCode::Char('d') => {
+                Some(KeyAction::ToggleDrain) => {
                     reboot.toggle_drain();
                     self.dirty = true;
                 }
-                KeyCode::Char('y') => {
+                Some(KeyAction::Confirm) => {
                     let Some(ScreenState::Reboot(reboot)) = self.state.screen.take() else {
                         unreachable!("matched Reboot above");
                     };
@@ -731,7 +803,7 @@ impl App {
                     }
                     self.dirty = true;
                 }
-                KeyCode::Esc | KeyCode::Char('n') => {
+                Some(KeyAction::Cancel) => {
                     self.state.screen = None;
                     self.dirty = true;
                 }
@@ -740,8 +812,13 @@ impl App {
 
             // TaskScreen: esc/q terminates a still-running task, then
             // dismisses with the rc (None while running / never launched).
-            ScreenState::Task(_) => {
-                if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            ScreenState::Task(task) => {
+                let viewport = size.1.saturating_sub(4) as usize;
+                if action
+                    .is_some_and(|action| apply_scroll_action(&mut task.scroll, action, viewport))
+                {
+                    self.dirty = true;
+                } else if action == Some(KeyAction::Close) {
                     let Some(ScreenState::Task(task)) = self.state.screen.take() else {
                         unreachable!("matched Task above");
                     };
@@ -760,8 +837,13 @@ impl App {
 
             // AttachedLogScreen: esc/q DETACHES — never terminates; the rc
             // rides the dismissal only once the run has settled.
-            ScreenState::AttachedLog(_) => {
-                if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            ScreenState::AttachedLog(attached) => {
+                let viewport = size.1.saturating_sub(4) as usize;
+                if action.is_some_and(|action| {
+                    apply_scroll_action(&mut attached.scroll, action, viewport)
+                }) {
+                    self.dirty = true;
+                } else if action == Some(KeyAction::Close) {
                     let Some(ScreenState::AttachedLog(attached)) = self.state.screen.take() else {
                         unreachable!("matched AttachedLog above");
                     };
@@ -794,7 +876,7 @@ impl App {
             // terminate is the explicit armed ctrl-k → y sequence.
             ScreenState::Deploy(view) if view.kill_armed => {
                 view.kill_armed = false;
-                if code == KeyCode::Char('y') {
+                if action == Some(KeyAction::ConfirmTerminate) {
                     if let Some(job) = self.deploy.as_mut() {
                         job.run.terminate();
                     }
@@ -804,89 +886,55 @@ impl App {
                 }
                 self.dirty = true;
             }
-            ScreenState::Deploy(view) => match code {
-                // Before the plain `k` scroll arm — modifiers decide.
-                KeyCode::Char('k')
-                    if modifiers.contains(KeyModifiers::CONTROL) && !view.finished =>
-                {
+            ScreenState::Deploy(view) => match action {
+                Some(KeyAction::ArmTerminate) if !view.finished => {
                     view.kill_armed = true;
                     self.dirty = true;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.scroll_up(1, size.1.saturating_sub(5) as usize);
-                        self.dirty = true;
-                    }
+                Some(
+                    action @ (KeyAction::MoveUp
+                    | KeyAction::MoveDown
+                    | KeyAction::PageUp
+                    | KeyAction::PageDown
+                    | KeyAction::HalfPageUp
+                    | KeyAction::HalfPageDown
+                    | KeyAction::Top
+                    | KeyAction::Bottom),
+                ) => {
+                    let viewport = size.1.saturating_sub(7) as usize;
+                    let changed = if view.active == DeployTab::Build {
+                        self.deploy
+                            .as_ref()
+                            .and_then(|job| job.nom.lock().ok())
+                            .is_some_and(|nom| apply_nom_scroll_action(&nom, action, viewport))
+                    } else {
+                        view.active_scroll_mut()
+                            .is_some_and(|scroll| apply_scroll_action(scroll, action, viewport))
+                    };
+                    self.dirty |= changed;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.scroll_down(1);
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::PageUp => {
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.scroll_up(
-                            size.1.saturating_sub(5) as usize,
-                            size.1.saturating_sub(5) as usize,
-                        );
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::PageDown => {
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.scroll_down(size.1.saturating_sub(5) as usize);
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    let page = size.1.saturating_sub(5) as usize;
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.scroll_up((page / 2).max(1), page);
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    let page = size.1.saturating_sub(5) as usize;
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.scroll_down((page / 2).max(1));
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.to_top(size.1.saturating_sub(5) as usize);
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    if let Some(scroll) = view.active_scroll_mut() {
-                        scroll.to_bottom();
-                        self.dirty = true;
-                    }
-                }
-                KeyCode::Char('b') => {
+                Some(KeyAction::BuildTab) => {
                     view.active = DeployTab::Build;
                     self.dirty = true;
                 }
-                KeyCode::Char('p') => {
+                Some(KeyAction::PlaybookTab) => {
                     view.active = DeployTab::Playbook;
                     self.dirty = true;
                 }
                 // `s` jumps to the summary only once it exists.
-                KeyCode::Char('s') if view.summary.is_some() => {
+                Some(KeyAction::SummaryTab) if view.summary.is_some() => {
                     view.active = DeployTab::Summary;
                     self.dirty = true;
                 }
-                KeyCode::Tab => {
+                Some(KeyAction::NextTab) => {
                     view.active = screen::cycle_tab(view, 1);
                     self.dirty = true;
                 }
-                KeyCode::BackTab => {
+                Some(KeyAction::PreviousTab) => {
                     view.active = screen::cycle_tab(view, -1);
                     self.dirty = true;
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                Some(KeyAction::Close) => {
                     let Some(ScreenState::Deploy(view)) = self.state.screen.take() else {
                         unreachable!("matched Deploy above");
                     };
@@ -931,20 +979,49 @@ impl App {
 
             // RunsScreen: navigate, refresh, attach (every registry run is
             // re-attachable — the foreground verb for backgrounded runs).
-            ScreenState::Runs(runs) => match code {
-                KeyCode::Up | KeyCode::Char('k') => {
+            ScreenState::Runs(runs) => match action {
+                Some(KeyAction::MoveUp) => {
                     runs.move_cursor(-1);
                     self.dirty = true;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                Some(KeyAction::MoveDown) => {
                     runs.move_cursor(1);
                     self.dirty = true;
                 }
-                KeyCode::Char('r') => {
+                Some(KeyAction::PageUp) => {
+                    runs.move_cursor(-10);
+                    self.dirty = true;
+                }
+                Some(KeyAction::PageDown) => {
+                    runs.move_cursor(10);
+                    self.dirty = true;
+                }
+                Some(KeyAction::HalfPageUp) => {
+                    runs.move_cursor(-5);
+                    self.dirty = true;
+                }
+                Some(KeyAction::HalfPageDown) => {
+                    runs.move_cursor(5);
+                    self.dirty = true;
+                }
+                Some(KeyAction::Top) => {
+                    runs.move_cursor(-(runs.cursor as i64));
+                    self.dirty = true;
+                }
+                Some(KeyAction::Bottom) => {
+                    let delta = runs
+                        .rows
+                        .len()
+                        .saturating_sub(1)
+                        .saturating_sub(runs.cursor) as i64;
+                    runs.move_cursor(delta);
+                    self.dirty = true;
+                }
+                Some(KeyAction::RefreshRuns) => {
                     *runs = RunsState::load();
                     self.dirty = true;
                 }
-                KeyCode::Enter => {
+                Some(KeyAction::Activate) => {
                     let Some(ScreenState::Runs(runs)) = self.state.screen.take() else {
                         unreachable!("matched Runs above");
                     };
@@ -953,12 +1030,137 @@ impl App {
                     }
                     self.dirty = true;
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                Some(KeyAction::Close) => {
                     self.state.screen = None;
                     self.dirty = true;
                 }
                 _ => {}
             },
+        }
+        Ok(())
+    }
+
+    async fn on_mouse(&mut self, mouse: MouseEvent, size: (u16, u16)) -> io::Result<()> {
+        let Some(target) = self.hit_map.hit(mouse.column, mouse.row).cloned() else {
+            return Ok(());
+        };
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let up = mouse.kind == MouseEventKind::ScrollUp;
+            match target {
+                Target::ScrollPane { pane, viewport } => {
+                    if pane == crate::hit::ScrollPane::Build {
+                        let changed = self
+                            .deploy
+                            .as_ref()
+                            .and_then(|job| job.nom.lock().ok())
+                            .is_some_and(|nom| {
+                                if up {
+                                    nom.scroll_up(3)
+                                } else {
+                                    nom.scroll_down(3)
+                                }
+                            });
+                        self.dirty |= changed;
+                    } else {
+                        let scroll = match pane {
+                            crate::hit::ScrollPane::Mcp => Some(&mut self.state.mcp_scroll),
+                            crate::hit::ScrollPane::Task => match self.state.screen.as_mut() {
+                                Some(ScreenState::Task(task)) => Some(&mut task.scroll),
+                                _ => None,
+                            },
+                            crate::hit::ScrollPane::AttachedLog => {
+                                match self.state.screen.as_mut() {
+                                    Some(ScreenState::AttachedLog(attached)) => {
+                                        Some(&mut attached.scroll)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            crate::hit::ScrollPane::Deploy => match self.state.screen.as_mut() {
+                                Some(ScreenState::Deploy(view)) => view.active_scroll_mut(),
+                                _ => None,
+                            },
+                            crate::hit::ScrollPane::Build => unreachable!(),
+                        };
+                        if let Some(scroll) = scroll {
+                            if up {
+                                scroll.scroll_up(3, viewport);
+                            } else {
+                                scroll.scroll_down(3);
+                            }
+                            self.dirty = true;
+                        }
+                    }
+                }
+                Target::ExplorerTable(tab) | Target::ExplorerRow { tab, .. } => {
+                    self.state.tab = tab;
+                    self.state
+                        .active_table_mut()
+                        .move_cursor(if up { -3 } else { 3 });
+                    self.dirty = true;
+                }
+                Target::RunsTable | Target::RunsRow(_) => {
+                    if let Some(ScreenState::Runs(runs)) = self.state.screen.as_mut() {
+                        runs.move_cursor(if up { -3 } else { 3 });
+                        self.dirty = true;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return Ok(());
+        }
+        match target {
+            Target::Action(action) if self.state.screen.is_some() => {
+                self.on_screen_action(Some(action), size).await?;
+            }
+            Target::Action(KeyAction::TabOne) => {
+                self.state.tab = Tab::Members;
+                self.dirty = true;
+            }
+            Target::Action(KeyAction::TabTwo) => {
+                self.state.tab = Tab::Groups;
+                self.dirty = true;
+            }
+            Target::Action(KeyAction::TabThree) => {
+                self.state.tab = Tab::Drift;
+                self.dirty = true;
+            }
+            Target::ExplorerRow { tab, index } => {
+                self.state.tab = tab;
+                let table = self.state.active_table_mut();
+                let delta = index as isize - table.cursor() as isize;
+                table.move_cursor(delta);
+                table.toggle();
+                self.dirty = true;
+            }
+            Target::RunsRow(index) => {
+                if let Some(ScreenState::Runs(runs)) = self.state.screen.as_mut() {
+                    let delta = index as i64 - runs.cursor as i64;
+                    runs.move_cursor(delta);
+                    self.dirty = true;
+                }
+            }
+            Target::DeployTab(target) => {
+                if let Some(ScreenState::Deploy(view)) = self.state.screen.as_mut() {
+                    view.active = match target {
+                        DeployTabTarget::Build => DeployTab::Build,
+                        DeployTabTarget::Playbook => DeployTab::Playbook,
+                        DeployTabTarget::Summary => DeployTab::Summary,
+                        DeployTabTarget::Host(name) => DeployTab::Host(name),
+                    };
+                    self.dirty = true;
+                }
+            }
+            Target::ExplorerTable(_)
+            | Target::RunsTable
+            | Target::ScrollPane { .. }
+            | Target::Action(_) => {}
         }
         Ok(())
     }
@@ -1032,20 +1234,20 @@ impl App {
 
     /// Action dispatch: compute the target (selection-else-cursor) and push
     /// the action's screen. No target → no-op.
-    fn dispatch(&mut self, action: Action) {
+    fn dispatch(&mut self, action: FleetAction) {
         let target = match action {
-            Action::Deploy => self.state.deploy_target(),
-            Action::Ping | Action::Reboot => self.state.target(),
+            FleetAction::Deploy => self.state.deploy_target(),
+            FleetAction::Ping | FleetAction::Reboot => self.state.target(),
         };
         let Some(target) = target else {
             return;
         };
         match action {
-            Action::Ping => {
+            FleetAction::Ping => {
                 let argv = (self.cfg.ping_argv)(&target);
                 self.push_task(format!("ping {target}"), argv, ansible_dir(), false);
             }
-            Action::Reboot => {
+            FleetAction::Reboot => {
                 // Availability pre-check: probe the shared launch line the
                 // way `action_reboot` does before showing the modal.
                 if (self.cfg.reboot_argv)(&target, "1", true).is_none() {
@@ -1056,7 +1258,7 @@ impl App {
                 self.state.screen = Some(ScreenState::Reboot(RebootState::new(target)));
                 self.dirty = true;
             }
-            Action::Deploy => {
+            FleetAction::Deploy => {
                 self.state.screen = Some(ScreenState::Confirm(ConfirmState::new(
                     format!(
                         "Deploy '{target}'?\n(eval-once batch build, then deploy-rs per host with magic rollback)"

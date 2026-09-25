@@ -71,6 +71,10 @@ CI runs. While evaluation is quiet, the build tab shows a waiting message.
 The nom process starts with the first Nix log record, avoiding its no-input
 warning during long evaluations.
 
+The TUI supports mouse clicks and wheel scrolling. Because mouse capture sends
+pointer events to Mandala, hold Shift while dragging when you want the terminal
+emulator to select text instead.
+
 Deploy builds use best effort by default: independent derivations continue after
 failures, and only successfully built profiles proceed to deployment. Failed
 targets remain visible in the summary and make the run return a nonzero status.

@@ -7,6 +7,7 @@
 
 use std::io;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -17,7 +18,7 @@ use nix::sys::signal::{Signal, raise};
 /// Safe to call any number of times, from the panic hook or a guard.
 pub fn restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 /// Chain a terminal-restoring panic hook in front of the default one, so
@@ -41,7 +42,13 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+            restore();
+            return Err(error);
+        }
+        // Mouse support is additive: terminals that refuse capture remain
+        // fully usable from the keyboard.
+        let _ = execute!(io::stdout(), EnableMouseCapture);
         Ok(Self { active: true })
     }
 
@@ -56,7 +63,11 @@ impl TerminalGuard {
     fn reenter(&mut self) -> io::Result<()> {
         if !self.active {
             enable_raw_mode()?;
-            execute!(io::stdout(), EnterAlternateScreen)?;
+            if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+                restore();
+                return Err(error);
+            }
+            let _ = execute!(io::stdout(), EnableMouseCapture);
             self.active = true;
         }
         Ok(())

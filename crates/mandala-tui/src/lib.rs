@@ -43,6 +43,8 @@ pub mod context;
 pub mod deploy;
 pub mod event;
 pub mod explorer;
+pub mod hit;
+pub mod keymap;
 pub mod nom_pane;
 pub mod render;
 pub mod screen;

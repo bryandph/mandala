@@ -20,7 +20,7 @@ use mandala_tui::render::{render, render_with_theme};
 use mandala_tui::screen::{
     AttachedLogState, ConfirmAction, ConfirmState, DeployTab, DeployViewState, LogLine, ORDERS,
     RebootState, ScreenState, TaskState, attached_close_rc, attached_pump, confirm_lines,
-    deploy_tabs, host_state_glyph, host_state_style, reboot_lines,
+    deploy_progress, deploy_tabs, host_state_glyph, host_state_style, reboot_lines,
 };
 use mandala_tui::state::AppState;
 use mandala_tui::theme::Theme;
@@ -274,6 +274,7 @@ fn host_tabs_appear_sorted_and_restyle_on_milestones() {
     assert_eq!(view.hosts[0].state, HostState::Copying);
     assert_eq!(host_state_glyph(view.hosts[0].state), "⇄");
     assert_eq!(view.hosts[1].state, HostState::Evaluating);
+    assert_eq!(deploy_progress(&view), (0, 2));
     assert_eq!(
         deploy_tabs(&view),
         vec![
@@ -292,6 +293,7 @@ fn host_tabs_appear_sorted_and_restyle_on_milestones() {
     tailer.poll();
     view.sync(Some(&tailer), &[], false, None, 0);
     assert_eq!(view.hosts[0].state, HostState::Confirmed);
+    assert_eq!(deploy_progress(&view), (1, 2));
     assert_eq!(host_state_glyph(view.hosts[0].state), "✓");
     assert_eq!(host_state_style(view.hosts[0].state).fg, Some(Color::Green));
 }
@@ -356,7 +358,9 @@ fn explicit_theme_is_threaded_into_the_header() {
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
     terminal
-        .draw(|frame| render_with_theme(&state, frame, &theme))
+        .draw(|frame| {
+            let _ = render_with_theme(&state, frame, &theme);
+        })
         .unwrap();
     let first = terminal
         .backend()
@@ -612,6 +616,10 @@ fn snapshot_confirm_modal() {
         },
     )));
     let terminal = draw(&state, 90, 12);
+    let border = terminal.backend().buffer().cell((10, 1)).unwrap();
+    assert_eq!(border.symbol(), "┌");
+    assert_eq!(border.style().fg, Some(Color::LightCyan));
+    assert!(border.style().add_modifier.contains(Modifier::BOLD));
     insta::assert_snapshot!(terminal.backend());
 }
 
@@ -627,6 +635,49 @@ fn snapshot_task_screen_stream() {
     state.screen = Some(ScreenState::Task(task));
     let terminal = draw(&state, 80, 10);
     insta::assert_snapshot!(terminal.backend());
+}
+
+#[test]
+fn task_scrollback_renders_visible_position_and_scrollbar() {
+    let mut task = TaskState::new("ping web", 1, false);
+    for i in 0..12 {
+        task.push_line(format!("line {i:02}"));
+    }
+
+    let mut state = AppState::new();
+    state.screen = Some(ScreenState::Task(task.clone()));
+    let at_tail = draw(&state, 30, 8);
+    let tail_text = format!("{}", at_tail.backend());
+    assert!(tail_text.contains("line 11"));
+    assert!(!tail_text.contains("line 00"));
+    assert!(tail_text.contains('┃'));
+
+    task.scroll.to_top(4);
+    state.screen = Some(ScreenState::Task(task));
+    let at_top = draw(&state, 30, 8);
+    let top_text = format!("{}", at_top.backend());
+    assert!(top_text.contains("line 00"));
+    assert!(!top_text.contains("line 11"));
+
+    let tail_thumb_row = (2..6)
+        .find(|&y| {
+            at_tail
+                .backend()
+                .buffer()
+                .cell((28, y))
+                .is_some_and(|cell| cell.symbol() == "┃")
+        })
+        .expect("tail scrollbar thumb");
+    let top_thumb_row = (2..6)
+        .find(|&y| {
+            at_top
+                .backend()
+                .buffer()
+                .cell((28, y))
+                .is_some_and(|cell| cell.symbol() == "┃")
+        })
+        .expect("top scrollbar thumb");
+    assert!(top_thumb_row < tail_thumb_row);
 }
 
 #[test]

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use crossterm::event::{Event, MouseEvent};
 use tokio::time::Instant;
 
 use crate::state::LoadedInventory;
@@ -14,12 +15,24 @@ use crate::state::LoadedInventory;
 /// Everything the loop can wake on, unified.
 #[derive(Debug)]
 pub enum LoopEvent {
-    /// A terminal input/resize event from crossterm.
-    Term(crossterm::event::Event),
+    /// A keyboard, resize, or other non-mouse event from crossterm.
+    Term(Event),
+    /// Mouse input is distinct while still sharing the terminal stream's
+    /// one-event-per-wake funnel and the loop's bounded internal-event drain.
+    Mouse(MouseEvent),
     /// An armed deadline fired.
     Timer(TimerId),
     /// An internal event from a background task.
     App(AppEvent),
+}
+
+impl From<Event> for LoopEvent {
+    fn from(event: Event) -> Self {
+        match event {
+            Event::Mouse(mouse) => Self::Mouse(mouse),
+            event => Self::Term(event),
+        }
+    }
 }
 
 /// Internal events background tasks send into the loop's channel — the
@@ -140,5 +153,24 @@ mod tests {
         assert_eq!(due, vec![TimerId::SpinnerTick]);
         assert_eq!(d.next_deadline(), None);
         assert!(!d.is_armed(TimerId::SpinnerTick));
+    }
+
+    #[test]
+    fn mouse_events_have_their_own_loop_variant() {
+        use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(
+            matches!(LoopEvent::from(Event::Mouse(mouse)), LoopEvent::Mouse(event) if event == mouse)
+        );
+        assert!(matches!(
+            LoopEvent::from(Event::Key(KeyEvent::from(KeyCode::Esc))),
+            LoopEvent::Term(Event::Key(_))
+        ));
     }
 }

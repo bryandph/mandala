@@ -2,6 +2,14 @@
 
 use std::ops::Range;
 
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+
+/// Maximum retained history for text and terminal-backed panes.
+pub const SCROLLBACK_MAX: usize = 8000;
+
 /// A viewport position stored as distance from the content tail.
 ///
 /// Offset-from-tail keeps a following pane pinned at zero. While unpinned,
@@ -90,6 +98,46 @@ impl ScrollState {
             .try_into()
             .unwrap_or(u16::MAX)
     }
+}
+
+/// Reserve the rightmost column for a scrollbar only when the content can
+/// actually scroll. Short panes retain their full width.
+#[must_use]
+pub fn content_area(area: Rect, scroll: &ScrollState) -> Rect {
+    if scroll.content_len() > area.height as usize && area.width > 1 {
+        Rect {
+            width: area.width - 1,
+            ..area
+        }
+    } else {
+        area
+    }
+}
+
+/// Draw a vertical scrollbar whose position follows the same top-of-buffer
+/// coordinate used by the sliced paragraph renderers.
+pub fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: &ScrollState,
+    track_style: Style,
+    thumb_style: Style,
+) {
+    let viewport = area.height as usize;
+    if scroll.content_len() <= viewport || area.is_empty() {
+        return;
+    }
+    let mut state = ScrollbarState::new(scroll.content_len())
+        .position(scroll.visible_range(viewport).start)
+        .viewport_content_length(viewport);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("┃")
+        .track_style(track_style)
+        .thumb_style(thumb_style);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
 #[cfg(test)]

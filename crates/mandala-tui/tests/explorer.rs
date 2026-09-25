@@ -173,7 +173,7 @@ fn survey_success_first_keeps_the_eval_spinner_up() {
     // spins for the eval.
     state.on_survey_done(1, 0, None, &snapshots(), now());
     assert_eq!(state.status, "drift refreshed · surveyed 1 host");
-    assert!(state.status_line().starts_with("running   "));
+    assert!(state.status_line().starts_with("⠋ running   "));
     assert!(state.status_line().contains("eval"));
     // Then the eval error lands and (sticky) replaces the resting message.
     let _ = state.on_drift_eval_finished(Err("eval failed: nope".to_string()), &snapshots(), now());
@@ -184,12 +184,12 @@ fn survey_success_first_keeps_the_eval_spinner_up() {
 fn spinner_line_lists_every_running_job_with_one_shared_frame() {
     let mut state = filled_state();
     let _ = state.refresh_drift();
-    assert_eq!(state.status_line(), "running   ⠋ eval   ·   ⠋ survey");
+    assert_eq!(state.status_line(), "⠋ running   eval   ·   survey");
     state.on_survey_progress(3);
     assert!(state.tick_spinner());
     assert_eq!(
         state.status_line(),
-        "running   ⠙ eval   ·   ⠙ survey (3 read)"
+        "⠙ running   eval   ·   survey (3 read)"
     );
     // Idle again: the resting message, and idle ticks change nothing.
     let _ = state.on_drift_eval_finished(
