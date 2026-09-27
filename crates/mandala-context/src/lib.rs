@@ -10,12 +10,14 @@
 //! pids are advisory (recycled-pid caveat carried over from phase 1).
 //!
 //! [`acquire`] is the one entry point: probe the discovery url first (it is
-//! authoritative for clients — the leader may sit on a walked port), then
-//! walk the identity's deterministic port sequence, binding where free and
-//! probing where occupied. A live listener whose rejection reports a
-//! *different* flake is another context squatting our derived port — step to
-//! the next port; one reporting *our* flake is our leader (join it, re-reading
-//! the discovery token if ours lost the mint race).
+//! authoritative for clients — the leader may sit on a walked port), scan the
+//! identity's full deterministic port sequence for an existing leader, then
+//! walk it again to race the bind. The full scan keeps a free earlier port
+//! from hiding our leader on a later port when discovery is missing or stale.
+//! A live listener whose rejection reports a *different* flake is another
+//! context squatting our derived port — step to the next port; one reporting
+//! *our* flake is our leader (join it, re-reading the discovery token if ours
+//! lost the mint race).
 
 pub mod client;
 pub mod discovery;
@@ -141,10 +143,34 @@ pub async fn acquire(
         match probe_with_busy_retry(addr, &token, client_name, identity.flake()).await {
             Probe::OurLeader(client) => return Ok(Acquired::Follower(client)),
             Probe::Busy => return Err(AcquireError::LeaderBusy),
-            Probe::TokenMismatch | Probe::Foreign | Probe::Dead => {}
+            Probe::TokenMismatch => {
+                return join_with_refreshed_token(addr, state_dir, identity, client_name, &token)
+                    .await;
+            }
+            Probe::Foreign | Probe::Dead => {}
         }
     }
 
+    // Discovery is metadata, not the lock: it may be absent, malformed, or
+    // stale while a leader still owns a later walked port. Inspect the whole
+    // range before binding anywhere so an earlier free port cannot create a
+    // second leader for the checkout.
+    for port in identity.ports() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        match probe_with_busy_retry(addr, &token, client_name, identity.flake()).await {
+            Probe::OurLeader(client) => return Ok(Acquired::Follower(client)),
+            Probe::Busy => return Err(AcquireError::LeaderBusy),
+            Probe::TokenMismatch => {
+                return join_with_refreshed_token(addr, state_dir, identity, client_name, &token)
+                    .await;
+            }
+            Probe::Foreign | Probe::Dead => {}
+        }
+    }
+
+    // No existing leader answered. Every contender walks the same order, so
+    // concurrent first claims race the same first available bind. A loser
+    // probes that just-bound endpoint and joins instead of advancing past it.
     for port in identity.ports() {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         match TcpListener::bind(addr).await {

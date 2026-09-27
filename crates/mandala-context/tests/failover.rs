@@ -14,11 +14,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, CallError, ContextIdentity, ContextSession, FleetContext, HostConfig,
-    HostConfigFactory, acquire, discovery,
+    AcquireError, Acquired, CallError, ContextIdentity, ContextSession, FleetContext, HostConfig,
+    HostConfigFactory, RunningHost, acquire, discovery,
 };
 
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)
@@ -92,6 +93,27 @@ async fn lead_as_a(
         Acquired::Leader(host) => host,
         Acquired::Follower(_) => panic!("no prior context — A must lead"),
     }
+}
+
+/// Hold the identity's first candidate port with a valid context for another
+/// flake, forcing our leader onto a later walked port.
+async fn occupy_first_as_foreign(identity: &ContextIdentity) -> RunningHost {
+    let port = identity.ports().next().unwrap();
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let (events, _) = broadcast::channel(8);
+    let calls = Arc::new(AtomicUsize::new(0));
+    RunningHost::start(
+        listener,
+        discovery::mint_token(),
+        "/foreign/checkout".to_string(),
+        HostConfig {
+            dispatch: labeled_dispatch("foreign", calls, events.clone()),
+            events,
+            heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+        },
+    )
 }
 
 // ---- kill a leader mid-call -------------------------------------------------
@@ -306,6 +328,87 @@ async fn simultaneous_promotion_race_has_exactly_one_winner() {
     for label in &served_by {
         assert_eq!(label, &winner, "every retry was served by the one winner");
     }
+}
+
+// ---- acquisition convergence ----------------------------------------------
+
+/// A joiner whose discovery snapshot carries the pre-rotation token must
+/// refresh that token and join the walked leader. It must not claim a free
+/// earlier port while the leader is publishing the rotated token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discovery_token_mismatch_refreshes_instead_of_binding() {
+    let (flake, state) = scratch("rotated-discovery");
+    let identity = ContextIdentity::with_port_range(&flake, 28825, 4).unwrap();
+    let first_port = identity.ports().next().unwrap();
+    let foreign = occupy_first_as_foreign(&identity).await;
+    let leader = lead_as_a(&identity, &state).await;
+    assert_ne!(
+        leader.port(),
+        first_port,
+        "foreign context forced a port walk"
+    );
+    drop(foreign);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let stale = discovery::read(&state, identity.key()).unwrap();
+    let fresh_token = leader.rotate_token().unwrap();
+    let fresh = discovery::read(&state, identity.key()).unwrap();
+    assert_eq!(fresh.token, fresh_token);
+    discovery::write(&state, identity.key(), &stale).unwrap();
+
+    let publish_state = state.clone();
+    let publish_key = identity.key().to_string();
+    let publisher = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        discovery::write(&publish_state, &publish_key, &fresh).unwrap();
+    });
+
+    let (events, _) = broadcast::channel(8);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = factory("joiner", calls, events);
+    match acquire(&identity, &state, "joiner", move || (cfg)())
+        .await
+        .unwrap()
+    {
+        Acquired::Follower(_) => {}
+        Acquired::Leader(_) => panic!("stale discovery token created a second leader"),
+    }
+    publisher.await.unwrap();
+}
+
+/// If discovery disappears while the leader owns a later walked port, a new
+/// process cannot authenticate, but it must fail safely rather than binding
+/// the now-free earlier port and splitting the context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_discovery_never_hides_a_walked_leader() {
+    let (flake, state) = scratch("missing-discovery");
+    let identity = ContextIdentity::with_port_range(&flake, 28830, 4).unwrap();
+    let first_port = identity.ports().next().unwrap();
+    let foreign = occupy_first_as_foreign(&identity).await;
+    let leader = lead_as_a(&identity, &state).await;
+    assert_ne!(
+        leader.port(),
+        first_port,
+        "foreign context forced a port walk"
+    );
+    drop(foreign);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    std::fs::remove_file(discovery::discovery_path(&state, identity.key())).unwrap();
+
+    let (events, _) = broadcast::channel(8);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = factory("joiner", calls, events);
+    let result = acquire(&identity, &state, "joiner", move || (cfg)()).await;
+    assert!(
+        matches!(result, Err(AcquireError::TokenUnavailable)),
+        "the live walked leader must block a second claim"
+    );
+
+    let free = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, first_port))
+        .await
+        .expect("the earlier port remains free; no second leader bound it");
+    drop(free);
+    drop(leader);
 }
 
 // ---- subscription resumption ------------------------------------------------

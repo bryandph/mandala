@@ -17,10 +17,17 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mandala_core::drift::to_pretty_1space;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Process-local uniqueness for discovery temp files. Combined with the pid,
+/// this separates concurrent writers both within one process and across
+/// processes. `create_new` below also protects against a stale temp file left
+/// by a prior process that happened to have the same pid.
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// One context's published coordination metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,19 +89,32 @@ pub fn write(state_dir: &Path, key: &str, discovery: &Discovery) -> io::Result<(
     root.insert("flake".to_string(), Value::from(discovery.flake.clone()));
     let bytes = to_pretty_1space(&root).map_err(io::Error::other)?;
 
-    let tmp = dir.join(format!("{key}.json.tmp"));
-    {
+    let (tmp, mut fh) = loop {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut fh = std::fs::OpenOptions::new()
+        let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{key}.json.{}.{id}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(&tmp)?;
+            .open(&tmp)
+        {
+            Ok(fh) => break (tmp, fh),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let result = (|| {
         fh.write_all(&bytes)?;
         fh.flush()?;
+        drop(fh);
+        std::fs::rename(&tmp, discovery_path(state_dir, key))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, discovery_path(state_dir, key))
+    result
 }
 
 /// Mint a fresh bearer token: 32 bytes of OS randomness, hex-encoded.
@@ -172,5 +192,41 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn concurrent_writers_use_independent_temp_files() {
+        let dir = scratch("concurrent");
+        let mut a = sample();
+        a.token = "aaaa".to_string();
+        let mut b = sample();
+        b.token = "bbbb".to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let write_one = |value: Discovery, barrier: std::sync::Arc<std::sync::Barrier>| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                write(&dir, "demo-concurrent", &value)
+            })
+        };
+        let writer_a = write_one(a.clone(), barrier.clone());
+        let writer_b = write_one(b.clone(), barrier.clone());
+        barrier.wait();
+
+        writer_a.join().unwrap().unwrap();
+        writer_b.join().unwrap().unwrap();
+        let published = read(&dir, "demo-concurrent").expect("one complete write wins");
+        assert!(published == a || published == b);
+
+        let leftovers: Vec<_> = std::fs::read_dir(contexts_dir(&dir))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }
