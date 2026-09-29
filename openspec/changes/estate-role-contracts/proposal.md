@@ -1,4 +1,4 @@
-No public tracking issue yet.
+No public tracking issue.
 
 ## Why
 
