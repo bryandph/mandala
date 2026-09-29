@@ -1,0 +1,25 @@
+schema: spec-driven
+# Public repository: every artifact here must be organization-neutral.
+context: |
+  mandala is a public, organization-neutral Nix library. Changes and specs here
+  are read by operators and agents in any organization, including ones with
+  access to public GitHub only. Never name a specific organization's hosts,
+  domains, endpoints, people, or private repositories; use the fictional
+  fixtures (acme, globex, operator-alice) for examples.
+
+  Retrieve only task-relevant sources:
+  - Architecture and conventions: README.md, docs/convention.md, docs/patterns/.
+  - Schemas: schema/; pure functions: lib/; flake-parts wiring: flake-modules/.
+  - Examples and fixtures: examples/, templates/.
+rules:
+  proposal:
+    - 'Link the public tracking issue if one exists; private trackers are never linked from this repository.'
+    - 'State a "Non-goals" section explicitly.'
+    - 'Pointers not values: reference the file that holds a fact rather than pasting drift-prone current state.'
+  design:
+    - 'Record decisions with alternatives and rationale.'
+    - 'Examples use fictional organizations and operators only.'
+    - 'Artifact completeness is not approval; obtain approval of the plan and unresolved decisions before implementation.'
+  tasks:
+    - 'Keep tasks shippable in small increments; add new behavior additively before switching consumers.'
+    - 'Include format and verification gates naming targeted checks (nix fmt, nix build .#checks.<system>.<name>).'
