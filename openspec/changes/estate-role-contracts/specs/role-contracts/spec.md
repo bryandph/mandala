@@ -66,7 +66,7 @@ Each role SHALL add conformance checks that force its contract data and relevant
 
 ### Requirement: Fictional candidate fixtures
 
-Direct and proxy project fixtures SHALL consume fictional orgs and the candidate engine. Root inputs SHALL be limited to nixpkgs and structural flake-parts/import-tree inputs. This slice SHALL require no delivery-tool input.
+Direct and proxy project fixtures SHALL consume fictional orgs and the candidate engine. Root inputs SHALL be exactly nixpkgs and the structural flake-parts/import-tree inputs, as the modified `mandala-engine` purity invariant requires. This slice SHALL require no delivery-tool input.
 
 #### Scenario: Candidate graph
 - **WHEN** CI overrides the fixture engine to the candidate implementation

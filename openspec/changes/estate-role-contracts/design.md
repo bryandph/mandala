@@ -85,7 +85,7 @@ Alternative: assert substituter list order in evaluation only. Rejected because 
 
 Role metadata lives at `mandala.role`; data lives at `mandala.contract.*`. Keep that location for this experimental interface rather than promise a later flattening. Existing aggregate keys remain unchanged. Existing consumers that do not import a role gain no new mandatory fields.
 
-Mandala root inputs remain limited to nixpkgs and optional structural inputs flake-parts/import-tree. A fixture proxy is not a production profiles implementation. All fixture checks use public or local fictional sources; no real org inputs are required.
+Mandala root inputs become exactly nixpkgs plus the structural inputs flake-parts and import-tree, with flake-parts following the engine's nixpkgs and all three overridable by consumers. This modifies the `mandala-engine` purity invariant: the structural inputs define the module structure consumers share (role modules, flake-parts wiring), while `lib`/schemas keep depending only on `nixpkgs.lib` and delivery tools stay consumer-owned. Alternative: keep nixpkgs as the only input and have consumers supply flake-parts, as existing flake-modules do. Rejected: every estate flake is expected to share mandala's structure, so mandala should define it rather than inherit whichever copy each consumer brings. A fixture proxy is not a production profiles implementation. All fixture checks use public or local fictional sources; no real org inputs are required.
 
 ## Verification
 

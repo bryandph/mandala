@@ -26,11 +26,13 @@ This change proves one complete path with fictional data: org schema → explici
 
 ### Modified Capabilities
 
-None. The existing fleet schema and aggregate are unchanged.
+- `mandala-engine`: the purity invariant changes from "nixpkgs is the only flake input" to "nixpkgs plus the structural inputs `flake-parts` and `import-tree`, all overridable by consumers". Delivery tools and toolchains stay out of the engine's inputs, and `lib`/schemas still depend only on `nixpkgs.lib`.
+
+The existing fleet schema and aggregate are unchanged.
 
 ## Impact
 
-New contract schemas, role modules, NixOS adapter, fictional fixtures, and targeted CI checks. The root may add the structural inputs `flake-parts` and `import-tree`; delivery tools remain consumer-owned. No private source or live system is required to verify this change.
+New contract schemas, role modules, NixOS adapter, fictional fixtures, and targeted CI checks. The root adds the structural inputs `flake-parts` and `import-tree` (a `mandala-engine` requirement change); delivery tools remain consumer-owned. No private source or live system is required to verify this change.
 
 ## Non-goals
 

@@ -3,7 +3,7 @@
 - [ ] 1.1 Record existing targeted checks and the showcase JSON aggregate as the parity baseline.
 - [ ] 1.2 Build a minimal org → proxy → project graph against the candidate source. Prove narHash metadata availability, provider wrapping, canonical follows paths, and metadata inspection without building or recursive evaluation.
 - [ ] 1.3 Demonstrate rejection of different engine sources that advertise the same contract version. Stop for a design revision if source agreement cannot be established as specified.
-- [ ] 1.4 Add only the needed structural inputs and document consumer-owned nixpkgs/tool inputs. Recheck existing behavior.
+- [ ] 1.4 Add the `flake-parts` (following nixpkgs) and `import-tree` inputs per the `mandala-engine` delta; document consumer-owned nixpkgs/tool inputs and the `follows` overrides. Recheck existing behavior, confirm `lib`/schemas reference only `nixpkgs.lib`, and confirm the lock's root inputs are exactly the three allowed.
 
 ## 2. Org schema and selection
 
