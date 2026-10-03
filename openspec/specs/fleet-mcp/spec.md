@@ -2,7 +2,6 @@
 
 ## Purpose
 The `mandala mcp` stdio server: read, drift, deploy-monitoring and confirmation-gated action tools over the fleet inventory, reusing the same cores as the CLI and TUI so tool behavior stays at parity across frontends and implementation swaps.
-
 ## Requirements
 ### Requirement: MCP server over the inventory, reusing the cores
 The system SHALL provide an MCP server, packaged in the mandala repo, that
@@ -52,8 +51,11 @@ The server SHALL expose deployed-generation drift as the same
 `DriftStatus`/`DriftEntry` judgement the dashboard uses, including
 `reboot-pending` when the installed system profile equals the expected
 generation while the running generation differs. Exact-path equality and
-distinct stale, incomplete, never-surveyed, and unreachable statuses SHALL
-remain shared with the CLI/TUI core. The expensive inputs — the read-only
+distinct stale, incomplete, never-surveyed, unreachable, and eval-failed
+statuses SHALL remain shared with the CLI/TUI core. When an opted-in
+evaluation fails for some members, the tool SHALL report `ok: false`, list
+the failed members, carry each one's error on its entry, and MUST NOT cache
+the partial expectation. The expensive inputs — the read-only
 state survey and expected-toplevel evaluation — SHALL run only when the
 request explicitly opts into them; a plain drift read uses existing snapshots
 and the rev-keyed expectation cache without surveying or re-evaluating. A
@@ -81,6 +83,10 @@ included for diagnosis but MUST NOT be labeled freshly refreshed.
 - **WHEN** a member's snapshot is older than the staleness threshold
 - **THEN** the server reports it as stale, matching the dashboard, not as
   in-sync, reboot-pending, or drift
+
+#### Scenario: a partial evaluation is reported per host
+- **WHEN** a client opts into evaluation and one member's configuration fails
+- **THEN** the tool returns `ok: false` with that member listed as failed, its entry reads eval-failed with its error, the other members are judged normally, and nothing is cached
 
 ### Requirement: Deploy monitoring across frontends
 The server SHALL report live and recent deploy state — per-host states and
@@ -446,3 +452,4 @@ target whether boot mode is true or false.
 - **WHEN** a client queries a run launched in boot mode
 - **THEN** the launch result and curated or diagnostic deploy status identify
   `boot=true`
+

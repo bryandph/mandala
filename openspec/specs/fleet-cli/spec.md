@@ -132,7 +132,14 @@ revision: a clean-rev match reuses the cache without re-evaluating, and a
 mismatch is surfaced as "contract moved". Snapshots older than a staleness
 threshold, incomplete snapshots, never-surveyed members, and unreachable
 members SHALL be judged as distinct statuses rather than folded into
-in-sync, reboot-pending, or drift. A drift refresh SHALL run expected-toplevel
+in-sync, reboot-pending, or drift. Expected-toplevel evaluation SHALL isolate
+failures per member: a failure confined to one member's configuration SHALL
+be reported against that member while every other member still evaluates,
+and that member SHALL be judged `eval-failed`, carrying its evaluation error,
+in place of any status that needs the expectation (in-sync, drift,
+reboot-pending, activated). A partial evaluation MUST NOT be written to the
+expectation cache, and `drift --eval` SHALL still report every member but
+exit non-zero when any member failed. A drift refresh SHALL run expected-toplevel
 evaluation and the read-only state survey concurrently from one operator
 gesture and SHALL also run automatically once a deploy or reboot completes.
 The survey SHALL run in the background rather than as a blocking view,
@@ -169,6 +176,14 @@ reporting a running count of host snapshots written so far in the top bar.
 #### Scenario: old data never claims in-sync
 - **WHEN** a member's snapshot is older than the staleness threshold
 - **THEN** its status reads stale, not in-sync, reboot-pending, or drift
+
+#### Scenario: one broken member never hides the others
+- **WHEN** expected evaluation runs and one member's configuration fails to evaluate
+- **THEN** every other member is judged against its evaluated expectation and the failed member reads eval-failed with its error, never in-sync, drift, reboot-pending, or activated
+
+#### Scenario: a partial evaluation is not cached
+- **WHEN** expected evaluation completes with any member failed
+- **THEN** the rev-keyed expectation cache is not written, and `drift --eval` exits non-zero after reporting every member
 
 ### Requirement: Deploy UI completion is rollback-aware
 The deploy-runner SHALL derive its terminal success indicator, exit value,
@@ -425,3 +440,4 @@ per-host state colors.
 - **WHEN** a multi-host deploy is in flight
 - **THEN** the deploy view renders a progress gauge reflecting completed
   versus total hosts
+
