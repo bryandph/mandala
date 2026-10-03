@@ -9,7 +9,6 @@
 //! ansible/nix/network. [`RealEffects`] is the production implementation over
 //! the `mandala-core` runner/drift/eval cores.
 
-use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -89,13 +88,14 @@ pub trait Effects: Send + Sync {
     async fn fresh_inventory(&self, flake: &str) -> Result<Inventory, InventoryError>;
 
     /// Expected toplevel out-paths for `members` (the slow eval behind
-    /// `host_eval toplevel=true` and `drift do_eval=true`). Failures are
-    /// returned structured, never raised to the transport.
+    /// `host_eval toplevel=true` and `drift do_eval=true`). A whole-eval
+    /// failure is returned structured, never raised to the transport; a
+    /// failure confined to one member lands in [`drift::Toplevels::errors`].
     async fn eval_expected(
         &self,
         flake: &str,
         members: &[String],
-    ) -> Result<BTreeMap<String, String>, EvalFailure>;
+    ) -> Result<drift::Toplevels, EvalFailure>;
 
     /// The contract's git rev (`-dirty`-suffixed), `None` on any git failure.
     async fn repo_rev(&self, flake: &str) -> Option<String>;
@@ -209,7 +209,7 @@ impl Effects for RealEffects {
         &self,
         flake: &str,
         members: &[String],
-    ) -> Result<BTreeMap<String, String>, EvalFailure> {
+    ) -> Result<drift::Toplevels, EvalFailure> {
         let evaluator = Arc::clone(&self.evaluator);
         let flake = flake.to_string();
         let members = members.to_vec();

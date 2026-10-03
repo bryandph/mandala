@@ -327,6 +327,48 @@ async fn leader_and_follower_paths_are_byte_identical() {
     );
     read_both(follower, local, "drift", &json!({"do_eval": true})).await;
 
+    // One member's configuration fails: the rest still evaluate, the failed
+    // host is `eval-failed` with its error, and nothing is cached.
+    let partial = || mandala_core::drift::Toplevels {
+        paths: [("cache".to_string(), "/nix/store/aaa-cache".to_string())].into(),
+        errors: [("web".to_string(), "error: web is broken".to_string())].into(),
+    };
+    install(
+        &slot,
+        handler(
+            FakeEffects {
+                rev: Some("deadbeef".to_string()),
+                eval: Some(Ok(partial())),
+                ..FakeEffects::default()
+            },
+            &events,
+        ),
+    );
+    let partial_drift = read_both(follower, local, "drift", &json!({"do_eval": true})).await;
+    assert_eq!(partial_drift["ok"], json!(false));
+    assert_eq!(partial_drift["eval_failed"], json!(["web"]));
+    let web = partial_drift["entries"]
+        .as_array()
+        .and_then(|es| es.iter().find(|e| e["host"] == "web"))
+        .expect("web entry");
+    assert_eq!(web["eval_error"], json!("error: web is broken"));
+    assert!(
+        !state.join(".expected.json").exists(),
+        "a partial eval is never cached"
+    );
+    let web_eval = read_both(
+        follower,
+        local,
+        "host_eval",
+        &json!({"member": "web", "toplevel": true}),
+    )
+    .await;
+    assert_eq!(web_eval["toplevel"], Value::Null);
+    assert_eq!(
+        web_eval["eval_error"]["output"],
+        json!("error: web is broken")
+    );
+
     // ---- reload (executes AT the leader; forwarded like any mutation) -------
     install(
         &slot,

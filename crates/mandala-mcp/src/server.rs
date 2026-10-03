@@ -463,9 +463,22 @@ impl MandalaHandler {
                 .await
             {
                 Ok(evaluated) => {
-                    result["toplevel"] = evaluated
-                        .get(&t.member)
-                        .map_or(Value::Null, |p| Value::from(p.clone()));
+                    if let Some(err) = evaluated.errors.get(&t.member) {
+                        let failure = EvalFailure {
+                            command: None,
+                            exit_code: None,
+                            output: err.clone(),
+                        };
+                        result["eval_error"] = failure_value(
+                            &format!("toplevel eval failed for {}", t.member),
+                            &failure,
+                        );
+                    } else {
+                        result["toplevel"] = evaluated
+                            .paths
+                            .get(&t.member)
+                            .map_or(Value::Null, |p| Value::from(p.clone()));
+                    }
                 }
                 Err(f) => {
                     result["eval_error"] =
@@ -505,7 +518,7 @@ impl MandalaHandler {
         let state_dir = drift::state_dir();
         let rev = self.state.effects.repo_rev(&self.state.flake).await;
         let (cached_rev, cached) = drift::load_expected(&state_dir);
-        let mut expected: Option<BTreeMap<String, String>> = None;
+        let mut expected: Option<drift::Toplevels> = None;
         if t.do_eval.unwrap_or(false) {
             match self
                 .state
@@ -514,9 +527,18 @@ impl MandalaHandler {
                 .await
             {
                 Ok(evaluated) => {
-                    // Best-effort cache write; a read-only state dir must not
-                    // sink an otherwise successful eval.
-                    let _ = drift::save_expected(rev.as_deref(), &evaluated, &state_dir);
+                    if evaluated.is_complete() {
+                        // Best-effort cache write; a read-only state dir must
+                        // not sink an otherwise successful eval.
+                        let _ = drift::save_expected(rev.as_deref(), &evaluated.paths, &state_dir);
+                    } else {
+                        // Partial: never cached (a map with holes would later
+                        // read as "not evaluated"); each failed host is an
+                        // `eval-failed` entry carrying its `eval_error`.
+                        result["ok"] = Value::Bool(false);
+                        result["eval_failed"] =
+                            Value::from(evaluated.errors.keys().cloned().collect::<Vec<String>>());
+                    }
                     expected = Some(evaluated);
                     result["expected_source"] = Value::from("eval");
                 }
@@ -525,7 +547,7 @@ impl MandalaHandler {
                 }
             }
         } else if drift::cache_fresh(cached_rev.as_deref(), rev.as_deref()) {
-            expected = Some(cached);
+            expected = Some(cached.into());
             result["expected_source"] = Value::from("cache");
         }
 

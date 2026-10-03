@@ -24,7 +24,6 @@
 //! claim. Note the indent asymmetry with the state files, which are `indent=1`
 //! (see [`crate::drift::to_pretty_1space`]).
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
@@ -533,12 +532,16 @@ fn run_drift(inv: &Inventory, flake: &str, m: &ArgMatches) -> ExitCode {
     let rev = drift::repo_rev(flake);
     let state = drift::state_dir();
     let (cached_rev, cached) = drift::load_expected(&state);
-    let mut expected: Option<BTreeMap<String, String>> = None;
+    let mut expected: Option<drift::Toplevels> = None;
     if do_eval {
         let mut evaluator = Evaluator::from_env();
         match drift::eval_expected(&mut evaluator, flake, &nodes) {
             Ok(exp) => {
-                let _ = drift::save_expected(rev.as_deref(), &exp, &state);
+                // Only a complete evaluation is cached: a map with holes
+                // would later read as "not evaluated" for the failed hosts.
+                if exp.is_complete() {
+                    let _ = drift::save_expected(rev.as_deref(), &exp.paths, &state);
+                }
                 expected = Some(exp);
             }
             Err(err) => {
@@ -558,7 +561,7 @@ fn run_drift(inv: &Inventory, flake: &str, m: &ArgMatches) -> ExitCode {
             }
         }
     } else if drift::cache_fresh(cached_rev.as_deref(), rev.as_deref()) {
-        expected = Some(cached);
+        expected = Some(cached.into());
     }
 
     let snapshots = drift::read_snapshots(&state);
@@ -570,9 +573,25 @@ fn run_drift(inv: &Inventory, flake: &str, m: &ArgMatches) -> ExitCode {
         Utc::now(),
     );
 
+    // Per-host eval failures: the table still renders (every other host was
+    // judged), the errors go to stderr, and the exit is a failure.
+    let eval_failures = expected.as_ref().map_or(0, |exp| exp.errors.len());
+    let finish = || {
+        if let Some(exp) = expected.as_ref().filter(|exp| !exp.is_complete()) {
+            eprintln!("expected-toplevel eval failed for {eval_failures} host(s):");
+            for (host, err) in &exp.errors {
+                let last = err.lines().last().unwrap_or("").trim();
+                eprintln!("  {host}: {last}");
+            }
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    };
+
     if as_json {
         println!("{}", to_pretty_2space(&entries));
-        return ExitCode::SUCCESS;
+        return finish();
     }
 
     let rows: Vec<Vec<String>> = entries
@@ -602,7 +621,7 @@ fn run_drift(inv: &Inventory, flake: &str, m: &ArgMatches) -> ExitCode {
             cached_rev.as_deref(),
         ),
     );
-    ExitCode::SUCCESS
+    finish()
 }
 
 /// The drift table caption for the four expected-cache states — a 1:1 port of
@@ -726,6 +745,8 @@ fn print_table(headers: &[&str], rows: &[Vec<String>], caption: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use serde_json::json;
 

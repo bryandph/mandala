@@ -7,7 +7,6 @@
 
 #![allow(dead_code)] // each test binary uses its own subset
 
-use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -67,7 +66,7 @@ pub struct FakeEffects {
     /// `subprocess.run` stand-in for ping / restart_service.
     pub adhoc: Option<Result<AdhocOutput, AdhocError>>,
     /// `drift.eval_expected` stand-in.
-    pub eval: Option<Result<BTreeMap<String, String>, EvalFailure>>,
+    pub eval: Option<Result<mandala_core::drift::Toplevels, EvalFailure>>,
     /// `drift.repo_rev` stand-in.
     pub rev: Option<String>,
     /// Read-only survey result for drift refresh tests.
@@ -103,7 +102,7 @@ impl Effects for FakeEffects {
         &self,
         _flake: &str,
         _members: &[String],
-    ) -> Result<BTreeMap<String, String>, EvalFailure> {
+    ) -> Result<mandala_core::drift::Toplevels, EvalFailure> {
         self.eval
             .clone()
             .expect("unexpected eval_expected call (no fake configured)")

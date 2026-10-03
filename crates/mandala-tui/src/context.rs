@@ -269,11 +269,12 @@ pub fn spawn_context_load(
 
 /// The `S` expected-toplevel eval over the context: `drift {do_eval: true}`
 /// evaluates at the leader AND writes the shared `.expected.json` cache
-/// (same state dir); the expected map is read back off the entries. An
-/// `eval_error` in the result surfaces exactly like a local eval failure.
+/// (same state dir); the expected map and any per-host `eval_error`s are
+/// read back off the entries. A whole-eval `eval_error` in the result
+/// surfaces exactly like a local eval failure.
 async fn eval_expected_over_context(
     session: &ContextSession,
-) -> Result<Result<(Option<String>, BTreeMap<String, String>), String>, ReadFailure> {
+) -> Result<Result<(Option<String>, drift::Toplevels), String>, ReadFailure> {
     let view = call_structured(session, "drift", json!({"do_eval": true})).await?;
     if let Some(err) = view.get("eval_error") {
         let msg = err
@@ -283,18 +284,21 @@ async fn eval_expected_over_context(
         return Ok(Err(format!("eval failed: {msg}")));
     }
     let rev = view.get("rev").and_then(Value::as_str).map(str::to_string);
-    let mut expected = BTreeMap::new();
+    let mut expected = drift::Toplevels::default();
     for entry in view
         .get("entries")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        if let (Some(host), Some(top)) = (
-            entry.get("host").and_then(Value::as_str),
-            entry.get("expected").and_then(Value::as_str),
-        ) {
-            expected.insert(host.to_string(), top.to_string());
+        let Some(host) = entry.get("host").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(top) = entry.get("expected").and_then(Value::as_str) {
+            expected.paths.insert(host.to_string(), top.to_string());
+        }
+        if let Some(err) = entry.get("eval_error").and_then(Value::as_str) {
+            expected.errors.insert(host.to_string(), err.to_string());
         }
     }
     Ok(Ok((rev, expected)))

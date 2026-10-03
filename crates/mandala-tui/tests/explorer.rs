@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use mandala_core::drift::Snapshot;
+use mandala_core::drift::{DriftStatus, Snapshot};
 use mandala_core::inventory::Inventory;
 use mandala_tui::event::AppEvent;
 use mandala_tui::explorer::{fresh_snapshots, run_survey};
@@ -141,6 +141,38 @@ fn deploy_target_marks_group_rows_as_mandala_group_selectors() {
 // ---- status machinery -------------------------------------------------------
 
 #[test]
+fn a_per_host_eval_failure_marks_only_that_host() {
+    let mut state = filled_state();
+    let (eval, _) = state.refresh_drift();
+    assert!(eval);
+    let expected = mandala_core::drift::Toplevels {
+        paths: [(
+            "cache".to_string(),
+            "/nix/store/curcache-toplevel".to_string(),
+        )]
+        .into(),
+        errors: [("web".to_string(), "error: web is broken".to_string())].into(),
+    };
+    let _ = state.on_drift_eval_finished(
+        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), expected)),
+        &snapshots(),
+        now(),
+    );
+    let status = |name: &str| {
+        state
+            .drift_rows
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.status)
+    };
+    assert_eq!(status("cache"), Some(DriftStatus::InSync));
+    assert_eq!(status("web"), Some(DriftStatus::EvalFailed));
+    // The partial result is a sticky error naming the failed host.
+    state.on_survey_done(2, 0, None, &snapshots(), now());
+    assert_eq!(state.status, "eval failed for 1 host(s): web");
+}
+
+#[test]
 fn sticky_error_survives_a_concurrent_success() {
     let mut state = filled_state();
     let (eval, survey) = state.refresh_drift();
@@ -193,7 +225,7 @@ fn spinner_line_lists_every_running_job_with_one_shared_frame() {
     );
     // Idle again: the resting message, and idle ticks change nothing.
     let _ = state.on_drift_eval_finished(
-        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), BTreeMap::new())),
+        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), Default::default())),
         &snapshots(),
         now(),
     );
@@ -318,7 +350,7 @@ fn reload_queued_behind_an_expected_eval_runs_after_it() {
     assert!(state.reload_pending);
     // The eval settles → the queued reload starts.
     let follow_up = state.on_drift_eval_finished(
-        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), BTreeMap::new())),
+        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), Default::default())),
         &snapshots(),
         now(),
     );
@@ -337,7 +369,8 @@ fn drift_caption_expected_fresh() {
             BTreeMap::from([(
                 "cache".to_string(),
                 "/nix/store/curcache-toplevel".to_string(),
-            )]),
+            )])
+            .into(),
         )),
         &snapshots(),
         now(),

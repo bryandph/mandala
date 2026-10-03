@@ -233,7 +233,11 @@ pub fn spawn_eval_expected(
             let expected = drift::eval_expected(&mut evaluator, &cfg.flake, &nodes)
                 .map_err(|e| format!("eval failed: {e}"))?;
             let rev = drift::repo_rev(&cfg.flake);
-            let _ = drift::save_expected(rev.as_deref(), &expected, &drift::state_dir());
+            // Only a complete eval is cached (a partial map would later read
+            // as "not evaluated" for the failed hosts).
+            if expected.is_complete() {
+                let _ = drift::save_expected(rev.as_deref(), &expected.paths, &drift::state_dir());
+            }
             Ok((rev, expected))
         })();
         let _ = tx.blocking_send(AppEvent::DriftEvalFinished { result });

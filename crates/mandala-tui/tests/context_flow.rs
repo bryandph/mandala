@@ -501,14 +501,15 @@ impl Effects for StubEffects {
         &self,
         _flake: &str,
         members: &[String],
-    ) -> Result<BTreeMap<String, String>, EvalFailure> {
+    ) -> Result<mandala_core::drift::Toplevels, EvalFailure> {
         if let Some(count) = &self.expected_eval_count {
             count.fetch_add(1, Ordering::SeqCst);
         }
         Ok(members
             .iter()
             .map(|m| (m.clone(), format!("/nix/store/expected-{m}")))
-            .collect())
+            .collect::<BTreeMap<_, _>>()
+            .into())
     }
     async fn repo_rev(&self, _flake: &str) -> Option<String> {
         None

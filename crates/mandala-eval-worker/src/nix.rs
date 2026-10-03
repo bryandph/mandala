@@ -66,6 +66,14 @@ use serde_json::Value as Json;
 /// A human-readable evaluation error (the worker never surfaces raw bytes).
 pub type EvalError = String;
 
+/// Per-member result of [`Evaluator::expected_toplevels`]: evaluated
+/// out-paths, and the error for each member whose configuration failed.
+#[derive(Debug, Default)]
+pub struct Toplevels {
+    pub paths: BTreeMap<String, String>,
+    pub errors: BTreeMap<String, EvalError>,
+}
+
 /// Render any error type that carries a `Display` impl as an [`EvalError`]. The
 /// safe crate's `Error` is `Display`, and the aggregate / toplevel paths carry
 /// no secrets, so this stays diagnostic.
@@ -370,16 +378,34 @@ impl Evaluator {
     }
 
     /// Expected toplevel out-paths for `members` (parity with
-    /// `drift.eval_expected`), one warm navigation per member.
+    /// `drift.eval_expected`), one warm navigation per member. A failure
+    /// shared by every member (locking the flake, forcing its outputs or
+    /// `nixosConfigurations`) fails the call; a failure in one member's
+    /// configuration is recorded against that member alone, so one broken
+    /// host never hides the others. Members without a configuration are
+    /// absent from both maps.
     pub fn expected_toplevels(
         &mut self,
         flake: &str,
         members: &[String],
-    ) -> Result<BTreeMap<String, String>, EvalError> {
-        let mut out = BTreeMap::new();
+    ) -> Result<Toplevels, EvalError> {
+        self.ensure_locked(flake)?;
+        {
+            let outputs = self.outputs(flake)?;
+            force(&outputs)?;
+            let cfgs = outputs.get_attr("nixosConfigurations").map_err(e2s)?;
+            force(&cfgs)?;
+        }
+        let mut out = Toplevels::default();
         for m in members {
-            if let Some(path) = self.host_toplevel(flake, m)? {
-                out.insert(m.clone(), path);
+            match self.host_toplevel(flake, m) {
+                Ok(Some(path)) => {
+                    out.paths.insert(m.clone(), path);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    out.errors.insert(m.clone(), e);
+                }
             }
         }
         Ok(out)

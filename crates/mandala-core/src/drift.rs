@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::eval::Evaluator;
+pub use crate::eval::Toplevels;
 
 /// The evaluated-expectations cache filename. Cached keyed by the contract's
 /// git rev: equal CLEAN revs guarantee an identical contract, so the slow
@@ -152,11 +153,15 @@ pub enum DriftStatus {
     /// The survey could not reach the host.
     #[serde(rename = "unreachable")]
     Unreachable,
+    /// The host's expected toplevel failed to evaluate, so nothing can be
+    /// judged against it (other members still evaluated).
+    #[serde(rename = "eval-failed")]
+    EvalFailed,
 }
 
 impl DriftStatus {
     /// Every status, for exhaustive iteration (the parity of `set(DriftStatus)`).
-    pub const ALL: [DriftStatus; 8] = [
+    pub const ALL: [DriftStatus; 9] = [
         DriftStatus::InSync,
         DriftStatus::Drift,
         DriftStatus::RebootPending,
@@ -165,6 +170,7 @@ impl DriftStatus {
         DriftStatus::Incomplete,
         DriftStatus::NoSnapshot,
         DriftStatus::Unreachable,
+        DriftStatus::EvalFailed,
     ];
 
     /// The stable string value (what the MCP `drift` tool surfaces).
@@ -179,6 +185,7 @@ impl DriftStatus {
             DriftStatus::Incomplete => "incomplete",
             DriftStatus::NoSnapshot => "no-snapshot",
             DriftStatus::Unreachable => "unreachable",
+            DriftStatus::EvalFailed => "eval-failed",
         }
     }
 
@@ -198,6 +205,7 @@ impl DriftStatus {
             DriftStatus::Incomplete => "dim red",
             DriftStatus::NoSnapshot => "dim",
             DriftStatus::Unreachable => "magenta",
+            DriftStatus::EvalFailed => "red",
         }
     }
 }
@@ -225,6 +233,10 @@ pub struct DriftEntry {
     pub system_profile: Option<String>,
     /// The snapshot's capture timestamp (ISO-8601), if recorded.
     pub captured_at: Option<String>,
+    /// Why this host's expected toplevel failed to evaluate. Omitted from
+    /// the serialized entry when there is no error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_error: Option<String>,
 }
 
 /// A per-host state snapshot written by the state playbook. Typed for the
@@ -321,18 +333,19 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// Locally evaluated toplevel out-paths for the given members, routed through
-/// the shared [`Evaluator`]. Host names are validated before they enter the
+/// the shared [`Evaluator`]. A member whose configuration fails is reported in
+/// [`Toplevels::errors`] rather than failing the others. Host names are validated before they enter the
 /// Nix expression: the aggregate is a versioned trust boundary, and a name
 /// containing `''` would otherwise escape the indented string.
 ///
 /// # Errors
 /// [`DriftError::InvalidMemberName`] if any name fails the guard (before any
-/// eval is attempted); [`DriftError::Eval`] if evaluation fails.
+/// eval is attempted); [`DriftError::Eval`] if evaluation fails as a whole.
 pub fn eval_expected(
     evaluator: &mut Evaluator,
     flake: &str,
     hosts: &[String],
-) -> Result<BTreeMap<String, String>, DriftError> {
+) -> Result<Toplevels, DriftError> {
     for name in hosts {
         if !valid_name(name) {
             return Err(DriftError::InvalidMemberName(name.clone()));
@@ -608,7 +621,11 @@ fn normalize_tokens(s: &str) -> String {
 /// expectation → [`DriftStatus::RebootPending`]; another current/expected
 /// mismatch → [`DriftStatus::Drift`]; a booted/current
 /// split → [`DriftStatus::RebootPending`] if a boot-critical fact moved else
-/// [`DriftStatus::Activated`]; otherwise [`DriftStatus::InSync`].
+/// [`DriftStatus::Activated`]; otherwise [`DriftStatus::InSync`]. A host
+/// whose expectation failed to evaluate is [`DriftStatus::EvalFailed`] in
+/// place of any judgement that needs the expectation (in-sync, drift,
+/// reboot-pending, activated); the survey-side statuses above still win, and
+/// every entry carries its `eval_error`.
 ///
 /// `max_age` is `Some(default_max_age())` in normal use; `None` disables the
 /// staleness check. `expected` is the loaded/evaluated cache (`None` == empty).
@@ -616,17 +633,18 @@ fn normalize_tokens(s: &str) -> String {
 pub fn compare(
     deploy_nodes: &[String],
     snapshots: &BTreeMap<String, Snapshot>,
-    expected: Option<&BTreeMap<String, String>>,
+    expected: Option<&Toplevels>,
     max_age: Option<TimeDelta>,
     now: DateTime<Utc>,
 ) -> Vec<DriftEntry> {
-    let empty = BTreeMap::new();
+    let empty = Toplevels::default();
     let expected = expected.unwrap_or(&empty);
     let mut nodes = deploy_nodes.to_vec();
     nodes.sort();
 
     let mut entries = Vec::with_capacity(nodes.len());
     for host in nodes {
+        let eval_error = expected.errors.get(&host).cloned();
         let Some(snap) = snapshots.get(&host) else {
             entries.push(DriftEntry {
                 host,
@@ -636,6 +654,7 @@ pub fn compare(
                 booted: None,
                 system_profile: None,
                 captured_at: None,
+                eval_error,
             });
             continue;
         };
@@ -643,7 +662,7 @@ pub fn compare(
         let booted = snap.booted.clone();
         let system_profile = snap.system_profile.clone();
         let captured_at = snap.captured_at.clone();
-        let exp = expected.get(&host).cloned();
+        let exp = expected.paths.get(&host).cloned();
 
         let status = if json_truthy(&snap.unreachable) {
             DriftStatus::Unreachable
@@ -653,6 +672,8 @@ pub fn compare(
             DriftStatus::Incomplete
         } else if too_old(captured_at.as_deref(), max_age, now) {
             DriftStatus::Stale
+        } else if eval_error.is_some() {
+            DriftStatus::EvalFailed
         } else if exp.is_some() && current != exp && system_profile == exp {
             DriftStatus::RebootPending
         } else if exp.is_some() && current != exp {
@@ -675,6 +696,7 @@ pub fn compare(
             booted,
             system_profile,
             captured_at,
+            eval_error,
         });
     }
     entries
@@ -771,11 +793,12 @@ mod tests {
         dir
     }
 
-    fn expect(hosts: &[&str]) -> BTreeMap<String, String> {
+    fn expect(hosts: &[&str]) -> Toplevels {
         hosts
             .iter()
             .map(|h| ((*h).to_string(), "/nix/store/aaa-x".to_string()))
-            .collect()
+            .collect::<BTreeMap<_, _>>()
+            .into()
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -1095,6 +1118,53 @@ mod tests {
         assert_eq!(entries["legacy-drift"].status, DriftStatus::Drift);
     }
 
+    // ---- eval-failed ----------------------------------------------------------
+
+    /// A host whose expectation failed to evaluate never reads in-sync,
+    /// drift, reboot-pending, or activated; the survey-side statuses still
+    /// win; every entry carries its error, and a clean entry serializes
+    /// without the field.
+    #[test]
+    fn a_failed_expectation_is_eval_failed_not_in_sync() {
+        let dir = tmp();
+        write_snap(&dir, "ok", json!({}));
+        write_snap(&dir, "broken", json!({}));
+        write_snap(
+            &dir,
+            "split",
+            json!({"current": "/nix/store/aaa-x", "booted": "/nix/store/zzz-old"}),
+        );
+        write_snap(&dir, "gone", json!({"unreachable": true}));
+        let mut expected = expect(&["ok"]);
+        for host in ["broken", "split", "gone", "never"] {
+            expected.errors.insert(host.to_string(), "boom".to_string());
+        }
+        let entries: BTreeMap<String, DriftEntry> = compare(
+            &["ok", "broken", "split", "gone", "never"].map(String::from),
+            &read_snapshots(&dir),
+            Some(&expected),
+            Some(default_max_age()),
+            now(),
+        )
+        .into_iter()
+        .map(|e| (e.host.clone(), e))
+        .collect();
+        assert_eq!(entries["ok"].status, DriftStatus::InSync);
+        assert_eq!(entries["broken"].status, DriftStatus::EvalFailed);
+        assert_eq!(entries["split"].status, DriftStatus::EvalFailed);
+        assert_eq!(entries["gone"].status, DriftStatus::Unreachable);
+        assert_eq!(entries["never"].status, DriftStatus::NoSnapshot);
+        for host in ["broken", "split", "gone", "never"] {
+            assert_eq!(entries[host].eval_error.as_deref(), Some("boom"));
+        }
+        assert_eq!(entries["ok"].eval_error, None);
+        let ok = serde_json::to_value(&entries["ok"]).unwrap();
+        assert!(ok.get("eval_error").is_none());
+        let broken = serde_json::to_value(&entries["broken"]).unwrap();
+        assert_eq!(broken["status"], "eval-failed");
+        assert_eq!(broken["eval_error"], "boom");
+    }
+
     // ---- test_activated_only_when_nothing_boot_critical_moved ---------------
 
     #[test]
@@ -1214,6 +1284,7 @@ mod tests {
             ("incomplete", "dim red"),
             ("no-snapshot", "dim"),
             ("unreachable", "magenta"),
+            ("eval-failed", "red"),
         ]);
         for status in DriftStatus::ALL {
             assert_eq!(expected.get(status.as_str()), Some(&status.style()));

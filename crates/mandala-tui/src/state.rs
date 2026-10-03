@@ -207,7 +207,7 @@ pub struct AppState {
     pub inventory: Option<Inventory>,
     /// Locally evaluated expected toplevels (from the fresh cache or an
     /// `S` eval); `None` = never evaluated for this contract.
-    pub expected: Option<BTreeMap<String, String>>,
+    pub expected: Option<drift::Toplevels>,
     /// The contract's rev at the last load/eval.
     pub rev: Option<String>,
     /// The rev the expected cache was evaluated at.
@@ -553,7 +553,7 @@ impl AppState {
         // Reuse the rev-keyed expected cache when the contract hasn't moved
         // since the last eval (a mismatch is itself the signal).
         if drift::cache_fresh(self.cached_rev.as_deref(), self.rev.as_deref()) {
-            self.expected = Some(cached);
+            self.expected = Some(cached.into());
         }
 
         self.member_rows = inventory
@@ -701,7 +701,7 @@ impl AppState {
     #[must_use]
     pub fn on_drift_eval_finished(
         &mut self,
-        result: Result<(Option<String>, BTreeMap<String, String>), String>,
+        result: Result<(Option<String>, drift::Toplevels), String>,
         snapshots: &BTreeMap<String, Snapshot>,
         now: DateTime<Utc>,
     ) -> Option<LoadRequest> {
@@ -711,8 +711,18 @@ impl AppState {
             Ok((rev, expected)) => {
                 self.rev = rev.clone();
                 self.cached_rev = rev;
+                // Per-host failures: the other hosts are judged, the failed
+                // ones read eval-failed, and the status line names them.
+                let partial = (!expected.is_complete()).then(|| {
+                    let hosts: Vec<&str> = expected.errors.keys().map(String::as_str).collect();
+                    format!(
+                        "eval failed for {} host(s): {}",
+                        hosts.len(),
+                        hosts.join(", ")
+                    )
+                });
                 self.expected = Some(expected);
-                None
+                partial
             }
             Err(e) => {
                 self.expected = None;
@@ -933,7 +943,7 @@ impl AppState {
         self.rev = rev;
         self.cached_rev = cached_rev;
         if drift::cache_fresh(self.cached_rev.as_deref(), self.rev.as_deref()) {
-            self.expected = Some(cached);
+            self.expected = Some(cached.into());
         }
         self.fill_drift(snapshots, now);
         self.set_status("drift refreshed (mcp)", false);
@@ -1279,7 +1289,7 @@ mod tests {
             &BTreeMap::new(),
             Utc::now(),
         );
-        assert_eq!(s.expected.as_ref(), Some(&cached));
+        assert_eq!(s.expected.as_ref().map(|e| &e.paths), Some(&cached));
         assert_eq!(s.status, "drift refreshed (mcp)");
         // A moved contract does not adopt the stale cache.
         let mut s = observer(false);

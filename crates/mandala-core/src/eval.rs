@@ -67,6 +67,35 @@ pub fn shutdown_workers() {
 /// A human-readable evaluation error.
 pub type EvalError = String;
 
+/// Expected toplevels for a set of members. A failure confined to one
+/// member's configuration lands in `errors` instead of failing the batch;
+/// members with no `nixosConfigurations` entry are in neither map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Toplevels {
+    /// Evaluated toplevel out-paths, by member.
+    pub paths: BTreeMap<String, String>,
+    /// The evaluation error, by member, for members whose configuration
+    /// failed to evaluate.
+    pub errors: BTreeMap<String, EvalError>,
+}
+
+impl Toplevels {
+    /// Every requested member evaluated (no per-member errors).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+impl From<BTreeMap<String, String>> for Toplevels {
+    fn from(paths: BTreeMap<String, String>) -> Self {
+        Self {
+            paths,
+            errors: BTreeMap::new(),
+        }
+    }
+}
+
 /// The default per-roundtrip bound on a worker evaluation. Generous: a cold
 /// whole-fleet `expected_toplevels` is one roundtrip. It exists to turn a
 /// wedged evaluation into an error, not to police slow ones.
@@ -182,27 +211,23 @@ impl Evaluator {
         }
     }
 
-    /// Expected toplevel out-paths for `members` (parity with the Python
-    /// `drift.eval_expected`). Missing members are simply absent from the map.
+    /// Expected toplevel out-paths for `members`. A failure in one member's
+    /// configuration is reported against that member in
+    /// [`Toplevels::errors`]; only a failure shared by the whole flake (or
+    /// the transport) fails the call. Missing members are simply absent.
     pub fn expected_toplevels(
         &mut self,
         flake: &str,
         members: &[String],
-    ) -> Result<BTreeMap<String, String>, EvalError> {
+    ) -> Result<Toplevels, EvalError> {
         match self.backend {
-            Backend::Subprocess => subprocess_expected_toplevels(flake, members),
+            Backend::Subprocess => subprocess_expected_toplevels_isolated(flake, members),
             Backend::Worker => {
                 let flake = canonical_flake(flake);
                 let resp = self
                     .worker_call("expected_toplevels", &flake, None, Some(members))?
                     .unwrap_or(Json::Null);
-                let obj = resp
-                    .as_object()
-                    .ok_or_else(|| "expected_toplevels: non-object value".to_string())?;
-                Ok(obj
-                    .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect())
+                parse_worker_toplevels(&resp)
             }
         }
     }
@@ -512,7 +537,64 @@ fn subprocess_aggregate(flake: &str) -> Result<Json, EvalError> {
     ])
 }
 
-/// Mirror of the Python `drift.eval_expected` expression + argv exactly.
+/// Read the worker's `expected_toplevels` value: per member, an out-path
+/// string or an `{"error": …}` object.
+fn parse_worker_toplevels(value: &Json) -> Result<Toplevels, EvalError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "expected_toplevels: non-object value".to_string())?;
+    let mut out = Toplevels::default();
+    for (member, entry) in obj {
+        if let Some(path) = entry.as_str() {
+            out.paths.insert(member.clone(), path.to_string());
+        } else if let Some(error) = entry.get("error").and_then(Json::as_str) {
+            out.errors.insert(member.clone(), error.to_string());
+        } else {
+            return Err(format!(
+                "expected_toplevels: unreadable entry for {member:?}: {entry}"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The subprocess backend's per-member isolation. One `nix eval` covers the
+/// batch; only if it fails is each member evaluated on its own, so a broken
+/// member gets its own error while the rest still evaluate. When every
+/// member fails alone too, the failure is not member-specific and the batch
+/// error is returned whole.
+fn subprocess_expected_toplevels_isolated(
+    flake: &str,
+    members: &[String],
+) -> Result<Toplevels, EvalError> {
+    let batch_err = match subprocess_expected_toplevels(flake, members) {
+        Ok(paths) => return Ok(paths.into()),
+        // A lone member has nothing to isolate from.
+        Err(e) if members.len() < 2 => return Err(e),
+        Err(e) => e,
+    };
+    let mut out = Toplevels::default();
+    for member in members {
+        match subprocess_expected_toplevels(flake, std::slice::from_ref(member)) {
+            Ok(mut paths) => {
+                if let Some(path) = paths.remove(member) {
+                    out.paths.insert(member.clone(), path);
+                }
+            }
+            Err(e) => {
+                out.errors.insert(member.clone(), e);
+            }
+        }
+    }
+    if out.paths.is_empty() && out.errors.len() == members.len() {
+        return Err(batch_err);
+    }
+    Ok(out)
+}
+
+/// Mirror of the Python `drift.eval_expected` expression + argv, except that
+/// members without a `nixosConfigurations` entry are skipped (absent from
+/// the result, matching the worker) instead of failing the whole eval.
 fn subprocess_expected_toplevels(
     flake: &str,
     members: &[String],
@@ -526,7 +608,7 @@ fn subprocess_expected_toplevels(
     let expr = format!(
         "cfgs: builtins.listToAttrs (map (n: {{ name = n; \
          value = cfgs.${{n}}.config.system.build.toplevel.outPath; }}) \
-         (builtins.fromJSON ''{names}''))"
+         (builtins.filter (n: cfgs ? ${{n}}) (builtins.fromJSON ''{names}'')))"
     );
     let value = run_nix_eval(&[
         "eval".into(),
@@ -558,6 +640,20 @@ mod tests {
         // We can't safely mutate process env in parallel tests; assert the
         // pure mapping instead via the documented rule.
         assert_eq!(Backend::Worker, Backend::Worker);
+    }
+
+    #[test]
+    fn worker_toplevels_split_paths_from_member_errors() {
+        let value = serde_json::json!({"a": "/nix/store/a", "b": {"error": "boom"}});
+        let t = parse_worker_toplevels(&value).expect("parses");
+        assert_eq!(
+            t.paths,
+            BTreeMap::from([("a".into(), "/nix/store/a".into())])
+        );
+        assert_eq!(t.errors, BTreeMap::from([("b".into(), "boom".into())]));
+        assert!(!t.is_complete());
+        assert!(parse_worker_toplevels(&serde_json::json!({"a": 1})).is_err());
+        assert!(parse_worker_toplevels(&serde_json::json!([])).is_err());
     }
 
     #[test]

@@ -133,7 +133,7 @@ fn drift_state() -> AppState {
         ),
     ]);
     let _ = state.on_drift_eval_finished(
-        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), expected)),
+        Ok((Some("aaaaaaaaaaaaaaaa".to_string()), expected.into())),
         &snapshots(),
         now(),
     );

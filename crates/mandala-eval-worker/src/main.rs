@@ -8,8 +8,10 @@
 //! → {"id":1,"op":"aggregate","flake":"/path/to/flake"}
 //! ← {"id":1,"ok":true,"value":{…}}
 //!
-//! → {"id":2,"op":"expected_toplevels","flake":"/p","members":["a","b"]}
-//! ← {"id":2,"ok":true,"value":{"a":"/nix/store/…","b":"/nix/store/…"}}
+//! → {"id":2,"op":"expected_toplevels","flake":"/p","members":["a","b","c"]}
+//! ← {"id":2,"ok":true,"value":{"a":"/nix/store/…","b":{"error":"…"}}}
+//!   // per member: its out-path, or {"error":…} when only that member's
+//!   // configuration failed; absent when it has no nixosConfigurations entry
 //!
 //! → {"id":3,"op":"host_eval","flake":"/p","member":"a"}
 //! ← {"id":3,"ok":true,"value":"/nix/store/…"}      // null if no such nixos host
@@ -72,6 +74,20 @@ impl Response {
     }
 }
 
+/// The `expected_toplevels` wire value: one entry per evaluated member, an
+/// out-path string or an `{"error": …}` object.
+fn toplevels_value(toplevels: nix::Toplevels) -> Json {
+    let mut obj: serde_json::Map<String, Json> = toplevels
+        .paths
+        .into_iter()
+        .map(|(k, v)| (k, Json::String(v)))
+        .collect();
+    for (member, error) in toplevels.errors {
+        obj.insert(member, serde_json::json!({ "error": error }));
+    }
+    Json::Object(obj)
+}
+
 fn handle(ev: &mut Evaluator, req: &Request) -> Response {
     match req.op.as_str() {
         "ping" => Response::ok(req.id, None),
@@ -91,10 +107,7 @@ fn handle(ev: &mut Evaluator, req: &Request) -> Response {
         "expected_toplevels" | "toplevel" => {
             let members = req.members.clone().unwrap_or_default();
             match ev.expected_toplevels(&req.flake, &members) {
-                Ok(map) => {
-                    let obj = map.into_iter().map(|(k, v)| (k, Json::String(v))).collect();
-                    Response::ok(req.id, Some(Json::Object(obj)))
-                }
+                Ok(toplevels) => Response::ok(req.id, Some(toplevels_value(toplevels))),
                 Err(e) => Response::err(req.id, e),
             }
         }
@@ -201,6 +214,17 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&v).unwrap(),
             r#"{"id":8,"ok":true,"value":"/nix/store/x"}"#
+        );
+    }
+
+    #[test]
+    fn toplevels_value_mixes_paths_and_member_errors() {
+        let mut t = nix::Toplevels::default();
+        t.paths.insert("a".into(), "/nix/store/a".into());
+        t.errors.insert("b".into(), "boom".into());
+        assert_eq!(
+            serde_json::to_string(&toplevels_value(t)).unwrap(),
+            r#"{"a":"/nix/store/a","b":{"error":"boom"}}"#
         );
     }
 

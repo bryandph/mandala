@@ -55,7 +55,7 @@ impl Effects for OrphanEffects {
         &self,
         _flake: &str,
         _members: &[String],
-    ) -> Result<std::collections::BTreeMap<String, String>, EvalFailure> {
+    ) -> Result<mandala_core::drift::Toplevels, EvalFailure> {
         panic!("unexpected eval_expected call")
     }
     async fn repo_rev(&self, _flake: &str) -> Option<String> {

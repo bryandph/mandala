@@ -5,8 +5,6 @@
 //! is touched. New sources (context events, subprocess output) add a
 //! variant here, never a second dispatch path.
 
-use std::collections::BTreeMap;
-
 use crossterm::event::{Event, MouseEvent};
 use tokio::time::Instant;
 
@@ -47,9 +45,10 @@ pub enum AppEvent {
         result: Result<LoadedInventory, String>,
     },
     /// The expected-toplevel eval settled: `(repo rev, toplevels)` on
-    /// success, the surfaced `eval failed: …` message on failure.
+    /// success (per-host failures inside), the surfaced `eval failed: …`
+    /// message when the eval failed as a whole.
     DriftEvalFinished {
-        result: Result<(Option<String>, BTreeMap<String, String>), String>,
+        result: Result<(Option<String>, mandala_core::drift::Toplevels), String>,
     },
     /// The survey's live fresh-snapshot tally moved.
     SurveyProgress { n: usize },
