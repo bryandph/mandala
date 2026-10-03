@@ -9,6 +9,11 @@
 //!   `EvalState` makes repeated evals (drift refresh, per-host toplevels)
 //!   effectively free. The worker is respawned on crash (one retry per call),
 //!   and `reload` replaces it so warm state never serves a moved contract.
+//!   Every roundtrip is bounded by `MANDALA_EVAL_TIMEOUT` (seconds, default
+//!   [`DEFAULT_TIMEOUT`]; `0` disables the bound): on expiry the worker is
+//!   killed, the call fails, and the next call starts a fresh worker. Every
+//!   reply must echo its request's `id`; a mismatch is a desynchronized
+//!   stream, handled like a crash.
 //! * `subprocess` — the build-selectable fallback: shell out to
 //!   `nix eval --no-warn-dirty --json`, byte-for-byte the argv the Python
 //!   porcelain uses. No warm state, no worker process; every call is cold.
@@ -18,9 +23,10 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
+use std::time::Duration;
 
 use serde_json::Value as Json;
 
@@ -61,6 +67,25 @@ pub fn shutdown_workers() {
 /// A human-readable evaluation error.
 pub type EvalError = String;
 
+/// The default per-roundtrip bound on a worker evaluation. Generous: a cold
+/// whole-fleet `expected_toplevels` is one roundtrip. It exists to turn a
+/// wedged evaluation into an error, not to police slow ones.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Resolve the roundtrip bound from `MANDALA_EVAL_TIMEOUT`: whole seconds,
+/// `0` for unbounded; unset or unparsable selects [`DEFAULT_TIMEOUT`].
+fn timeout_from_env() -> Option<Duration> {
+    parse_timeout(std::env::var("MANDALA_EVAL_TIMEOUT").ok().as_deref())
+}
+
+fn parse_timeout(raw: Option<&str>) -> Option<Duration> {
+    match raw.map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(0)) => None,
+        Some(Ok(secs)) => Some(Duration::from_secs(secs)),
+        _ => Some(DEFAULT_TIMEOUT),
+    }
+}
+
 /// Which evaluation backend to drive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -100,16 +125,19 @@ pub struct Evaluator {
     worker: Option<Worker>,
     next_id: u64,
     quiet: bool,
+    timeout: Option<Duration>,
 }
 
 impl Evaluator {
-    /// Build an evaluator with the backend chosen by `MANDALA_EVAL`.
+    /// Build an evaluator with the backend chosen by `MANDALA_EVAL` and the
+    /// roundtrip bound chosen by `MANDALA_EVAL_TIMEOUT`.
     #[must_use]
     pub fn from_env() -> Self {
-        Self::new(Backend::from_env())
+        Self::new(Backend::from_env()).timeout(timeout_from_env())
     }
 
-    /// Build an evaluator with an explicit backend.
+    /// Build an evaluator with an explicit backend and the
+    /// [`DEFAULT_TIMEOUT`] roundtrip bound.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
         Self {
@@ -117,7 +145,17 @@ impl Evaluator {
             worker: None,
             next_id: 1,
             quiet: false,
+            timeout: Some(DEFAULT_TIMEOUT),
         }
+    }
+
+    /// Bound each worker roundtrip (`None`: unbounded). On expiry the worker
+    /// is killed and the call fails without a retry — a wedged evaluation
+    /// would only wedge again. The subprocess backend is unaffected.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Silence child-evaluator stderr (the worker's chatter: dirty-tree
@@ -203,7 +241,8 @@ impl Evaluator {
 
     /// Send one request to the worker, (re)spawning it and retrying once on a
     /// transport failure (crash isolation: an evaluator abort kills only the
-    /// worker; we bring up a fresh one).
+    /// worker; we bring up a fresh one). A timeout kills the worker and fails
+    /// the call without a retry.
     fn worker_call(
         &mut self,
         op: &str,
@@ -229,7 +268,12 @@ impl Evaluator {
             }
             let line = Json::Object(req).to_string();
 
-            match self.worker.as_mut().unwrap().roundtrip(&line) {
+            match self
+                .worker
+                .as_mut()
+                .unwrap()
+                .roundtrip(&line, id, self.timeout)
+            {
                 Ok(resp) => {
                     let ok = resp.get("ok").and_then(Json::as_bool).unwrap_or(false);
                     if ok {
@@ -242,9 +286,19 @@ impl Evaluator {
                         .to_string();
                     return Err(err);
                 }
-                Err(transport) => {
-                    // The worker died mid-exchange: drop it and, on the first
-                    // failure, respawn and retry once.
+                Err(RoundtripError::Timeout(bound)) => {
+                    // Dropping the worker kills and reaps it; the next call
+                    // starts a fresh one.
+                    self.worker = None;
+                    return Err(format!(
+                        "eval worker timed out after {}s and was killed \
+                         (MANDALA_EVAL_TIMEOUT raises the bound; 0 disables it)",
+                        bound.as_secs_f64()
+                    ));
+                }
+                Err(RoundtripError::Transport(transport)) => {
+                    // The worker died or desynchronized mid-exchange: drop it
+                    // and, on the first failure, respawn and retry once.
                     self.worker = None;
                     if attempt == 1 {
                         return Err(format!("eval worker unavailable: {transport}"));
@@ -256,11 +310,22 @@ impl Evaluator {
     }
 }
 
+/// Why a worker roundtrip produced no usable reply.
+enum RoundtripError {
+    /// The pipe failed, the worker exited, or the reply was malformed or
+    /// answered a different request.
+    Transport(String),
+    /// No reply arrived within the bound.
+    Timeout(Duration),
+}
+
 /// A supervised child `mandala-eval-worker` process and its stdio pipes.
+/// Stdout is drained by a reader thread into `lines`, so a roundtrip can
+/// wait with a deadline instead of blocking in `read_line`.
 struct Worker {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    lines: mpsc::Receiver<std::io::Result<String>>,
 }
 
 impl Worker {
@@ -294,6 +359,10 @@ impl Worker {
         let Some(stdout) = child.stdout.take() else {
             return reject(child, "worker stdout unavailable");
         };
+        let lines = match spawn_reader(stdout) {
+            Ok(lines) => lines,
+            Err(e) => return reject(child, &format!("worker reader thread: {e}")),
+        };
         // Register under the lock, re-checking the latch: a kill sweep
         // racing this spawn must never miss the child.
         {
@@ -307,32 +376,80 @@ impl Worker {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines,
         })
     }
 
-    /// Write one request line and read one response line. Any IO failure (or a
-    /// closed stdout, i.e. the worker exited) is a transport error.
-    fn roundtrip(&mut self, line: &str) -> Result<serde_json::Map<String, Json>, EvalError> {
+    /// Write one request line and wait (up to `timeout`) for one response
+    /// line, which must echo request `id`. Any IO failure, a closed stdout
+    /// (the worker exited), or a malformed or mismatched reply is a
+    /// transport error.
+    fn roundtrip(
+        &mut self,
+        line: &str,
+        id: u64,
+        timeout: Option<Duration>,
+    ) -> Result<serde_json::Map<String, Json>, RoundtripError> {
+        let transport = RoundtripError::Transport;
         self.stdin
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.write_all(b"\n"))
             .and_then(|()| self.stdin.flush())
-            .map_err(|e| format!("write: {e}"))?;
-        let mut resp = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut resp)
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("worker closed stdout".to_string());
-        }
+            .map_err(|e| transport(format!("write: {e}")))?;
+        let received = match timeout {
+            Some(bound) => self.lines.recv_timeout(bound).map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => RoundtripError::Timeout(bound),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    transport("worker closed stdout".to_string())
+                }
+            })?,
+            None => self
+                .lines
+                .recv()
+                .map_err(|_| transport("worker closed stdout".to_string()))?,
+        };
+        let resp = received.map_err(|e| transport(format!("read: {e}")))?;
         let val: Json = serde_json::from_str(resp.trim())
-            .map_err(|e| format!("bad worker response {resp:?}: {e}"))?;
-        val.as_object()
+            .map_err(|e| transport(format!("bad worker response {resp:?}: {e}")))?;
+        let obj = val
+            .as_object()
             .cloned()
-            .ok_or_else(|| "worker response not an object".to_string())
+            .ok_or_else(|| transport("worker response not an object".to_string()))?;
+        match obj.get("id").and_then(Json::as_u64) {
+            Some(got) if got == id => Ok(obj),
+            got => Err(transport(format!(
+                "worker reply id {got:?} does not match request id {id}"
+            ))),
+        }
     }
+}
+
+/// Drain the worker's stdout line by line on a dedicated thread. The thread
+/// ends at EOF (the worker exited or was killed) or once the receiver is
+/// dropped, so a killed worker never strands it.
+fn spawn_reader(stdout: ChildStdout) -> std::io::Result<mpsc::Receiver<std::io::Result<String>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("mandala-eval-reader".to_string())
+        .spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(rx)
 }
 
 impl Drop for Worker {
@@ -441,6 +558,16 @@ mod tests {
         // We can't safely mutate process env in parallel tests; assert the
         // pure mapping instead via the documented rule.
         assert_eq!(Backend::Worker, Backend::Worker);
+    }
+
+    #[test]
+    fn timeout_env_parsing() {
+        assert_eq!(parse_timeout(None), Some(DEFAULT_TIMEOUT));
+        assert_eq!(parse_timeout(Some("30")), Some(Duration::from_secs(30)));
+        assert_eq!(parse_timeout(Some(" 45 ")), Some(Duration::from_secs(45)));
+        assert_eq!(parse_timeout(Some("0")), None);
+        assert_eq!(parse_timeout(Some("soon")), Some(DEFAULT_TIMEOUT));
+        assert_eq!(parse_timeout(Some("-1")), Some(DEFAULT_TIMEOUT));
     }
 
     #[test]

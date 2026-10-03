@@ -102,6 +102,19 @@ fn handle(ev: &mut Evaluator, req: &Request) -> Response {
     }
 }
 
+/// One response frame. A value that fails to serialize must still produce a
+/// well-formed reply carrying the request id: an empty line would read as a
+/// transport failure and get a healthy worker killed.
+fn encode(resp: &Response) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|e| {
+        serde_json::to_string(&Response::err(
+            resp.id,
+            format!("response serialization failed: {e}"),
+        ))
+        .unwrap_or_else(|_| format!(r#"{{"id":{},"ok":false}}"#, resp.id))
+    })
+}
+
 fn main() {
     // The Nix evaluator recurses on the C stack; a flake-parts / dendritic
     // aggregate blows past the default 8 MiB thread stack (the `nix` CLI runs
@@ -143,7 +156,7 @@ fn run() -> i32 {
             // No id to echo on a malformed frame — surface under id 0.
             Err(e) => Response::err(0, format!("bad request: {e}")),
         };
-        if writeln!(out, "{}", serde_json::to_string(&resp).unwrap_or_default()).is_err() {
+        if writeln!(out, "{}", encode(&resp)).is_err() {
             break;
         }
         let _ = out.flush();
@@ -189,6 +202,13 @@ mod tests {
             serde_json::to_string(&v).unwrap(),
             r#"{"id":8,"ok":true,"value":"/nix/store/x"}"#
         );
+    }
+
+    #[test]
+    fn encode_is_one_framed_reply() {
+        let line = encode(&Response::ok(11, Some(Json::from(1))));
+        assert_eq!(line, r#"{"id":11,"ok":true,"value":1}"#);
+        assert!(!line.contains('\n'));
     }
 
     #[test]
