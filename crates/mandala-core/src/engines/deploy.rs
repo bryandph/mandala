@@ -645,7 +645,6 @@ pub fn build_run_argv(flake: &str, targets: &[String], out_link: &Path) -> Vec<S
         "--keep-going".to_string(),
         "--log-format".to_string(),
         "internal-json".to_string(),
-        "--impure".to_string(),
         "--out-link".to_string(),
         out_link.display().to_string(),
     ]);
@@ -2320,7 +2319,7 @@ exit 0
     }
 
     #[test]
-    fn build_argv_is_one_targeted_impure_invocation() {
+    fn build_argv_is_one_targeted_pure_invocation() {
         let argv = build_run_argv(
             "/fleet",
             &["cache".into(), "web".into()],
@@ -2336,13 +2335,13 @@ exit 0
                 "--keep-going",
                 "--log-format",
                 "internal-json",
-                "--impure",
                 "--out-link",
                 "/run/profile",
             ]
         );
         assert!(!argv.iter().any(|arg| arg.contains("router")));
         assert!(!argv.iter().any(|arg| arg.contains("deployBatch")));
+        assert!(!argv.iter().any(|arg| arg == "--impure"));
     }
 
     #[test]
