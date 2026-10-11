@@ -110,3 +110,10 @@ configurations (and facts-only members) declare, and computes the views
 other systems consume. Toolchains (deploy-rs, nixpkgs package sets) are
 injected as function arguments, never engine inputs: the engine's only
 flake input is nixpkgs, and lib-only consumers evaluate nothing else.
+
+## License
+
+MIT (see [LICENSE](LICENSE)), except `crates/mandala-deploy`, which is
+MPL-2.0 because it vendors code from
+[serokell/deploy-rs](https://github.com/serokell/deploy-rs). The built
+`mandala` binary links that crate, so it is covered by both licenses.
