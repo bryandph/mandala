@@ -3,7 +3,7 @@ name = "mandala-deploy"
 description = "Sink-attributed deploy-rs push and activation controller for Mandala"
 edition.workspace = true
 version.workspace = true
-license = "MIT OR MPL-2.0"
+license = "MPL-2.0"
 rust-version.workspace = true
 repository.workspace = true
 
