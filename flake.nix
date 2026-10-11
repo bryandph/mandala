@@ -159,7 +159,8 @@
         meta = {
           description = "mandala fleet porcelain (Rust) — CLI + stdio MCP, single static binary";
           mainProgram = "mandala";
-          license = lib.licenses.mit;
+          # MIT workspace; crates/mandala-deploy (linked in) is MPL-2.0.
+          license = with lib.licenses; [mit mpl20];
         };
       };
 
