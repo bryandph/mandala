@@ -330,6 +330,11 @@ pub enum DeployRunError {
     MissingSettingsProjection,
     /// An enabled member lacks its required flattened settings entry.
     MissingMemberSettings(String),
+    /// An enabled member's flattened settings do not match the Stage-A shape.
+    InvalidMemberSettings {
+        host: String,
+        error: serde_json::Error,
+    },
     /// Creating the run registry failed.
     Registry(io::Error),
 }
@@ -349,6 +354,9 @@ impl fmt::Display for DeployRunError {
             }
             Self::MissingMemberSettings(host) => {
                 write!(f, "aggregate has no flattened deploy settings for {host}")
+            }
+            Self::InvalidMemberSettings { host, error } => {
+                write!(f, "invalid flattened deploy settings for {host}: {error}")
             }
             Self::Registry(err) => write!(f, "creating deploy registry run: {err}"),
         }
@@ -381,14 +389,15 @@ fn deploy_rs_enabled(inv: &Inventory, host: &str) -> bool {
 
 /// Resolve and validate a native deploy before a registry run is allocated.
 ///
-/// This ordering is deliberate: a bad selector or selection with no
-/// deployable members leaves no empty run behind. The [`Inventory`] itself was
-/// built by the CLI's one aggregate evaluation, so consuming the flattened
-/// settings here does not perform another eval.
+/// This ordering is deliberate: a bad selector, a selection with no
+/// deployable members, or a target whose flattened settings do not match the
+/// Stage-A shape leaves no empty run behind and never reaches the batch build.
+/// The [`Inventory`] itself was built by the CLI's one aggregate evaluation,
+/// so consuming the flattened settings here does not perform another eval.
 ///
 /// # Errors
 /// Selector errors, a zero-deployable selection, or a missing/malformed
-/// flattened-settings projection.
+/// flattened-settings projection or member entry.
 pub fn plan_run(
     inv: &Inventory,
     limit: &str,
@@ -402,7 +411,7 @@ pub fn plan_run(
 ///
 /// # Errors
 /// Selector errors, a zero-deployable selection, or a missing/malformed
-/// flattened-settings projection.
+/// flattened-settings projection or member entry.
 pub fn plan_run_with_boot(
     inv: &Inventory,
     limit: &str,
@@ -431,6 +440,15 @@ pub fn plan_run_with_boot(
         let value = projected
             .get(host)
             .ok_or_else(|| DeployRunError::MissingMemberSettings(host.clone()))?;
+        // Validate now so a malformed entry refuses before registry creation
+        // and the batch build. The plan keeps the raw value; fan-out parses it
+        // again as defense in depth.
+        serde_json::from_value::<FlattenedDeploySettings>(value.clone()).map_err(|error| {
+            DeployRunError::InvalidMemberSettings {
+                host: host.clone(),
+                error,
+            }
+        })?;
         settings.insert(host.clone(), value.clone());
     }
 
@@ -1738,6 +1756,16 @@ mod tests {
     }
 
     fn inv() -> Inventory {
+        let mut cache = minimal_parent_deploy_settings();
+        cache["sshUser"] = Value::from("cache-admin");
+        cache["confirmTimeout"] = Value::from(30);
+        let mut web = minimal_parent_deploy_settings();
+        web["sshUser"] = Value::from("web-admin");
+        web["confirmTimeout"] = Value::from(60);
+        inv_with_settings(json!({"cache": cache, "web": web}))
+    }
+
+    fn inv_with_settings(settings: Value) -> Inventory {
         Inventory::from_value(json!({
             "schemaVersion": 1,
             "members": {
@@ -1761,10 +1789,7 @@ mod tests {
             },
             "projections": {"deploy": {
                 "nodes": ["web", "cache"],
-                "settings": {
-                    "cache": {"sshUser": "cache-admin", "confirmTimeout": 30},
-                    "web": {"sshUser": "web-admin", "confirmTimeout": 60}
-                }
+                "settings": settings
             }},
         }))
         .unwrap()
@@ -2260,6 +2285,44 @@ exit 0
         let err = prepare_run(&inv(), "@gateway", 4, false).unwrap_err();
         assert!(matches!(err, DeployRunError::NoDeployableMembers(_)));
         assert!(!base.exists());
+    }
+
+    #[test]
+    fn invalid_member_settings_refuse_before_registry_creation() {
+        let base = tmp_base("invalid-settings");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let mut web = minimal_parent_deploy_settings();
+        web["sshUsr"] = Value::from("typo");
+        let inv = inv_with_settings(json!({
+            "cache": minimal_parent_deploy_settings(),
+            "web": web,
+        }));
+
+        for boot in [false, true] {
+            let err = plan_run_with_boot(&inv, "@k3s", 4, false, boot).unwrap_err();
+            assert!(
+                matches!(&err, DeployRunError::InvalidMemberSettings { host, .. } if host == "web"),
+                "{err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.starts_with("invalid flattened deploy settings for web: "),
+                "{message}"
+            );
+            assert!(message.contains("sshUsr"), "{message}");
+        }
+        assert!(matches!(
+            plan_run(&inv, "@k3s", 4, false).unwrap_err(),
+            DeployRunError::InvalidMemberSettings { .. }
+        ));
+        assert!(matches!(
+            prepare_run_with_boot(&inv, "@k3s", 4, false, true).unwrap_err(),
+            DeployRunError::InvalidMemberSettings { .. }
+        ));
+        assert!(!base.exists());
+
+        // A valid sibling alone still plans.
+        assert!(plan_run(&inv, "cache", 4, false).is_ok());
     }
 
     #[test]
