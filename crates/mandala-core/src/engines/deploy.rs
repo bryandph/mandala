@@ -497,6 +497,11 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
         Value::from(plan.halt_on_build_failure),
     );
     meta.insert("pid".into(), Value::from(i64::from(std::process::id())));
+    // Already checked against the parent at entry and removed from env. The
+    // original supervisor can now be dead and the engine reparented.
+    if let Some(pid) = crate::supervisor::captured_pid() {
+        meta.insert("supervisor_pid".into(), Value::from(pid));
+    }
     meta.insert("started_at".into(), Value::from(now_epoch_f64()));
     registry::write_meta(&path, &meta)?;
 

@@ -853,6 +853,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
     let err = out.try_clone()?;
     let mut command = std::process::Command::new(&request.argv[0]);
     command
+        .env(crate::supervisor::PID_ENV, std::process::id().to_string())
         .args(&request.argv[1..])
         .current_dir(&request.cwd)
         .stdin(Stdio::null())
