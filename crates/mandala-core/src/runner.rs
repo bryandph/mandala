@@ -847,6 +847,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
         return Err(std::io::Error::other("invalid deploy supervisor request"));
     }
 
+    let _signals = mandala_deploy::process::SignalForwarder::install(false)?;
     let log_path = launch_dir.join(COMMAND_LOG);
     let out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
     let err = out.try_clone()?;
@@ -857,7 +858,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    let mut child = match command.spawn() {
+    let (mut child, _engine_group) = match mandala_deploy::process::spawn_std(&mut command) {
         Ok(child) => child,
         Err(error) => {
             if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
@@ -1049,6 +1050,7 @@ impl DeployRun {
         let supervisor_out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
         let supervisor_err = supervisor_out.try_clone()?;
         let child = match tokio::process::Command::new(supervisor)
+            .process_group(0)
             .arg(&launch_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(supervisor_out))
@@ -1083,7 +1085,8 @@ impl DeployRun {
         let err = log.try_clone()?;
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
+        cmd.process_group(0)
+            .args(&argv[1..])
             .current_dir(&cwd)
             // NEVER inherit stdin: an interactive prompt (ssh, vault, become)
             // would wedge the run silently.
@@ -1284,18 +1287,22 @@ impl DeployRun {
             .and_then(|meta| meta.get("pid").and_then(Value::as_i64))
             .filter(|pid| registry::pid_alive(Some(*pid)));
         if let Some(pid) = deployed_pid.and_then(|pid| i32::try_from(pid).ok()) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            terminate_deploy_group(pid);
         } else if let Some(child) = self.child.as_ref()
             && let Some(pid) = child.id()
         {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            terminate_deploy_group(pid as i32);
         }
+    }
+}
+
+/// Supervised/inline engines lead an isolated group. A directly launched
+/// engine may not: fall back to its signal-forwarding PID in that case.
+fn terminate_deploy_group(pid: i32) {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::Pid;
+    if killpg(Pid::from_raw(pid), Signal::SIGTERM).is_err() {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
     }
 }
 

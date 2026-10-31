@@ -930,8 +930,10 @@ name = "mandala-deploy"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "nix 0.31.3",
  "serde",
  "serde_json",
+ "signal-hook",
  "thiserror 2.0.20",
  "tokio",
 ]

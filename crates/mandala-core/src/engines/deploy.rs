@@ -709,10 +709,11 @@ fn resolve_profiles(
     argv: &[String],
     count: usize,
 ) -> Result<Vec<(String, String)>, BuildError> {
-    let output = ProcCommand::new(program)
-        .args(&argv[1..])
-        .args(["--dry-run", "--json"])
-        .output()?;
+    let output = mandala_deploy::process::output_std(
+        ProcCommand::new(program)
+            .args(&argv[1..])
+            .args(["--dry-run", "--json"]),
+    )?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "resolving profiles: {}",
@@ -769,22 +770,23 @@ fn recover_profiles(
     };
     for (index, (host, (drv, path))) in run.plan.targets.iter().zip(resolved).enumerate() {
         let link = profile_link(&run.path.join("profile"), index);
-        let output = ProcCommand::new(program)
-            .args([
-                "build",
-                path,
-                "--offline",
-                "--max-jobs",
-                "0",
-                "--builders",
-                "",
-                "--option",
-                "substitute",
-                "false",
-                "--out-link",
-            ])
-            .arg(&link)
-            .output()?;
+        let output = mandala_deploy::process::output_std(
+            ProcCommand::new(program)
+                .args([
+                    "build",
+                    path,
+                    "--offline",
+                    "--max-jobs",
+                    "0",
+                    "--builders",
+                    "",
+                    "--option",
+                    "substitute",
+                    "false",
+                    "--out-link",
+                ])
+                .arg(&link),
+        )?;
         if output.status.success() {
             let mapped = map_profile_links(std::slice::from_ref(host), &link)?;
             if mapped[host] != Path::new(path) {
@@ -813,11 +815,14 @@ fn save_derivation_log(
     std::fs::create_dir_all(&directory)?;
     let path = directory.join(name).with_extension("log");
     let file = std::fs::File::create(&path)?;
-    let output = ProcCommand::new(program)
-        .args(["log", "--offline", drv])
-        .stdout(file)
-        .stderr(Stdio::piped())
-        .output()?;
+    let (child, _group) = mandala_deploy::process::spawn_std(
+        ProcCommand::new(program)
+            .args(["log", "--offline", drv])
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(Stdio::piped()),
+    )?;
+    let output = child.wait_with_output()?;
     if output.status.success() {
         Ok(path)
     } else {
@@ -906,9 +911,10 @@ fn build_profiles_with(
     let mut command = ProcCommand::new(program);
     command
         .args(&argv[1..])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
+    let (mut child, build_group) = match mandala_deploy::process::spawn_std(&mut command) {
         Ok(child) => child,
         Err(error) => {
             let _ = writer.emit(
@@ -996,6 +1002,9 @@ fn build_profiles_with(
     });
 
     let status = child.wait()?;
+    // A reaped Nix may have left descendants holding the capture pipes open.
+    // Settle the owned group before joining the pipe readers.
+    drop(build_group);
     let stdout_lines = stdout_task
         .join()
         .map_err(|_| io::Error::other("nix stdout reader panicked"))??;
@@ -1598,6 +1607,13 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
     let flake = m.get_one::<String>("flake").map_or(".", String::as_str);
     match m.subcommand() {
         Some(("run", sm)) => {
+            let _signals = match mandala_deploy::process::SignalForwarder::install(true) {
+                Ok(signals) => signals,
+                Err(error) => {
+                    eprintln!("mandala: installing deploy signal forwarding: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let limit = sm.get_one::<String>("limit").map_or("", String::as_str);
             let throttle = *sm.get_one::<i64>("throttle").unwrap_or(&4);
             let dry_activate = sm.get_flag("dry-activate");

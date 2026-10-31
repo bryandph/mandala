@@ -263,9 +263,7 @@ pub async fn resolve_activation_disposition(
         Level::Debug,
         &format!("switch-capability-command {capability}"),
     );
-    let output = ssh_command(deploy_data, &ssh_addr)
-        .arg(capability)
-        .output()
+    let output = crate::process::output(ssh_command(deploy_data, &ssh_addr).arg(capability))
         .await
         .map_err(DeployProfileError::CapabilityProbeSpawn)?;
     emit_output(deploy_data.sink, &output);
@@ -297,9 +295,7 @@ pub async fn resolve_activation_disposition(
     deploy_data
         .sink
         .emit(Level::Debug, &format!("switch-preflight-command {check}"));
-    let output = ssh_command(deploy_data, &ssh_addr)
-        .arg(check)
-        .output()
+    let output = crate::process::output(ssh_command(deploy_data, &ssh_addr).arg(check))
         .await
         .map_err(DeployProfileError::PreflightSpawn)?;
     emit_output(deploy_data.sink, &output);
@@ -336,9 +332,7 @@ async fn boot_stage_command(
     deploy_data
         .sink
         .emit(Level::Debug, &format!("{label}-command {command}"));
-    let output = ssh_command(deploy_data, ssh_addr)
-        .arg(command)
-        .output()
+    let output = crate::process::output(ssh_command(deploy_data, ssh_addr).arg(command))
         .await
         .map_err(|error| format!("{label} spawn failed: {error}"))?;
     emit_output(deploy_data.sink, &output);
@@ -415,9 +409,7 @@ pub async fn stage_profile_for_boot(
     deploy_data
         .sink
         .emit(Level::Debug, &format!("previous-profile-command {resolve}"));
-    let output = ssh_command(deploy_data, &ssh_addr)
-        .arg(resolve)
-        .output()
+    let output = crate::process::output(ssh_command(deploy_data, &ssh_addr).arg(resolve))
         .await
         .map_err(DeployProfileError::PreviousProfileSpawn)?;
     emit_output(deploy_data.sink, &output);
@@ -492,11 +484,7 @@ async fn confirm_profile(
     deploy_data
         .sink
         .emit(Level::Debug, &format!("confirm-command {confirm}"));
-    let mut command = ssh_command(deploy_data, ssh_addr);
-    command.kill_on_drop(true);
-    let output = command
-        .arg(confirm)
-        .output()
+    let output = crate::process::output(ssh_command(deploy_data, ssh_addr).arg(confirm))
         .await
         .map_err(DeployProfileError::ConfirmSpawn)?;
     checked_output(output, deploy_data, DeployProfileError::ConfirmExit)?;
@@ -518,9 +506,7 @@ async fn clear_stale_canary(
     deploy_data
         .sink
         .emit(Level::Debug, &format!("canary-cleanup-command {cleanup}"));
-    let output = ssh_command(deploy_data, ssh_addr)
-        .arg(cleanup)
-        .output()
+    let output = crate::process::output(ssh_command(deploy_data, ssh_addr).arg(cleanup))
         .await
         .map_err(DeployProfileError::CanaryCleanupSpawn)?;
     checked_output(output, deploy_data, DeployProfileError::CanaryCleanupExit)?;
@@ -572,9 +558,7 @@ pub async fn deploy_profile(
         .emit(Level::Debug, &format!("activate-command {activate}"));
 
     if !magic_rollback || dry_activate {
-        let output = ssh_command(deploy_data, &ssh_addr)
-            .arg(activate)
-            .output()
+        let output = crate::process::output(ssh_command(deploy_data, &ssh_addr).arg(activate))
             .await
             .map_err(DeployProfileError::ActivateSpawn)?;
         checked_output(output, deploy_data, DeployProfileError::ActivateExit)?;
@@ -598,16 +582,19 @@ pub async fn deploy_profile(
     // either the new activation or waiter can observe it.
     clear_stale_canary(deploy_data, deploy_defs, temp_path, &ssh_addr).await?;
 
-    let activate_child = ssh_command(deploy_data, &ssh_addr)
-        .arg(activate)
-        .spawn()
-        .map_err(DeployProfileError::ActivateSpawn)?;
-    let wait_child = ssh_command(deploy_data, &ssh_addr)
-        .arg(wait)
-        .spawn()
-        .map_err(DeployProfileError::WaitSpawn)?;
-    let mut activate_output = Box::pin(activate_child.wait_with_output());
-    let mut wait_output = Box::pin(wait_child.wait_with_output());
+    let (activate_child, activate_group) =
+        crate::process::spawn(ssh_command(deploy_data, &ssh_addr).arg(activate))
+            .map_err(DeployProfileError::ActivateSpawn)?;
+    // Construct the guarded future before spawning the waiter: a waiter-spawn
+    // failure must also drop and terminate activation, not detach it.
+    let mut activate_output = Box::pin(crate::process::wait_with_output(
+        activate_child,
+        activate_group,
+    ));
+    let (wait_child, wait_group) =
+        crate::process::spawn(ssh_command(deploy_data, &ssh_addr).arg(wait))
+            .map_err(DeployProfileError::WaitSpawn)?;
+    let mut wait_output = Box::pin(crate::process::wait_with_output(wait_child, wait_group));
     let mut activation_finished = None;
 
     tokio::select! {

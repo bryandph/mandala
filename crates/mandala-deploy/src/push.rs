@@ -74,7 +74,7 @@ pub async fn push_profile(
         command.env(key, value);
     }
 
-    let output = command.output().await?;
+    let output = crate::process::output(&mut command).await?;
     emit_output(deploy_data.sink, &output);
     if !output.status.success() {
         return Err(PushProfileError::Exit(output.status));
