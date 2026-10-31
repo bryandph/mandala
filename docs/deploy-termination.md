@@ -41,14 +41,27 @@ cannot be forwarded, and a descendant deliberately creating a new session can
 escape a process group.
 
 The supervisor passes `MANDALA_DEPLOY_SUPERVISOR_PID` only in its engine child's
-command environment. The engine writes that positive process ID as
-`supervisor_pid` in its initial atomic `meta.json`, before publishing its run ID.
-No frontend discovery-time metadata merge is needed, and subsequent engine
-metadata updates preserve the field. This is a private handoff, not a user
-configuration option: ordinary direct CLI runs omit it, and malformed/out-of-range
-values are ignored. A valid handoff is not checked against the current parent
-PID, because an engine whose supervisor died early may already be reparented.
-Callers launching a standalone engine must not inject an unrelated stale hint.
+command environment, never in its own environment. As the first operation in
+`mandala`'s `main`, the engine captures the hint and current parent PID, accepts
+only a positive matching PID, and immediately removes the variable before any
+other work or threads. Thus no engine subprocess inherits it, and an unrelated
+or stale hint cannot make a healthy direct CLI run look orphaned.
+
+Engine registration reads the captured immutable identity and writes
+`supervisor_pid` in its initial atomic `meta.json` before publishing the run ID.
+It remains valid if the supervisor dies during inventory loading/preflight and
+the engine is reparented before registration. Death before main captures the
+identity remains uncovered: avoiding false failures from inherited hints takes
+priority over that rare startup window. No frontend discovery-time metadata
+merge is needed; later engine metadata updates preserve the field.
+
+Downstream native-engine binaries must call
+`unsafe { mandala_core::supervisor::capture_at_entry() };` as the first statement
+of main, before any threads/environment readers. This validates/clears the handoff
+and stores the identity in a process-global OnceLock. Plain `deploy::engine()` and
+`register_run()` use that immutable cache; no factory changes are needed. If
+capture was never called, they default to no supervisor. They never read process
+environment implicitly. The handoff variable is private, not a user option.
 
 Registry observers and attached frontends treat a dead recorded supervisor with
 no terminal run rc as failure, even if the engine PID remains alive. A live
@@ -63,5 +76,7 @@ failed-waiter/activate race. Unit tests intercept the group-signal operation to
 assert successful std/async waits never signal on drop and an unreaped guard
 still does. `crates/mandala/tests/supervisor_metadata.rs` exercises real
 `DeployRun::start` metadata, supervisor-death detection, active-run retention,
-direct CLI omission and an already-dead handoff. Tests never signal live fleet
+direct CLI omission, rejection of mismatched/inherited hints, child-environment
+clearing, and supervisor death during FIFO-gated inventory loading before run
+registration. Tests never signal live fleet
 processes.

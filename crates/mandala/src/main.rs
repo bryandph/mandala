@@ -19,6 +19,9 @@ use mandala_tui::deploy::{DeployConfig, run_attach_blocking, run_deploy_blocking
 use mandala_tui::explorer::{ExplorerConfig, run_explorer_blocking};
 
 fn main() -> ExitCode {
+    // SAFETY: first operation at executable entry, before any threads or other
+    // environment readers. This also clears the handoff before spawning children.
+    unsafe { mandala_core::supervisor::capture_at_entry() };
     Cli::new()
         .mcp_launcher(|flake| match mandala_mcp::serve_stdio_blocking(flake) {
             Ok(()) => ExitCode::SUCCESS,

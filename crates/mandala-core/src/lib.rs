@@ -9,6 +9,7 @@ pub mod eval;
 pub mod inventory;
 pub mod registry;
 pub mod runner;
+pub mod supervisor;
 
 pub use cli::{Cli, Engine, TuiRequest};
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};

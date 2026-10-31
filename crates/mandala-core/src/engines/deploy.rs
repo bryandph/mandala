@@ -497,14 +497,9 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
         Value::from(plan.halt_on_build_failure),
     );
     meta.insert("pid".into(), Value::from(i64::from(std::process::id())));
-    // Trust the private supervisor handoff, not getppid(): the engine may
-    // already be reparented if its supervisor died before registration.
-    // Ordinary direct CLI runs have no handoff and omit the field.
-    if let Some(pid) = std::env::var(crate::runner::DEPLOY_SUPERVISOR_PID_ENV)
-        .ok()
-        .and_then(|raw| raw.parse::<i32>().ok())
-        .filter(|pid| *pid > 0)
-    {
+    // Already checked against the parent at entry and removed from env. The
+    // original supervisor can now be dead and the engine reparented.
+    if let Some(pid) = crate::supervisor::captured_pid() {
         meta.insert("supervisor_pid".into(), Value::from(pid));
     }
     meta.insert("started_at".into(), Value::from(now_epoch_f64()));

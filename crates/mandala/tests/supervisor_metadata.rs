@@ -49,6 +49,11 @@ fn setup() -> PathBuf {
         &root.join("bin/nix"),
         r#"#!/bin/sh
 set -eu
+if [ "${MANDALA_DEPLOY_SUPERVISOR_PID+x}" = x ]; then
+  echo leaked > "$MANDALA_FLEET_STATE/handoff-leaked"
+  exit 98
+fi
+echo clear >> "$MANDALA_FLEET_STATE/handoff-cleared"
 case " $* " in
  *' --dry-run '*)
   printf '%s\n' '[{"drvPath":"/nix/store/00000000000000000000000000000000-web-profile.drv","outputs":{"out":"/nix/store/00000000000000000000000000000000-web-profile"}}]'
@@ -59,6 +64,15 @@ exec sleep 60
 "#,
     );
     program(&root.join("bin/ssh"), "#!/bin/sh\nexit 99\n");
+    // Exec preserves the PID, exposing the identity of our own supervisor
+    // without relying on ps/procfs or adding a production PID accessor.
+    program(
+        &root.join("bin/supervisor"),
+        &format!(
+            "#!/bin/sh\necho $$ > \"$MANDALA_FLEET_STATE/supervisor.pid\"\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_mandala-run-supervisor")
+        ),
+    );
     let path = std::env::join_paths(
         std::iter::once(root.join("bin"))
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -70,10 +84,7 @@ exec sleep 60
         std::env::set_var("MANDALA_FLEET_STATE", &root);
         std::env::set_var("MANDALA_AGGREGATE_FILE", root.join("aggregate.json"));
         std::env::set_var("MANDALA_DEPLOY_ENGINE_BIN", env!("CARGO_BIN_EXE_mandala"));
-        std::env::set_var(
-            "MANDALA_DEPLOY_SUPERVISOR_BIN",
-            env!("CARGO_BIN_EXE_mandala-run-supervisor"),
-        );
+        std::env::set_var("MANDALA_DEPLOY_SUPERVISOR_BIN", root.join("bin/supervisor"));
         std::env::set_var("PATH", path);
         std::env::remove_var("MANDALA_DEPLOY_SUPERVISOR_PID");
     }
@@ -93,6 +104,79 @@ impl Drop for RunningDeploy {
             }
         }
     }
+}
+
+/// A FIFO is the existing inventory-file seam: opening its writer proves the
+/// engine reached inventory loading, after main captured/cleared the handoff,
+/// but before it can register a run. No timing-only delay or production hook.
+async fn supervisor_death_during_inventory_read_preserves_early_identity(root: &Path) {
+    let fifo = root.join("inventory.fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::remove_file(root.join("supervisor.pid")).unwrap();
+    let contents = fs::read(root.join("aggregate.json")).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        let mut pipe = fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        pipe.write_all(&contents).unwrap();
+    });
+    let mut early = RunningDeploy(DeployRun::new("web"));
+    // env execs the actual engine without changing its parent. The production
+    // start/supervisor path still performs the private PID handoff itself.
+    early.0.program = Some(vec![
+        "env".into(),
+        format!("MANDALA_AGGREGATE_FILE={}", fifo.display()),
+        env!("CARGO_BIN_EXE_mandala").into(),
+        "--flake".into(),
+        root.to_string_lossy().into_owned(),
+        "deploy".into(),
+        "run".into(),
+        "--limit".into(),
+        "web".into(),
+    ]);
+    early.0.start().await.unwrap();
+    until(|| ready_rx.try_recv().is_ok()).await;
+    let supervisor = fs::read_to_string(root.join("supervisor.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i64>()
+        .unwrap();
+    signal(supervisor, "KILL");
+    until(|| early.0.finished()).await; // supervisor reaped before registration
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    until(|| {
+        early
+            .0
+            .output()
+            .iter()
+            .any(|line| registry::is_valid_run_id(line.trim()))
+    })
+    .await;
+    assert!(early.0.discover_run().unwrap());
+    let meta = registry::read_meta(early.0.events_dir.as_ref().unwrap());
+    assert_eq!(
+        meta["supervisor_pid"].as_i64(),
+        Some(supervisor),
+        "preserve validated early parent after reparenting"
+    );
+    assert!(!root.join("handoff-leaked").exists());
+    let mut observed = registry::open_run(early.0.run_id.as_ref().unwrap()).unwrap();
+    assert_eq!(observed.liveness(), RunLiveness::Failed);
+    signal(meta["pid"].as_i64().unwrap(), "TERM");
 }
 
 #[test]
@@ -115,6 +199,19 @@ fn production_supervisor_identity_drives_orphan_detection_and_retention() {
         let supervisor = meta["supervisor_pid"]
             .as_i64()
             .expect("production registration writes supervisor_pid");
+        assert_eq!(
+            fs::read_to_string(root.join("supervisor.pid"))
+                .unwrap()
+                .trim()
+                .parse::<i64>()
+                .unwrap(),
+            supervisor
+        );
+        assert!(root.join("handoff-cleared").exists());
+        assert!(
+            !root.join("handoff-leaked").exists(),
+            "engine effects must not inherit the handoff"
+        );
         assert_ne!(engine, supervisor);
         assert_ne!(supervisor, i64::from(std::process::id()));
         assert!(registry::pid_alive(Some(supervisor)));
@@ -145,10 +242,11 @@ fn production_supervisor_identity_drives_orphan_detection_and_retention() {
         signal(engine, "TERM");
         until(|| !registry::pid_alive(Some(build))).await;
 
-        // Direct CLI runs omit the field. Malformed hints are ignored, but a
-        // valid private hint must survive reparenting (getppid no longer equals
-        // the supervisor after early death). Reuse this fixture's dead PID to
-        // deterministically exercise that handoff without a timing race.
+        supervisor_death_during_inventory_read_preserves_early_identity(&root).await;
+
+        // Direct CLI runs omit the field. Malformed and inherited/mismatched
+        // hints (including the already-dead supervisor from another run) must
+        // not make a healthy independently launched engine look orphaned.
         for hint in [
             None,
             Some("not-a-pid".to_owned()),
@@ -181,13 +279,9 @@ fn production_supervisor_identity_drives_orphan_detection_and_retention() {
             assert!(registry::is_valid_run_id(id.trim()));
             let path = registry::runs_dir().join(id.trim());
             let meta = registry::read_meta(&path);
-            if hint.as_deref().and_then(|hint| hint.parse::<i64>().ok()) == Some(supervisor) {
-                assert_eq!(meta["supervisor_pid"].as_i64(), Some(supervisor));
-                let mut orphan = registry::open_run(id.trim()).unwrap();
-                assert_eq!(orphan.liveness(), RunLiveness::Failed);
-            } else {
-                assert!(!meta.contains_key("supervisor_pid"));
-            }
+            assert!(!meta.contains_key("supervisor_pid"));
+            let mut independent = registry::open_run(id.trim()).unwrap();
+            assert_eq!(independent.liveness(), RunLiveness::Running);
             signal(i64::from(child.id()), "TERM");
             until(|| child.try_wait().unwrap().is_some()).await;
         }
