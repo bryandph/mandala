@@ -685,61 +685,37 @@ fn effective_deploy_returncode(
 // other frontends can attach. Parity port of `runner.py` lines 35-62
 // (helpers) and 210-449.
 
-/// The operator repo's ansible root when present, else the cwd — the one
-/// working-directory convention every frontend shares. Parity of the Python
-/// `ansible_dir()`.
+/// Resolve Ansible configuration from the fleet checkout, never the leader cwd.
+/// Context callers pass the canonical path from `ContextIdentity`.
 #[must_use]
-pub fn ansible_dir() -> PathBuf {
-    if Path::new("ansible/ansible.cfg").is_file() {
-        PathBuf::from("ansible")
+pub fn ansible_dir(flake: impl AsRef<Path>) -> PathBuf {
+    let root =
+        std::fs::canonicalize(flake.as_ref()).unwrap_or_else(|_| flake.as_ref().to_path_buf());
+    if root.join("ansible/ansible.cfg").is_file() {
+        root.join("ansible")
     } else {
-        PathBuf::from(".")
+        root
     }
 }
 
-/// The reboot launch line, shared by the TUI action and the MCP reboot tool.
-///
-/// Prefers the operator's `ans-reboot` wrapper: it carries controller-side env
-/// raw `ansible-playbook` lacks — the delegated k8s drain pins a python WITH
-/// the kubernetes lib. Falls back to `playbooks/reboot.yaml`; `None` when
-/// neither exists. Parity of the Python `reboot_argv`.
+/// The fleet flake must expose `apps.<system>.ans-reboot`: its environment
+/// supplies the Python dependencies needed by delegated drain/Ready steps.
+/// Never substitute the leader's PATH wrapper or a raw playbook.
 #[must_use]
-pub fn reboot_argv(target: &str, serial: &str, drain: bool) -> Option<Vec<String>> {
-    let mut base = if which("ans-reboot") {
-        vec![
-            "ans-reboot".to_string(),
-            "-l".to_string(),
-            target.to_string(),
-        ]
-    } else if ansible_dir().join("playbooks/reboot.yaml").is_file() {
-        vec![
-            "ansible-playbook".to_string(),
-            "playbooks/reboot.yaml".to_string(),
-            "-l".to_string(),
-            target.to_string(),
-        ]
-    } else {
-        return None;
-    };
-    base.push("-e".to_string());
-    base.push(format!("reboot_serial={serial}"));
-    base.push("-e".to_string());
-    base.push(format!("drain={}", if drain { "true" } else { "false" }));
-    Some(base)
-}
-
-/// Is `name` an executable on `PATH`? (Parity of `shutil.which`, used only to
-/// prefer the `ans-reboot` wrapper over the raw playbook.)
-fn which(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        std::fs::metadata(dir.join(name))
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-            .unwrap_or(false)
-    })
+pub fn reboot_argv(flake: &Path, target: &str, serial: &str, drain: bool) -> Option<Vec<String>> {
+    let root = std::fs::canonicalize(flake).unwrap_or_else(|_| flake.to_path_buf());
+    Some(vec![
+        "nix".to_string(),
+        "run".to_string(),
+        format!("{}#ans-reboot", root.display()),
+        "--".to_string(),
+        "-l".to_string(),
+        target.to_string(),
+        "-e".to_string(),
+        format!("reboot_serial={serial}"),
+        "-e".to_string(),
+        format!("drain={}", if drain { "true" } else { "false" }),
+    ])
 }
 
 /// Unix epoch seconds as a float — parity with Python `time.time()`, the

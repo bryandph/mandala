@@ -54,9 +54,9 @@ pub struct ExplorerConfig {
     /// is the only stable surface; the pane wraps and scrolls.
     pub ping_argv: fn(&str) -> Vec<String>,
     /// The reboot launch line (target, serial, drain) — defaults to the
-    /// shared [`mandala_core::runner::reboot_argv`] (wrapper-preference +
-    /// availability semantics live there); `None` = reboot unavailable.
-    pub reboot_argv: fn(&str, &str, bool) -> Option<Vec<String>>,
+    /// shared [`mandala_core::runner::reboot_argv`] (flake app contract
+    /// lives there); tests may return `None` to model unavailable reboot.
+    pub reboot_argv: fn(&std::path::Path, &str, &str, bool) -> Option<Vec<String>>,
     /// Test seam: override the deploy screen's launched argv verbatim
     /// (`DeployRun::program`); `None` builds the real native-engine line.
     pub deploy_program: Option<Vec<String>>,
@@ -280,7 +280,7 @@ pub fn spawn_survey(tx: mpsc::Sender<AppEvent>, cfg: ExplorerConfig) {
     tokio::spawn(run_survey(
         tx,
         cfg.survey_argv,
-        ansible_dir(),
+        ansible_dir(&cfg.flake),
         drift::state_dir(),
     ));
 }

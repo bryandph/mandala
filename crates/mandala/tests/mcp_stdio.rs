@@ -801,6 +801,81 @@ fn wait_with_timeout(
     }
 }
 
+/// A follower launched outside the checkout uses the leader's canonical
+/// flake inventory, not either process's cwd.
+#[test]
+fn follower_ping_uses_canonical_flake_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+    let (flake, state, aggregate) = scratch_tree("flake-ping");
+    let root = flake.parent().unwrap();
+    let elsewhere = root.join("elsewhere");
+    let bin = root.join("bin");
+    let ansible = flake.join("ansible");
+    for dir in [&elsewhere, &bin, &ansible] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(
+        ansible.join("ansible.cfg"),
+        "[defaults]\ninventory=inventory\n",
+    )
+    .unwrap();
+    std::fs::write(ansible.join("inventory"), "checkout-only").unwrap();
+    let observed = root.join("observed");
+    let stub = bin.join("ansible");
+    write_program(&stub, format!(
+        "#!/bin/sh\npwd > '{}'\ncat inventory >> '{}'\nprintf 'web | SUCCESS => {{\"ping\": \"pong\"}}\\n'\n",
+        observed.display(), observed.display()
+    )).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_mandala"))
+            .args(["--flake", flake.to_str().unwrap(), "mcp"])
+            .current_dir(&elsewhere)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("MANDALA_AGGREGATE_FILE", &aggregate)
+            .env("MANDALA_FLEET_STATE", &state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut leader = spawn();
+    let mut leader_in = leader.stdin.take().unwrap();
+    let mut leader_out = BufReader::new(leader.stdout.take().unwrap());
+    handshake(&mut leader_in, &mut leader_out);
+    let leader_pid = read_discovery(&state).unwrap()["pid"].clone();
+    let mut follower = spawn();
+    let mut input = follower.stdin.take().unwrap();
+    let mut output = BufReader::new(follower.stdout.take().unwrap());
+    handshake(&mut input, &mut output);
+    assert_eq!(read_discovery(&state).unwrap()["pid"], leader_pid);
+    send(
+        &mut input,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "ping", "arguments": {"selector": "web"}}
+        }),
+    );
+    let result = read_response(&mut output, 3);
+    drop(input);
+    drop(leader_in);
+    assert!(wait_with_timeout(&mut follower, Duration::from_secs(5)).success());
+    assert!(wait_with_timeout(&mut leader, Duration::from_secs(5)).success());
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    assert_eq!(
+        std::fs::read_to_string(observed).unwrap(),
+        format!(
+            "{}\ncheckout-only",
+            ansible.canonicalize().unwrap().display()
+        )
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Every protocol version the linked SDK supports must negotiate — above all
 /// the newest one, which is what a current client actually asks for.
 ///

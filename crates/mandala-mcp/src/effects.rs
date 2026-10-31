@@ -128,8 +128,8 @@ pub trait Effects: Send + Sync {
         extra_meta: Meta,
     ) -> io::Result<CommandLaunch>;
 
-    /// The reboot launch line (`ans-reboot` wrapper preferred, playbook
-    /// fallback), `None` when neither exists.
+    /// The flake-scoped reboot app launch line. Missing apps fail explicitly
+    /// in nix, naming the requested `<flake>#ans-reboot` installable.
     fn reboot_argv(&self, target: &str, serial: &str, drain: bool) -> Option<Vec<String>>;
 }
 
@@ -138,12 +138,18 @@ pub trait Effects: Send + Sync {
 /// blocking pool so a slow eval never wedges the server's message loop.
 pub struct RealEffects {
     evaluator: Arc<Mutex<Evaluator>>,
+    flake: PathBuf,
+    ansible_dir: PathBuf,
 }
 
 impl RealEffects {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(flake: impl Into<PathBuf>) -> Self {
+        let flake: PathBuf = flake.into();
+        let flake = std::fs::canonicalize(&flake).unwrap_or(flake);
         Self {
+            ansible_dir: ansible_dir(&flake),
+            flake,
             evaluator: Arc::new(Mutex::new(Evaluator::from_env())),
         }
     }
@@ -153,16 +159,16 @@ impl RealEffects {
     /// TUI's context factory uses this; the stdio server keeps [`Self::new`]
     /// (its stderr is free, and errors travel in-band either way).
     #[must_use]
-    pub fn quiet() -> Self {
-        Self {
-            evaluator: Arc::new(Mutex::new(Evaluator::from_env().quiet())),
-        }
+    pub fn quiet(flake: impl Into<PathBuf>) -> Self {
+        let mut effects = Self::new(flake);
+        effects.evaluator = Arc::new(Mutex::new(Evaluator::from_env().quiet()));
+        effects
     }
 }
 
 impl Default for RealEffects {
     fn default() -> Self {
-        Self::new()
+        Self::new(".")
     }
 }
 
@@ -248,7 +254,7 @@ impl Effects for RealEffects {
         // the TUI leader's alternate screen quiet.
         let output = tokio::process::Command::new("ansible-playbook")
             .arg("mandala.fleet.state")
-            .current_dir(ansible_dir())
+            .current_dir(&self.ansible_dir)
             .env("MANDALA_FLEET_STATE", drift::state_dir())
             .stdin(Stdio::null())
             .output()
@@ -263,7 +269,7 @@ impl Effects for RealEffects {
     async fn run_adhoc(&self, argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
-            .current_dir(ansible_dir())
+            .current_dir(&self.ansible_dir)
             // Silence deprecation chatter that would otherwise ride along in
             // every tool result (the Python `_adhoc_env`).
             .env("ANSIBLE_DEPRECATION_WARNINGS", "False")
@@ -331,6 +337,6 @@ impl Effects for RealEffects {
     }
 
     fn reboot_argv(&self, target: &str, serial: &str, drain: bool) -> Option<Vec<String>> {
-        reboot_argv(target, serial, drain)
+        reboot_argv(&self.flake, target, serial, drain)
     }
 }
