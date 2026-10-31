@@ -118,7 +118,18 @@ impl DeployJob {
             returncode,
             elapsed,
         );
-        self.nom.lock().map(|nom| nom.take_dirty()).unwrap_or(false)
+        let nom = self
+            .nom
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = view.build_line.find(" · nom: ") {
+            view.build_line.truncate(index);
+        }
+        if nom.dropped_lines() > 0 {
+            view.build_line
+                .push_str(&format!(" · nom: {} dropped lines", nom.dropped_lines()));
+        }
+        nom.take_dirty()
     }
 }
 

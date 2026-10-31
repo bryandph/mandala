@@ -17,6 +17,60 @@ use ratatui::style::{Color, Modifier, Style};
 
 const FIXTURE: &str = include_str!("fixtures/nix-internal-json.txt");
 
+/// Feed far more than a pipe can hold. A stalled renderer must not hold
+/// the caller (and thus Esc/ctrl-k) hostage until its 30-second sleep exits.
+#[test]
+fn stalled_nom_does_not_block_the_event_loop() {
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut pane = NomPane::new();
+        pane.spawn_cmd("sh", &["-c", "sleep 30"], 12, 60);
+        let start = Instant::now();
+        for _ in 0..4096 {
+            pane.feed(&"x".repeat(4096));
+        }
+        let elapsed = start.elapsed();
+        pane.resize(15, 70);
+        let _ = draw(&pane, 70, 15);
+        pane.finish();
+        let _ = done.send(elapsed);
+    });
+    let elapsed = result
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stalled nom blocked the UI loop");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn pending_nom_input_is_bounded_and_counts_dropped_lines() {
+    let mut pane = NomPane::new();
+    for _ in 0..512 {
+        pane.feed("queued before spawn");
+    }
+    assert_eq!(pane.dropped_lines(), 256);
+    pane.feed(&"x".repeat(16 * 1024 + 1));
+    assert_eq!(pane.dropped_lines(), 257);
+}
+
+#[test]
+fn deploy_build_status_surfaces_dropped_lines_without_accumulating_suffixes() {
+    use mandala_core::runner::DeployRun;
+    use mandala_tui::{deploy::DeployJob, screen::DeployViewState};
+    let mut job = DeployJob::new(DeployRun::new("fixture"));
+    for _ in 0..512 {
+        job.nom.lock().unwrap().feed("pending");
+    }
+    let mut view = DeployViewState::new("fixture", false, false, false, false);
+    job.tick(&mut view);
+    assert!(
+        view.build_line.contains("nom: 256 dropped lines"),
+        "{}",
+        view.build_line
+    );
+    job.tick(&mut view);
+    assert_eq!(view.build_line.matches("nom:").count(), 1);
+}
+
 fn draw(pane: &NomPane, width: u16, height: u16) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal

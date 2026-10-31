@@ -22,10 +22,11 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
@@ -47,6 +48,10 @@ nix::ioctl_read_bad!(tiocgwinsz, nix::libc::TIOCGWINSZ, Winsize);
 const MIN_ROWS: u16 = 10;
 const MIN_COLS: u16 = 40;
 
+// Bound both queue length and each record: at most 4 MiB pending input.
+const INPUT_QUEUE_LINES: usize = 256;
+const INPUT_LINE_BYTES: usize = 16 * 1024;
+
 fn winsize(rows: u16, cols: u16) -> Winsize {
     Winsize {
         ws_row: rows,
@@ -64,7 +69,8 @@ pub struct NomPane {
     /// loop's dirty-flag render path polls it via [`take_dirty`](Self::take_dirty).
     dirty: Arc<AtomicBool>,
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    stdin: Option<SyncSender<String>>,
+    dropped_lines: u64,
     master: Option<OwnedFd>,
     failed: Option<String>,
     /// `Some` until spawn: lines fed early buffer here (nom.py parity).
@@ -87,6 +93,7 @@ impl NomPane {
             dirty: Arc::new(AtomicBool::new(false)),
             child: None,
             stdin: None,
+            dropped_lines: 0,
             master: None,
             failed: None,
             pending: Some(Vec::new()),
@@ -167,7 +174,24 @@ impl NomPane {
         };
         // Parent side: both slave fds were moved into the child's stdio and
         // are closed here; we keep only the master.
-        self.stdin = child.stdin.take();
+        if let Some(mut stdin) = child.stdin.take() {
+            let (sender, receiver) = sync_channel::<String>(INPUT_QUEUE_LINES);
+            self.stdin = Some(sender);
+            // Only this thread can block on the pipe. Never join it on the UI
+            // thread; EOF drains the queue, and child teardown unblocks writes.
+            std::thread::spawn(move || {
+                for line in receiver {
+                    if stdin
+                        .write_all(line.as_bytes())
+                        .and_then(|()| stdin.write_all(b"\n"))
+                        .and_then(|()| stdin.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
         self.child = Some(child);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_MAX)));
@@ -211,10 +235,18 @@ impl NomPane {
 
     /// One raw `@nix {...}` line into nom's stdin (buffered until spawn).
     pub fn feed(&mut self, line: &str) {
-        if self.finished {
+        if self.finished || self.failed.is_some() {
+            return;
+        }
+        if line.len() > INPUT_LINE_BYTES {
+            self.record_drop();
             return;
         }
         if let Some(pending) = self.pending.as_mut() {
+            if pending.len() == INPUT_QUEUE_LINES {
+                self.record_drop();
+                return;
+            }
             pending.push(line.to_string());
             self.start_if_ready();
             return;
@@ -223,14 +255,21 @@ impl NomPane {
     }
 
     fn write_line(&mut self, line: &str) {
-        if let Some(stdin) = self.stdin.as_mut() {
-            // Broken pipe = nom died; the drain thread already stopped and
-            // the last emulated screen stays up. Never propagate.
-            let _ = stdin
-                .write_all(line.as_bytes())
-                .and_then(|()| stdin.write_all(b"\n"))
-                .and_then(|()| stdin.flush());
+        if let Some(sender) = &self.stdin
+            && sender.try_send(line.to_string()).is_err()
+        {
+            self.record_drop();
         }
+    }
+
+    fn record_drop(&mut self) {
+        self.dropped_lines = self.dropped_lines.saturating_add(1);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Records omitted rather than blocking the event loop (drop newest).
+    pub fn dropped_lines(&self) -> u64 {
+        self.dropped_lines
     }
 
     /// EOF nom's stdin so it draws its final summary and exits.
@@ -253,7 +292,7 @@ impl NomPane {
         if let Some(parser) = self.parser.as_ref() {
             parser
                 .lock()
-                .expect("nom pane emulator lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .screen_mut()
                 .set_size(rows, cols);
         }
@@ -278,7 +317,7 @@ impl NomPane {
     pub fn screen_contents(&self) -> Option<String> {
         self.parser.as_ref().map(|p| {
             p.lock()
-                .expect("nom pane emulator lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .screen()
                 .contents()
         })
@@ -288,7 +327,7 @@ impl NomPane {
     pub fn emulator_size(&self) -> Option<(u16, u16)> {
         self.parser.as_ref().map(|p| {
             p.lock()
-                .expect("nom pane emulator lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .screen()
                 .size()
         })
@@ -329,7 +368,9 @@ impl NomPane {
         let Some(parser) = self.parser.as_ref() else {
             return false;
         };
-        let mut parser = parser.lock().expect("nom pane emulator lock poisoned");
+        let mut parser = parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let screen = parser.screen_mut();
         let before = screen.scrollback();
         screen.set_scrollback(update(before));
@@ -343,7 +384,9 @@ impl NomPane {
     /// Current offset from the live tail and the retained maximum.
     fn scrollback_position(&self) -> Option<(usize, usize)> {
         let parser = self.parser.as_ref()?;
-        let mut parser = parser.lock().expect("nom pane emulator lock poisoned");
+        let mut parser = parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let screen = parser.screen_mut();
         let current = screen.scrollback();
         screen.set_scrollback(usize::MAX);
@@ -429,12 +472,42 @@ impl Widget for &NomPane {
                 .render(area, buf);
             return;
         };
-        let parser = parser.lock().expect("nom pane emulator lock poisoned");
+        let parser = parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut cursor = Cursor::default();
         cursor.hide();
         PseudoTerminal::new(parser.screen())
             .cursor(cursor)
             .render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_parser_recovers_for_render_resize_and_scrolling() {
+        let mut pane = NomPane::new();
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(12, 60, 100)));
+        let shared = parser.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = shared.lock().unwrap();
+                panic!("fixture drain failure");
+            })
+            .join()
+            .is_err()
+        );
+        pane.parser = Some(parser);
+        pane.resize(15, 70);
+        assert_eq!(pane.emulator_size(), Some((15, 70)));
+        assert_eq!(pane.screen_contents(), Some(String::new()));
+        pane.scroll_to_top();
+        pane.scroll_to_bottom();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 70, 15));
+        (&pane).render(buffer.area, &mut buffer);
     }
 }
 
@@ -448,7 +521,7 @@ fn drain_pty(fd: OwnedFd, parser: Arc<Mutex<vt100::Parser>>, dirty: Arc<AtomicBo
             Ok(n) => {
                 parser
                     .lock()
-                    .expect("nom pane emulator lock poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .process(&buf[..n]);
                 dirty.store(true, Ordering::Release);
             }
