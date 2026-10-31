@@ -11,16 +11,22 @@ Spawn and group registration use the same lock as signal forwarding: termination
 cannot fall between spawning a child and remembering it. Once termination starts,
 new effects fail with `Interrupted` instead of launching another copy, recovery
 build or SSH connection. The engine forwards the received signal to all owned
-groups. After a two-second grace period it SIGKILLs any remaining groups and exits
-nonzero. If normal error handling finishes first, its group guards still clean up
-remaining children.
+groups. After a two-second grace period it SIGKILLs still-owned groups and exits
+nonzero. Reaping and deregistration share the forwarder lock, so no signal can
+race between a successful wait and removing its now-reusable PGID.
 
-Group guards also clean up on normal completion and when an async operation is
-dropped. In particular, a failed waiter or failure to spawn the waiter drops the
+Group guards clean up when an operation is cancelled or returns early while its
+leader is still unreaped. A successful wait disarms the guard: dropping a
+completed operation never signals a PGID that could belong to another process. In particular, a failed waiter or failure to spawn the waiter drops the
 activate-SSH future and kills that group; cancelling confirmation or boot staging
 does not detach SSH. Tokio children additionally use `kill_on_drop` for direct
-child reaping. The synchronous build group is settled before joining its output
-readers, so descendants cannot indefinitely hold those pipes open after Nix exits.
+child reaping. Capture drains stdout/stderr concurrently with waiting and
+unregisters a reaped leader immediately, even if descendants still hold pipes
+open. Deliberately choosing the simpler safe policy, descendants of a normally
+completed/reaped leader are not killed; as before this change, capture can wait
+for them to close inherited output descriptors. Killing such descendants safely
+would require a pre-reap observation (for example WNOWAIT), not a post-reap
+killpg, because an empty group's identifier is no longer reserved.
 
 The durable supervisor launches the engine in an isolated group, forwards
 SIGTERM/SIGINT to it, and remains alive to reap it. `DeployRun::terminate` signals
@@ -38,4 +44,6 @@ is handled separately (LAB-87).
 `crates/mandala/tests/termination.rs` exercises real engine and supervisor binaries
 with isolated shell-only Nix/SSH effects. It checks build/copy/SSH descendant
 cleanup, both forwarded signals, escalation for a signal-ignoring build, and the
-failed-waiter/activate race. It never signals live fleet processes.
+failed-waiter/activate race. Unit tests intercept the group-signal operation to
+assert successful std/async waits never signal on drop and an unreaped guard
+still does. Tests never signal live fleet processes.

@@ -815,14 +815,14 @@ fn save_derivation_log(
     std::fs::create_dir_all(&directory)?;
     let path = directory.join(name).with_extension("log");
     let file = std::fs::File::create(&path)?;
-    let (child, _group) = mandala_deploy::process::spawn_std(
+    let (child, group) = mandala_deploy::process::spawn_std(
         ProcCommand::new(program)
             .args(["log", "--offline", drv])
             .stdin(Stdio::null())
             .stdout(file)
             .stderr(Stdio::piped()),
     )?;
-    let output = child.wait_with_output()?;
+    let output = mandala_deploy::process::wait_std_with_output(child, group)?;
     if output.status.success() {
         Ok(path)
     } else {
@@ -914,7 +914,7 @@ fn build_profiles_with(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (mut child, build_group) = match mandala_deploy::process::spawn_std(&mut command) {
+    let (mut child, mut build_group) = match mandala_deploy::process::spawn_std(&mut command) {
         Ok(child) => child,
         Err(error) => {
             let _ = writer.emit(
@@ -1001,9 +1001,8 @@ fn build_profiles_with(
         (tracker, forest, event_error)
     });
 
-    let status = child.wait()?;
-    // A reaped Nix may have left descendants holding the capture pipes open.
-    // Settle the owned group before joining the pipe readers.
+    let status = mandala_deploy::process::wait_std(&mut child, &mut build_group)?;
+    // Once reaped, the old PGID can be reused and must never be signalled.
     drop(build_group);
     let stdout_lines = stdout_task
         .join()

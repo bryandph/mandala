@@ -858,7 +858,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    let (mut child, _engine_group) = match mandala_deploy::process::spawn_std(&mut command) {
+    let (mut child, mut engine_group) = match mandala_deploy::process::spawn_std(&mut command) {
         Ok(child) => child,
         Err(error) => {
             if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
@@ -867,7 +867,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
             return Ok(127);
         }
     };
-    let status = child.wait()?;
+    let status = mandala_deploy::process::wait_std(&mut child, &mut engine_group)?;
     Ok(exit_code(status))
 }
 
