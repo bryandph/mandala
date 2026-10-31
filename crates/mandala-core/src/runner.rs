@@ -769,6 +769,8 @@ fn merge_meta(meta: &mut Meta, extra: &Meta) {
 }
 
 const DEPLOY_SUPERVISOR_REQUEST: &str = "supervisor.json";
+/// Private supervisor -> direct engine child handoff, never a global env edit.
+pub(crate) const DEPLOY_SUPERVISOR_PID_ENV: &str = "MANDALA_DEPLOY_SUPERVISOR_PID";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DeploySupervisorRequest {
@@ -853,6 +855,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
     let err = out.try_clone()?;
     let mut command = std::process::Command::new(&request.argv[0]);
     command
+        .env(DEPLOY_SUPERVISOR_PID_ENV, std::process::id().to_string())
         .args(&request.argv[1..])
         .current_dir(&request.cwd)
         .stdin(Stdio::null())

@@ -28,3 +28,4 @@ mandala-tui.workspace = true
 [dev-dependencies]
 # The stdio-MCP handshake integration test (spike 1.2) drives JSON-RPC by hand.
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

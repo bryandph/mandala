@@ -897,6 +897,7 @@ dependencies = [
  "mandala-mcp",
  "mandala-tui",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

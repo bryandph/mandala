@@ -38,12 +38,30 @@ This is local process ownership, not remote rollback authority. Ending a local
 SSH connection cannot undo a remote activation already in progress; deploy-rs's
 existing canary/rollback protocol controls that outcome. SIGKILL to the engine
 cannot be forwarded, and a descendant deliberately creating a new session can
-escape a process group. Run metadata/liveness after an abruptly killed supervisor
-is handled separately (LAB-87).
+escape a process group.
+
+The supervisor passes `MANDALA_DEPLOY_SUPERVISOR_PID` only in its engine child's
+command environment. The engine writes that positive process ID as
+`supervisor_pid` in its initial atomic `meta.json`, before publishing its run ID.
+No frontend discovery-time metadata merge is needed, and subsequent engine
+metadata updates preserve the field. This is a private handoff, not a user
+configuration option: ordinary direct CLI runs omit it, and malformed/out-of-range
+values are ignored. A valid handoff is not checked against the current parent
+PID, because an engine whose supervisor died early may already be reparented.
+Callers launching a standalone engine must not inject an unrelated stale hint.
+
+Registry observers and attached frontends treat a dead recorded supervisor with
+no terminal run rc as failure, even if the engine PID remains alive. A live
+supervisor also protects its registered run from retention pruning. Neither
+observer writes metadata or kills processes implicitly. PID reuse retains the
+registry's existing conservative liveness caveat.
 
 `crates/mandala/tests/termination.rs` exercises real engine and supervisor binaries
 with isolated shell-only Nix/SSH effects. It checks build/copy/SSH descendant
 cleanup, both forwarded signals, escalation for a signal-ignoring build, and the
 failed-waiter/activate race. Unit tests intercept the group-signal operation to
 assert successful std/async waits never signal on drop and an unreaped guard
-still does. Tests never signal live fleet processes.
+still does. `crates/mandala/tests/supervisor_metadata.rs` exercises real
+`DeployRun::start` metadata, supervisor-death detection, active-run retention,
+direct CLI omission and an already-dead handoff. Tests never signal live fleet
+processes.
