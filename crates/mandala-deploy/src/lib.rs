@@ -14,6 +14,7 @@ use thiserror::Error;
 pub mod data;
 pub mod deploy;
 pub mod event;
+pub mod process;
 pub mod push;
 
 pub use event::{EventSink, JsonlSink, Level};
