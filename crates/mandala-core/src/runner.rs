@@ -57,7 +57,15 @@ fn version_supported(v: Option<i64>) -> bool {
 pub struct EventWriter {
     host: String,
     plugin: String,
-    file: Mutex<std::fs::File>,
+    file: Mutex<EventFile>,
+}
+
+#[derive(Debug)]
+struct EventFile {
+    file: std::fs::File,
+    build_filter: Option<crate::build_log::BuildLogFilter>,
+    bytes: u64,
+    truncated: bool,
 }
 
 struct EventRecord<'a> {
@@ -133,7 +141,12 @@ impl EventWriter {
         Ok(Self {
             host: host.to_string(),
             plugin: plugin.to_string(),
-            file: Mutex::new(file),
+            file: Mutex::new(EventFile {
+                bytes: file.metadata()?.len(),
+                file,
+                build_filter: (stream == "build").then(Default::default),
+                truncated: false,
+            }),
         })
     }
 
@@ -155,6 +168,30 @@ impl EventWriter {
         fields: serde_json::Map<String, Value>,
         ts: f64,
     ) -> std::io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("event writer lock poisoned"))?;
+        if event == "nixlog"
+            && let Some(filter) = file.build_filter.as_mut()
+            && !filter.retain(
+                fields
+                    .get("line")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        {
+            return Ok(());
+        }
+        let mut fields = fields;
+        if file.build_filter.is_some() && event != "nixlog" {
+            fields
+                .values_mut()
+                .for_each(crate::build_log::bound_strings);
+        }
+        let terminal = (event == "status"
+            && fields.get("state").and_then(Value::as_str) == Some("done"))
+            || (event == "progress" && fields.get("final").and_then(Value::as_bool) == Some(true));
         let record = EventRecord {
             v: EVENT_PROTOCOL_VERSION,
             ts,
@@ -164,13 +201,37 @@ impl EventWriter {
             fields,
         };
 
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| std::io::Error::other("event writer lock poisoned"))?;
-        serde_json::to_writer(&mut *file, &record).map_err(std::io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.flush()
+        let mut bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+        if file.build_filter.is_some() {
+            use crate::build_log::{BUILD_LOG_MAX_BYTES, TERMINAL_RESERVE};
+            let limit = if terminal {
+                BUILD_LOG_MAX_BYTES
+            } else {
+                BUILD_LOG_MAX_BYTES - TERMINAL_RESERVE
+            };
+            // Leave room for one explicit notice; do not rotate/truncate under tailers.
+            if (!terminal && file.truncated) || file.bytes + bytes.len() as u64 > limit - 1024 {
+                if !file.truncated {
+                    file.truncated = true;
+                    let notice = EventRecord {
+                        v: EVENT_PROTOCOL_VERSION, ts, host: &self.host, plugin: &self.plugin,
+                        event: "line", fields: [("line".into(), Value::from("build log size cap reached; subsequent detail omitted (final counters/status retained)")), ("stream".into(), Value::from("mandala"))].into_iter().collect(),
+                    };
+                    let mut notice = serde_json::to_vec(&notice).map_err(std::io::Error::other)?;
+                    notice.push(b'\n');
+                    if file.bytes + notice.len() as u64 <= BUILD_LOG_MAX_BYTES {
+                        file.file.write_all(&notice)?;
+                        file.bytes += notice.len() as u64;
+                        file.file.flush()?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        file.file.write_all(&bytes)?;
+        file.bytes += bytes.len() as u64;
+        file.file.flush()
     }
 }
 

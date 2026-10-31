@@ -1093,7 +1093,9 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
             build["nodes"] = serde_json::to_value(nodes).unwrap_or_default();
             build["nodes_truncated"] = Value::from(elided);
         }
-        build["forest"] = serde_json::to_value(snapshot.into_summary()).unwrap_or_default();
+        build["forest"] = bounded_forest_summary(
+            serde_json::to_value(snapshot.into_summary()).unwrap_or_default(),
+        );
     }
     json!({
         "run_id": obs.info.run_id,
@@ -1108,6 +1110,24 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
         "hosts": hosts,
         "build": build,
     })
+}
+
+/// Count/row limits alone cannot bound producer-controlled diagnostic strings.
+/// Keep the forest part of a tool result below 32 KiB, explicitly falling back
+/// to exact counts rather than returning a result the client cannot consume.
+fn bounded_forest_summary(value: Value) -> Value {
+    if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 32 * 1024) {
+        value
+    } else {
+        json!({
+            "version": value["version"],
+            "elapsed_ms": value["elapsed_ms"],
+            "counts": value["counts"],
+            "detail_truncated": true,
+            "completed_downloads": value["completed_downloads"],
+            "completed_substitutions": value["completed_substitutions"],
+        })
+    }
 }
 
 /// The default projection of a deploy run's meta: the outcome and identity
@@ -1395,6 +1415,22 @@ mod tests {
             json!(["confirmation failed; rolled back"])
         );
         assert_eq!(snap["hosts"]["beta"]["raw_lines_total"], 1);
+    }
+
+    #[test]
+    fn forest_summary_byte_budget_handles_oversized_errors() {
+        let mut tailer =
+            mandala_core::runner::EventTailer::new(std::path::Path::new("/nonexistent"));
+        tailer.forest.feed_line(&format!(
+            "@nix {}",
+            json!({"action":"msg","level":0,"msg":"e".repeat(100_000)})
+        ));
+        let value = bounded_forest_summary(
+            serde_json::to_value(tailer.forest.snapshot().into_summary()).unwrap(),
+        );
+        assert_eq!(value["detail_truncated"], true);
+        assert!(value["counts"].is_object());
+        assert!(serde_json::to_vec(&value).unwrap().len() < 32 * 1024);
     }
 
     #[test]

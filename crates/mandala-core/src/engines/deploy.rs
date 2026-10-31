@@ -1029,7 +1029,9 @@ fn build_profiles_with(
     let rc = outcome
         .as_ref()
         .map_or_else(|error| error.exit_code(), |_| process_rc);
-    if let Err(error) = writer.emit("progress", tracker.fields()).and_then(|()| {
+    let mut final_progress = tracker.fields();
+    final_progress.insert("final".into(), Value::Bool(true));
+    if let Err(error) = writer.emit("progress", final_progress).and_then(|()| {
         writer.emit(
             "status",
             event_fields([("rc", Value::from(rc)), ("state", Value::from("done"))]),

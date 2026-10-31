@@ -42,6 +42,7 @@ fn registry_env() -> &'static PathBuf {
         unsafe {
             std::env::set_var("MANDALA_FLEET_STATE", &dir);
             std::env::set_var("MANDALA_FLEET_RUN_KEEP", "500");
+            std::env::set_var("MANDALA_FLEET_RUN_MAX_AGE_DAYS", "30");
             std::env::remove_var("MANDALA_DEPLOY_SUPERVISOR_BIN");
         }
         dir
@@ -89,10 +90,13 @@ fn stub_cfg(deploy_program: &[&str]) -> ExplorerConfig {
     let body = deploy_program[2];
     // Emulate the native engine boundary: the frontend/supervisor passes no
     // events directory. The engine stub allocates its own registry run,
-    // publishes that id, then writes events there.
+    // publishes that id, then writes events there. Match the real engine's
+    // current timestamp: a fixed old date makes completed stubs eligible for
+    // age pruning by concurrently allocating attached-mode tests.
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S_%6f").to_string();
     let native = format!(
         r#"test -z "$MANDALA_FLEET_EVENTS" || exit 91
-rid="20260721T120000_000000-$$"
+rid="{stamp}-$$"
 events="$MANDALA_FLEET_STATE/runs/$rid"
 mkdir -p "$events"
 printf '{{"run_id":"%s","limit":"web","pid":%s,"started_at":0}}\n' "$rid" "$$" > "$events/meta.json"
@@ -380,6 +384,54 @@ async fn owned_finish_materializes_summary_with_recap() {
     assert_eq!(summary.recap[0], "PLAY RECAP *********");
     assert_eq!(summary.recap[1], "web : ok=3 failed=0");
     assert_eq!(summary.recap.len(), 2);
+}
+
+/// An exited run can be pruned while a frontend is between polling ticks.
+/// Engine stubs must publish a current run timestamp, just like the real engine,
+/// so another test allocating a run cannot age-prune their final events.
+#[tokio::test]
+async fn completed_native_stub_survives_retention_before_final_discovery() {
+    registry_env();
+    let cfg = stub_cfg(&[
+        "sh",
+        "-c",
+        r#"printf '%s\n' '{"v":1,"ts":0,"host":"web","plugin":"deploy","event":"milestone","milestone":"rollback"}' > "$MANDALA_NATIVE_TEST_EVENTS/web.jsonl"; exit 0"#,
+    ]);
+    let mut run = DeployRun::new("web");
+    run.program = cfg.deploy_program;
+    run.start().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !run.finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native stub did not exit"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let run_id = run
+        .output()
+        .into_iter()
+        .find(|line| registry::is_valid_run_id(line.trim()))
+        .expect("published run id");
+    let path = registry::runs_dir().join(run_id.trim());
+    assert!(path.exists(), "stub allocated a run");
+    // Deterministically reproduce a concurrent attached test's allocation,
+    // after this engine exits but before the observer discovers final events.
+    let _ = registry::new_run_dir().unwrap();
+    assert!(
+        path.exists(),
+        "a newly completed native stub must not be age-pruned"
+    );
+    assert!(run.discover_run().unwrap());
+    assert_eq!(run.returncode(), Some(1));
+    assert!(
+        run.tailer
+            .as_ref()
+            .unwrap()
+            .hosts
+            .values()
+            .any(|host| host.state == HostState::RolledBack)
+    );
 }
 
 #[tokio::test]

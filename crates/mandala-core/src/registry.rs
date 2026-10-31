@@ -36,6 +36,9 @@ use crate::runner::{EventTailer, HostState, is_terminal};
 /// allocated. A run whose recorded pid is still alive is NEVER pruned. Override
 /// via `MANDALA_FLEET_RUN_KEEP`.
 pub const DEFAULT_KEEP: usize = 20;
+/// Inactive runs older than this are removed even below the count cap.
+/// Override with `MANDALA_FLEET_RUN_MAX_AGE_DAYS` (0 disables age pruning).
+pub const DEFAULT_MAX_AGE_DAYS: u64 = 30;
 
 const META: &str = "meta.json";
 const META_TMP: &str = "meta.json.tmp";
@@ -248,7 +251,7 @@ fn list_runs_in(base: &Path) -> Vec<RunInfo> {
     let mut runs: Vec<RunInfo> = rd
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
         .filter_map(|p| {
             let run_id = p
                 .file_name()
@@ -279,15 +282,43 @@ pub fn prune(keep: Option<usize>) {
 }
 
 fn prune_in(base: &Path, keep: Option<usize>) {
-    let keep = keep.unwrap_or_else(keep_env);
+    let days = std::env::var("MANDALA_FLEET_RUN_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_AGE_DAYS);
+    prune_policy(
+        base,
+        keep.unwrap_or_else(keep_env),
+        days,
+        chrono::Utc::now().naive_utc(),
+    );
+}
+
+fn prune_policy(base: &Path, keep: usize, max_age_days: u64, now: chrono::NaiveDateTime) {
     let mut survivors = 0usize;
     for info in list_runs_in(base) {
         // most-recent first
-        if pid_alive(info.pid()) {
-            continue; // live runs are kept and don't count against the cap
+        let supervisor = info.meta.get("supervisor_pid").and_then(Value::as_i64);
+        let allocating_pid = info
+            .meta
+            .is_empty()
+            .then(|| {
+                info.run_id
+                    .rsplit_once('-')
+                    .and_then(|(_, pid)| pid.parse::<i64>().ok())
+            })
+            .flatten();
+        if pid_alive(info.pid()) || pid_alive(supervisor) || pid_alive(allocating_pid) {
+            continue; // include supervisors and not-yet-published allocations
         }
+        let expired = max_age_days > 0
+            && chrono::NaiveDateTime::parse_from_str(&info.run_id[..22], "%Y%m%dT%H%M%S_%6f")
+                .is_ok_and(|started| {
+                    now.signed_duration_since(started).num_days()
+                        >= max_age_days.min(i64::MAX as u64) as i64
+                });
         survivors += 1;
-        if survivors > keep {
+        if survivors > keep || expired {
             let _ = std::fs::remove_dir_all(&info.path);
         }
     }
@@ -675,7 +706,7 @@ mod tests {
         write_meta(&live, &meta(&[("pid", Value::from(4242))])).unwrap(); // "alive"
 
         let _g = test_hooks::install(|pid| pid == Some(4242));
-        prune_in(&base, Some(2));
+        prune_policy(&base, 2, 0, chrono::Utc::now().naive_utc());
 
         let survivors: std::collections::BTreeSet<String> =
             list_runs_in(&base).into_iter().map(|r| r.run_id).collect();
@@ -683,6 +714,40 @@ mod tests {
         assert!(survivors.contains(&ids[5]) && survivors.contains(&ids[4]));
         assert!(!survivors.contains(&ids[0]) && !survivors.contains(&ids[3]));
         assert!(survivors.contains("20260101T000000_000000-9"));
+    }
+
+    #[test]
+    fn prune_age_spares_active_supervisor_and_unpublished_runs() {
+        let base = tmp().join("runs");
+        let now =
+            chrono::NaiveDateTime::parse_from_str("20260215T000000", "%Y%m%dT%H%M%S").unwrap();
+        for (id, fields) in [
+            (
+                "20260101T000000_000000-1",
+                meta(&[("pid", Value::from(999999))]),
+            ),
+            (
+                "20260214T000000_000000-1",
+                meta(&[("pid", Value::from(999999))]),
+            ),
+            (
+                "20260101T000000_000000-2",
+                meta(&[("supervisor_pid", Value::from(4242))]),
+            ),
+            ("20260101T000000_000000-4242", Meta::new()),
+            ("20260101T000000_000000-999999", Meta::new()),
+        ] {
+            let path = base.join(id);
+            std::fs::create_dir_all(&path).unwrap();
+            write_meta(&path, &fields).unwrap();
+        }
+        let _g = test_hooks::install(|pid| pid == Some(4242));
+        prune_policy(&base, 20, 30, now);
+        assert!(!base.join("20260101T000000_000000-1").exists());
+        assert!(base.join("20260214T000000_000000-1").exists());
+        assert!(base.join("20260101T000000_000000-2").exists());
+        assert!(base.join("20260101T000000_000000-4242").exists());
+        assert!(!base.join("20260101T000000_000000-999999").exists());
     }
 
     // ---- liveness decision tree ---------------------------------------------

@@ -1,6 +1,7 @@
 //! mandala-core — fleet inventory, selector algebra, drift, and the run
 //! registry: the shared cores the CLI and the MCP server read.
 
+pub mod build_log;
 pub mod cli;
 pub mod drift;
 pub mod engines;
