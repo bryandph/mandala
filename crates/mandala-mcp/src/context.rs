@@ -88,7 +88,7 @@ pub fn handler_dispatch(handler: Arc<MandalaHandler>) -> Dispatch {
 /// subscribers see every call this leader executes, origin-labeled.
 #[must_use]
 pub fn host_config_factory(flake: &str) -> HostConfigFactory {
-    factory_with_effects(flake, crate::effects::RealEffects::new)
+    factory_with_effects(flake, |path| crate::effects::RealEffects::new(path))
 }
 
 /// [`host_config_factory`] over QUIET production effects: the eval worker's
@@ -97,19 +97,22 @@ pub fn host_config_factory(flake: &str) -> HostConfigFactory {
 /// section-4 quiet rule now covers the hosted leader's children too).
 #[must_use]
 pub fn quiet_host_config_factory(flake: &str) -> HostConfigFactory {
-    factory_with_effects(flake, crate::effects::RealEffects::quiet)
+    factory_with_effects(flake, |path| crate::effects::RealEffects::quiet(path))
 }
 
 fn factory_with_effects(
     flake: &str,
-    effects: fn() -> crate::effects::RealEffects,
+    effects: fn(&str) -> crate::effects::RealEffects,
 ) -> HostConfigFactory {
-    let flake = flake.to_string();
+    let flake = mandala_context::ContextIdentity::for_flake(flake).map_or_else(
+        |_| flake.to_string(),
+        |identity| identity.flake().to_string(),
+    );
     Arc::new(move || {
         let (events, _) = broadcast::channel::<Value>(256);
         let sink_events = events.clone();
         let handler = Arc::new(
-            MandalaHandler::with_effects(&flake, Arc::new(effects())).with_sink(Arc::new(
+            MandalaHandler::with_effects(&flake, Arc::new(effects(&flake))).with_sink(Arc::new(
                 move |event: &Value| {
                     let _ = sink_events.send(event.clone());
                 },

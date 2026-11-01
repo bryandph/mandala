@@ -793,12 +793,17 @@ impl App {
                     let choice = reboot.choice();
                     // The chosen order + drain ride as extra-vars through
                     // `reboot_argv` (shared with the MCP tool — the
-                    // wrapper-preference rationale lives there).
-                    match (self.cfg.reboot_argv)(&reboot.target, choice.serial, choice.drain) {
+                    // flake-app environment contract lives there).
+                    match (self.cfg.reboot_argv)(
+                        std::path::Path::new(&self.cfg.flake),
+                        &reboot.target,
+                        choice.serial,
+                        choice.drain,
+                    ) {
                         None => self.state.set_status(screen::REBOOT_UNAVAILABLE, false),
                         Some(argv) => {
                             let title = format!("reboot {}", reboot.target);
-                            self.push_task(title, argv, ansible_dir(), true);
+                            self.push_task(title, argv, ansible_dir(&self.cfg.flake), true);
                         }
                     }
                     self.dirty = true;
@@ -1245,12 +1250,19 @@ impl App {
         match action {
             FleetAction::Ping => {
                 let argv = (self.cfg.ping_argv)(&target);
-                self.push_task(format!("ping {target}"), argv, ansible_dir(), false);
+                self.push_task(
+                    format!("ping {target}"),
+                    argv,
+                    ansible_dir(&self.cfg.flake),
+                    false,
+                );
             }
             FleetAction::Reboot => {
                 // Availability pre-check: probe the shared launch line the
                 // way `action_reboot` does before showing the modal.
-                if (self.cfg.reboot_argv)(&target, "1", true).is_none() {
+                if (self.cfg.reboot_argv)(std::path::Path::new(&self.cfg.flake), &target, "1", true)
+                    .is_none()
+                {
                     self.state.set_status(screen::REBOOT_UNAVAILABLE, false);
                     self.dirty = true;
                     return;

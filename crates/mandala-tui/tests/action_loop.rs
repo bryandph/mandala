@@ -219,7 +219,12 @@ async fn esc_on_a_running_task_dismisses_with_rc_none() {
 
 // ---- reboot: pre-check, modal flow, after-mutation --------------------------
 
-fn reboot_unavailable(_t: &str, _s: &str, _d: bool) -> Option<Vec<String>> {
+fn reboot_unavailable(
+    _flake: &std::path::Path,
+    _t: &str,
+    _s: &str,
+    _d: bool,
+) -> Option<Vec<String>> {
     None
 }
 
@@ -242,7 +247,12 @@ thread_local! {
     static REBOOT_CALLS: RefCell<Vec<(String, String, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
-fn reboot_capture(target: &str, serial: &str, drain: bool) -> Option<Vec<String>> {
+fn reboot_capture(
+    _flake: &std::path::Path,
+    target: &str,
+    serial: &str,
+    drain: bool,
+) -> Option<Vec<String>> {
     REBOOT_CALLS.with(|calls| {
         calls
             .borrow_mut()
@@ -306,7 +316,7 @@ async fn reboot_modal_esc_cancels_without_running() {
     assert_eq!(calls.len(), 1);
 }
 
-fn reboot_quick(_t: &str, _s: &str, _d: bool) -> Option<Vec<String>> {
+fn reboot_quick(_flake: &std::path::Path, _t: &str, _s: &str, _d: bool) -> Option<Vec<String>> {
     Some(vec!["sh".into(), "-c".into(), "echo done".into()])
 }
 

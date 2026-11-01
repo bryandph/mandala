@@ -143,7 +143,8 @@ impl MandalaHandler {
     /// A handler over the production effects (evaluator, runners, ansible).
     #[must_use]
     pub fn new(flake: impl Into<String>) -> Self {
-        Self::with_effects(flake, Arc::new(RealEffects::new()))
+        let flake = flake.into();
+        Self::with_effects(flake.clone(), Arc::new(RealEffects::new(flake)))
     }
 
     /// A handler over injected effects (the parity tests' seam).
@@ -895,7 +896,7 @@ impl MandalaHandler {
         let launch = self
             .state
             .effects
-            .launch_command(argv, "reboot", Some(ansible_dir()), extra)
+            .launch_command(argv, "reboot", Some(ansible_dir(&self.state.flake)), extra)
             .await
             .map_err(|e| tool_error(e.to_string()))?;
         if !launch.launched {

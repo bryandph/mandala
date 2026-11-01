@@ -25,7 +25,6 @@
 //! (see [`crate::drift::to_pretty_1space`]).
 
 use std::ffi::OsString;
-use std::path::Path;
 use std::process::ExitCode;
 
 use chrono::Utc;
@@ -512,13 +511,8 @@ fn run_drift(inv: &Inventory, flake: &str, m: &ArgMatches) -> ExitCode {
     let nodes = inv.deploy_nodes();
 
     if refresh {
-        // Prefer the ./ansible working dir when it carries the collection cfg.
-        let ansible_dir = if Path::new("ansible/ansible.cfg").is_file() {
-            Path::new("ansible")
-        } else {
-            Path::new(".")
-        };
-        match drift::refresh_snapshots(ansible_dir, None, None) {
+        let ansible_dir = crate::runner::ansible_dir(flake);
+        match drift::refresh_snapshots(&ansible_dir, None, None) {
             Ok(rc) if rc != 0 => {
                 eprintln!("state survey exited {rc} (continuing with whatever was captured)");
             }
