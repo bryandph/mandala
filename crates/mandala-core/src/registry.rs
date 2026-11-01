@@ -64,7 +64,7 @@ pub fn runs_dir() -> PathBuf {
 
 /// The retention cap: `MANDALA_FLEET_RUN_KEEP` (clamped to at least 1) else
 /// [`DEFAULT_KEEP`]. An empty or unparseable value falls back to the default.
-fn keep_env() -> usize {
+pub(crate) fn keep_env() -> usize {
     if let Ok(raw) = std::env::var("MANDALA_FLEET_RUN_KEEP")
         && !raw.is_empty()
         && let Ok(n) = raw.parse::<i64>()

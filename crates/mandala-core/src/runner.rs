@@ -759,8 +759,174 @@ fn deploy_launches_dir() -> PathBuf {
         .join("deploy-launches")
 }
 
+// The launch name protects the allocation window; active.json protects a
+// supervisor/inline engine after the frontend exits. Recycled PIDs retain
+// extra state conservatively, matching the registry's liveness policy.
+const LAUNCH_ACTIVE: &str = "active.json";
+
+/// Shared open-file-description lock, inherited by the supervisor/engine.
+/// Unlike a PID publication alone this also covers a frontend dying between
+/// spawn and publication, before the supervisor has executed its first line.
+fn lock_launch(dir: &Path) -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("active.lock"))?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+// Called only in the forked child immediately before exec. The parent's fd
+// remains CLOEXEC; unrelated concurrently spawned children cannot inherit it.
+unsafe fn inherit_launch_lock(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+    if flags < 0
+        || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn write_launch_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
+    let temporary = dir.join(format!("active.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, format!("{{\"pid\":{pid}}}"))?;
+    std::fs::rename(temporary, dir.join(LAUNCH_ACTIVE))
+}
+
+fn launch_max_age_days() -> u64 {
+    std::env::var("MANDALA_FLEET_RUN_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(registry::DEFAULT_MAX_AGE_DAYS)
+}
+
+/// Prune inactive launch logs using the same count and age policy as runs.
+/// Unknown names, symlinks and unreadable activity metadata are left alone.
+fn prune_deploy_launches(base: &Path, keep: usize, days: u64, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let mut inactive = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let parts: Vec<_> = name.split('-').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let (Ok(stamp), Ok(allocator), Ok(_sequence)) = (
+            parts[0].parse::<u128>(),
+            parts[1].parse::<i64>(),
+            parts[2].parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if allocator <= 0 {
+            continue;
+        }
+        let path = entry.path();
+        // Do not follow a lock-file symlink supplied in a fixture/import.
+        if path
+            .join("active.lock")
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            continue;
+        }
+        let Ok(lock) = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.join("active.lock"))
+        else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        let active = match std::fs::read(path.join(LAUNCH_ACTIVE)) {
+            Ok(bytes) => {
+                let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                    continue;
+                };
+                let Some(pid) = value.get("pid").and_then(Value::as_i64) else {
+                    continue;
+                };
+                registry::pid_alive(Some(pid))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Legacy and not-yet-published allocations: never remove a
+                // live allocator, nor a launch whose registry engine lives.
+                registry::pid_alive(Some(allocator)) || launch_engine_alive(&path)
+            }
+            Err(_) => continue,
+        };
+        if !active && !launch_engine_alive(&path) {
+            inactive.push((stamp, path));
+        }
+    }
+    inactive.sort_by(|a, b| b.0.cmp(&a.0));
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let max_age = u128::from(days) * 86_400 * 1_000_000_000;
+    for (index, (stamp, path)) in inactive.into_iter().enumerate() {
+        if index >= keep || (days > 0 && now.saturating_sub(stamp) >= max_age) {
+            // Recheck the lock at removal, without keeping one fd open per
+            // historic launch during the scan.
+            let Ok(lock) = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join("active.lock"))
+            else {
+                continue;
+            };
+            if lock.try_lock().is_ok() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+}
+
+fn launch_engine_alive(path: &Path) -> bool {
+    let Ok(log) = std::fs::File::open(path.join(COMMAND_LOG)) else {
+        return false;
+    };
+    // The engine's identity is its first output record, not an unbounded
+    // scan through a potentially large launch log.
+    for line in BufReader::new(std::io::Read::take(log, 64 * 1024))
+        .lines()
+        .take(32)
+        .flatten()
+    {
+        if registry::is_valid_run_id(line.trim())
+            && let Some(run) = registry::open_run(line.trim())
+        {
+            return registry::pid_alive(run.info.pid())
+                || registry::pid_alive(
+                    run.info.meta.get("supervisor_pid").and_then(Value::as_i64),
+                );
+        }
+    }
+    false
+}
+
 fn new_deploy_launch_dir() -> std::io::Result<PathBuf> {
     let base = deploy_launches_dir();
+    prune_deploy_launches(
+        &base,
+        registry::keep_env(),
+        launch_max_age_days(),
+        SystemTime::now(),
+    );
     std::fs::create_dir_all(&base)?;
     for attempt in 0..100_u32 {
         let stamp = SystemTime::now()
@@ -815,6 +981,7 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
         ));
     }
 
+    write_launch_pid(&launch_dir, std::process::id())?;
     let request_path = launch_dir.join(DEPLOY_SUPERVISOR_REQUEST);
     let request: DeploySupervisorRequest =
         serde_json::from_slice(&std::fs::read(&request_path)?).map_err(std::io::Error::other)?;
@@ -1024,9 +1191,15 @@ impl DeployRun {
         )?;
         std::fs::rename(&request_tmp, launch_dir.join(DEPLOY_SUPERVISOR_REQUEST))?;
 
+        let launch_lock = lock_launch(&launch_dir)?;
+        let lock_fd = std::os::fd::AsRawFd::as_raw_fd(&launch_lock);
         let supervisor_out = std::fs::OpenOptions::new().append(true).open(&log_path)?;
         let supervisor_err = supervisor_out.try_clone()?;
-        let child = match tokio::process::Command::new(supervisor)
+        let mut command = tokio::process::Command::new(supervisor);
+        unsafe {
+            command.pre_exec(move || inherit_launch_lock(lock_fd));
+        }
+        let child = match command
             .process_group(0)
             .arg(&launch_dir)
             .stdin(Stdio::null())
@@ -1043,6 +1216,9 @@ impl DeployRun {
                 return Err(error);
             }
         };
+        if let Some(pid) = child.id() {
+            write_launch_pid(&launch_dir, pid)?;
+        }
         self.child = Some(child);
         Ok(())
     }
@@ -1061,7 +1237,12 @@ impl DeployRun {
         log.flush()?;
         let err = log.try_clone()?;
 
+        let launch_lock = lock_launch(&launch_dir)?;
+        let lock_fd = std::os::fd::AsRawFd::as_raw_fd(&launch_lock);
         let mut cmd = tokio::process::Command::new(&argv[0]);
+        unsafe {
+            cmd.pre_exec(move || inherit_launch_lock(lock_fd));
+        }
         cmd.process_group(0)
             .args(&argv[1..])
             .current_dir(&cwd)
@@ -1071,6 +1252,9 @@ impl DeployRun {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err));
         let child = cmd.spawn()?;
+        if let Some(pid) = child.id() {
+            write_launch_pid(&launch_dir, pid)?;
+        }
         self.child = Some(child);
         Ok(())
     }
@@ -1789,6 +1973,119 @@ mod write_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Allocation applies the same 20 inactive / 30 day defaults as runs,
+    /// excluding live allocators, supervisors and engines from that budget.
+    #[test]
+    fn launch_allocation_bounds_inactive_logs_and_never_prunes_live_launches() {
+        let root = tmp_base();
+        let _base = registry::test_hooks::install_runs_base(root.join("runs"));
+        let _pids = registry::test_hooks::install(|pid| pid == Some(4242));
+        let base = root.join("deploy-launches");
+        std::fs::create_dir_all(&base).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let day = 86_400_u128 * 1_000_000_000;
+        let expired = base.join(format!("{}-999999-0", now - 31 * day));
+        std::fs::create_dir(&expired).unwrap();
+        for n in 0_u32..25 {
+            let path = base.join(format!("{}-999999-{n}", now - day + u128::from(n)));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join(COMMAND_LOG), "fixture output").unwrap();
+        }
+        let active = base.join(format!("{}-999999-0", now - 60 * day));
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("active.json"), r#"{"pid":4242}"#).unwrap();
+        let allocating = base.join(format!("{}-4242-0", now - 90 * day));
+        std::fs::create_dir(&allocating).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "never follow symlinks").unwrap();
+        let link = base.join(format!("{}-999999-9", now - 100 * day));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let unknown = base.join("unknown-do-not-delete");
+        std::fs::create_dir(&unknown).unwrap();
+
+        let fresh = new_deploy_launch_dir().unwrap();
+        assert!(!expired.exists(), "inactive launches expire after 30 days");
+        assert!(active.exists(), "live supervisor is never pruned");
+        assert!(allocating.exists(), "live allocator is never pruned");
+        assert!(outside.join("keep").exists());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(unknown.exists());
+        assert!(fresh.exists());
+        let inactive_logs = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().join(COMMAND_LOG).is_file())
+            .count();
+        assert_eq!(inactive_logs, 20, "only 20 inactive launch logs survive");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inherited_launch_lock_protects_spawn_before_pid_publication() {
+        use std::os::unix::process::CommandExt;
+        let root = tmp_base();
+        let _pids = registry::test_hooks::install(|_| false);
+        let launch = root.join("1000000000-999999-0");
+        std::fs::create_dir(&launch).unwrap();
+        let lock = lock_launch(&launch).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&lock);
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        unsafe {
+            command.pre_exec(move || inherit_launch_lock(fd));
+        }
+        let mut child = command.spawn().unwrap();
+        drop(lock); // model frontend death before publishing supervisor PID
+        prune_deploy_launches(&root, 0, 1, SystemTime::now());
+        assert!(
+            launch.exists(),
+            "inherited lock protects the unpublished child"
+        );
+        assert!(child.wait().unwrap().success());
+        prune_deploy_launches(&root, 0, 1, SystemTime::now());
+        assert!(
+            !launch.exists(),
+            "exited child releases the launch for retention"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launch_retention_honors_age_disable_and_protects_registered_engines() {
+        let root = tmp_base();
+        let _base = registry::test_hooks::install_runs_base(root.join("runs"));
+        let _pids = registry::test_hooks::install(|pid| pid == Some(4242));
+        let base = root.join("deploy-launches");
+        std::fs::create_dir_all(&base).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(90 * 86_400);
+        let old = base.join("1000000000-999999-0");
+        std::fs::create_dir(&old).unwrap();
+        prune_deploy_launches(&base, 20, 0, now);
+        assert!(old.exists(), "age 0 disables age pruning");
+        prune_deploy_launches(&base, 20, 30, now);
+        assert!(!old.exists());
+
+        let run_id = "20261031T120000_000001-999999";
+        let run = root.join("runs").join(run_id);
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("meta.json"), r#"{"pid":4242,"kind":"deploy"}"#).unwrap();
+        let launch = base.join("1000000000-999999-1");
+        std::fs::create_dir(&launch).unwrap();
+        std::fs::write(launch.join(COMMAND_LOG), format!("$ deploy\n{run_id}\n")).unwrap();
+        // Even if its supervisor died, the engine can still be running.
+        std::fs::write(launch.join("active.json"), r#"{"pid":999999}"#).unwrap();
+        prune_deploy_launches(&base, 0, 1, now);
+        assert!(
+            launch.exists(),
+            "live registered engine must survive pruning"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Append v1 milestone events (defaulting `v`/`ts`) to a `.jsonl` file.

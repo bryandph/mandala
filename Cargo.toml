@@ -21,7 +21,7 @@ edition = "2024"
 version = "0.1.0"
 license = "MIT"
 rust-version = "1.90"
-repository = "https://github.com/bryanhuff/mandala"
+repository = "https://github.com/bryandph/mandala"
 
 [workspace.dependencies]
 nix-build-forest = { path = "crates/nix-build-forest" }
