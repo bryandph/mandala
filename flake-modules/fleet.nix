@@ -101,7 +101,7 @@
     lib.filter
     (name: !(lib.elem name knownDeploymentGroups))
     (lib.attrNames cfg.deployment.groupSettings);
-  deploySettingsFor = member: let
+  deploySettingsFor = controller: member: let
     deployment = member.deployment;
     # The old member-only connection surface remains a compatibility input.
     # Its schema defaults are not authored overrides: otherwise root/22/fqdn
@@ -128,7 +128,7 @@
       };
     merged = engine.mergeDeploySettings {
       knownGroups = knownDeploymentGroups;
-      fleet = cfg.deployment.settings;
+      fleet = cfg.deployment.settings // controller;
       groupSettings = cfg.deployment.groupSettings;
       memberGroups = engine.ansibleGroupsFor member;
       member = memberSettings;
@@ -143,8 +143,12 @@
     // merged;
   flattenedDeploySettings =
     lib.mapAttrs
-    (_: deploySettingsFor)
+    (_: deploySettingsFor {})
     cfg.members;
+  controllerDeploySettings =
+    lib.mapAttrs
+    (_: controller: lib.mapAttrs (_: deploySettingsFor controller) cfg.members)
+    cfg.deployment.controllerSettings;
   validHostname = name:
     builtins.stringLength name
     <= 63
@@ -172,7 +176,25 @@ in {
       description = "VALIDATED operator data (lib.evalOperator result, or an operator-data flake's data.operator), carried into flake.mandala.operator.";
     };
 
+    # Intermediate merge surface: each tool contributes fields within a
+    # platform before the complete pure projection enters the aggregate.
+    controllerProjections = lib.mkOption {
+      type = lib.types.lazyAttrsOf (lib.types.lazyAttrsOf lib.types.raw);
+      default = {};
+      internal = true;
+    };
+
     deployment = {
+      controllerSettings = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.submodule {
+          options.identityFile = lib.mkOption {
+            type = lib.types.strMatching "/.*";
+            description = "Explicit absolute SSH identity path on this controller OS; never read or imported into the store.";
+          };
+        });
+        default = {};
+        description = "Optional controller OS identity overrides keyed by darwin or linux, applied after fleet defaults but before group/member settings. A configured map requires an entry for the runtime controller OS.";
+      };
       settings = lib.mkOption {
         type = deploySettingsType;
         default = {};
@@ -193,7 +215,17 @@ in {
   };
 
   config = {
-    mandala.projections.deploy.settings = flattenedDeploySettings;
+    mandala.projections =
+      {
+        deploy.settings = flattenedDeploySettings;
+      }
+      // lib.optionalAttrs (cfg.deployment.controllerSettings != {}) {
+        byControllerPlatform = cfg.controllerProjections;
+      };
+    mandala.controllerProjections =
+      lib.mapAttrs
+      (_: settings: {deploy = {inherit settings;};})
+      controllerDeploySettings;
 
     mandala.members = assert lib.assertMsg (collisions == [])
     "mandala member sources overlap: ${lib.concatStringsSep ", " collisions}";
@@ -201,6 +233,9 @@ in {
     "mandala member keys must be bare RFC 1123 hostnames: ${lib.concatStringsSep ", " invalidKeys}";
     assert lib.assertMsg (mismatchedNames == [])
     "mandala member keys must equal host.name: ${lib.concatStringsSep ", " mismatchedNames}";
+    assert lib.assertMsg (lib.all (platform: lib.elem platform ["darwin" "linux"])
+      (lib.attrNames cfg.deployment.controllerSettings))
+    "mandala deployment.controllerSettings keys must be darwin or linux";
     assert lib.assertMsg (unknownDeploymentGroups == [])
     "mandala deployment.groupSettings keys must name known sanitized groups: ${lib.concatStringsSep ", " unknownDeploymentGroups}"; mergedMembers;
 

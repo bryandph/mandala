@@ -38,5 +38,22 @@ in {
       inherit (cfg) extraHostvars pythonInterpreter guardGroup;
     };
     mandala.projections.ansibleInventory = config.flake.ansibleInventory;
+    # Pure outputs for external inventory scripts. The caller selects its
+    # controller OS explicitly; evaluation never inspects the evaluator OS.
+    flake.ansibleInventoryByControllerPlatform =
+      lib.mapAttrs
+      (_: projection: projection.ansibleInventory)
+      config.mandala.controllerProjections;
+    mandala.controllerProjections =
+      lib.mapAttrs
+      (platform: _: {
+        ansibleInventory = engine.projections.ansibleInventory {
+          hosts = config.mandala.members;
+          deploySettings = config.mandala.controllerProjections.${platform}.deploy.settings;
+          inherit (cfg) extraHostvars pythonInterpreter guardGroup;
+        };
+      })
+      # Use the authored keys, not controllerProjections' own fixed point.
+      config.mandala.deployment.controllerSettings;
   };
 }
