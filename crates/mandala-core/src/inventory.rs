@@ -230,6 +230,9 @@ fn schema_display(found: Option<&Value>) -> String {
 #[derive(Debug, Clone)]
 pub struct Inventory {
     aggregate: Aggregate,
+    // Selection is separate from the lossless authored aggregate. Every
+    // operational connection accessor uses this same controller projection.
+    controller_platform: Option<String>,
 }
 
 impl Inventory {
@@ -243,6 +246,17 @@ impl Inventory {
     /// [`InventoryError::Malformed`] if the value is not a well-formed
     /// aggregate envelope.
     pub fn from_value(value: Value) -> Result<Self, InventoryError> {
+        Self::from_value_for_controller(value, std::env::consts::OS)
+    }
+
+    /// Build for an explicit runtime controller OS (not the target/evaluator
+    /// platform). `macos` maps to `darwin`; `linux` stays `linux`. A configured
+    /// controller map fails closed on unsupported or missing platforms.
+    ///
+    /// # Errors
+    /// The same validation errors as [`Self::from_value`], including a malformed
+    /// or unavailable controller projection. No map preserves legacy behavior.
+    pub fn from_value_for_controller(value: Value, os: &str) -> Result<Self, InventoryError> {
         // Gate the schema BEFORE typed deserialization, so a version mismatch
         // yields the "found vs supported" message rather than a serde error.
         let found = value.get("schemaVersion");
@@ -291,7 +305,60 @@ impl Inventory {
                 }
             }
         }
-        Ok(Self { aggregate })
+        let controller_platform = aggregate
+            .extra
+            .get("projections")
+            .and_then(|p| p.get("byControllerPlatform"))
+            .map(|platforms| {
+                let platform = match os {
+                    "macos" | "darwin" => "darwin",
+                    "linux" => "linux",
+                    _ => {
+                        return Err(InventoryError::Malformed(format!(
+                            "controller OS {os:?} is unsupported by configured controllerSettings"
+                        )));
+                    }
+                };
+                if !platforms.is_object() {
+                    return Err(InventoryError::Malformed(
+                        "projections.byControllerPlatform must be an object".into(),
+                    ));
+                }
+                let selected = platforms.get(platform).ok_or_else(|| {
+                    InventoryError::Malformed(format!(
+                        "controllerSettings has no projection for controller platform {platform:?}"
+                    ))
+                })?;
+                if selected
+                    .pointer("/deploy/settings")
+                    .and_then(Value::as_object)
+                    .is_none()
+                {
+                    return Err(InventoryError::Malformed(format!(
+                        "controller projection {platform:?} has no deploy.settings object"
+                    )));
+                }
+                if aggregate
+                    .extra
+                    .get("projections")
+                    .and_then(|p| p.get("ansibleInventory"))
+                    .is_some()
+                    && selected
+                        .get("ansibleInventory")
+                        .and_then(Value::as_object)
+                        .is_none()
+                {
+                    return Err(InventoryError::Malformed(format!(
+                        "controller projection {platform:?} has no ansibleInventory object"
+                    )));
+                }
+                Ok(platform.to_string())
+            })
+            .transpose()?;
+        Ok(Self {
+            aggregate,
+            controller_platform,
+        })
     }
 
     /// Evaluate `<flake>#mandala` through the supplied evaluator and build a
@@ -417,9 +484,9 @@ impl Inventory {
         Ok(self.resolve(selector)?.join(","))
     }
 
-    /// The top-level `projections` value (`None` if the aggregate carries no
-    /// projections). Parity with the Python `inv.aggregate.get("projections",
-    /// {})`.
+    /// The authored top-level `projections` value (`None` if absent), kept
+    /// lossless for inspection. Operational connection callers must use
+    /// [`Self::deploy_settings`] / [`Self::ansible_inventory`] for selection.
     #[must_use]
     pub fn projections(&self) -> Option<&Value> {
         self.aggregate.extra.get("projections")
@@ -443,23 +510,33 @@ impl Inventory {
             .unwrap_or_default()
     }
 
-    /// The flattened per-node deploy settings emitted by the deploy
-    /// projection. These are the settings the native deploy engine consumes;
-    /// callers must not re-merge member/group/fleet authoring tiers.
+    /// The controller-selected flattened per-node deploy settings (the global
+    /// deploy projection when no controller map is configured). These are the
+    /// settings the native deploy engine consumes; callers must not re-merge
+    /// member/group/fleet authoring tiers.
     #[must_use]
     pub fn deploy_settings(&self) -> Option<&serde_json::Map<String, Value>> {
-        self.projections()
+        self.connection_projections()
             .and_then(|p| p.get("deploy"))
             .and_then(|d| d.get("settings"))
             .and_then(Value::as_object)
     }
 
-    /// The projected ansible dynamic-inventory value (`None` if the ansible
-    /// flakeModule was not imported). Parity with the Python
-    /// `aggregate["projections"]["ansibleInventory"]`.
+    /// The controller-selected Ansible dynamic inventory (`None` if the
+    /// Ansible flakeModule was not imported). Without a controller map this
+    /// is the legacy `aggregate["projections"]["ansibleInventory"]` value.
     #[must_use]
     pub fn ansible_inventory(&self) -> Option<&Value> {
-        self.projections().and_then(|p| p.get("ansibleInventory"))
+        self.connection_projections()
+            .and_then(|p| p.get("ansibleInventory"))
+    }
+
+    fn connection_projections(&self) -> Option<&Value> {
+        let projections = self.projections()?;
+        match &self.controller_platform {
+            Some(platform) => projections.get("byControllerPlatform")?.get(platform),
+            None => Some(projections),
+        }
     }
 }
 
@@ -467,6 +544,70 @@ impl Inventory {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn controller_platform_connection_projection_is_shared_and_lossless() {
+        let mut value = json!({
+            "schemaVersion": 1, "members": {}, "groups": {},
+            "projections": {
+                "deploy": {"settings": {"node": {"identityFile": "/keys/fleet"}}},
+                "ansibleInventory": {"all": {"hosts": {}}}
+            }
+        });
+        let legacy_bytes = serde_json::to_vec(&value).unwrap();
+        for os in ["macos", "linux", "freebsd"] {
+            let inv = Inventory::from_value_for_controller(value.clone(), os).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&serde_json::to_value(inv.aggregate()).unwrap()).unwrap(),
+                legacy_bytes
+            );
+            assert_eq!(
+                inv.deploy_settings().unwrap()["node"]["identityFile"],
+                "/keys/fleet"
+            );
+        }
+        for (platform, identity) in [
+            ("darwin", "/Users/bryan/.ssh/id_rsa"),
+            ("linux", "/home/bryan/.ssh/id_rsa"),
+        ] {
+            value["projections"]["byControllerPlatform"][platform] = json!({
+                "deploy": {"settings": {"node": {"identityFile": identity}}},
+                "ansibleInventory": {"all": {"hosts": {"node": {
+                    "ansible_ssh_private_key_file": identity,
+                    "ansible_ssh_common_args": "-o IdentitiesOnly=yes -o IdentityAgent=none"
+                }}}}
+            });
+        }
+        for (os, platform) in [("macos", "darwin"), ("linux", "linux")] {
+            let inv = Inventory::from_value_for_controller(value.clone(), os).unwrap();
+            let selected = &value["projections"]["byControllerPlatform"][platform];
+            assert_eq!(
+                inv.deploy_settings().unwrap(),
+                selected["deploy"]["settings"].as_object().unwrap()
+            );
+            assert_eq!(
+                inv.ansible_inventory().unwrap(),
+                &selected["ansibleInventory"]
+            );
+            assert_eq!(
+                inv.deploy_settings().unwrap()["node"]["identityFile"],
+                inv.ansible_inventory().unwrap()["all"]["hosts"]["node"]["ansible_ssh_private_key_file"]
+            );
+            assert_eq!(serde_json::to_value(inv.aggregate()).unwrap(), value);
+        }
+        let err = Inventory::from_value_for_controller(value.clone(), "freebsd").unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+        value["projections"]["byControllerPlatform"]
+            .as_object_mut()
+            .unwrap()
+            .remove("linux");
+        let err = Inventory::from_value_for_controller(value.clone(), "linux").unwrap_err();
+        assert!(err.to_string().contains("no projection"));
+        value["projections"]["byControllerPlatform"]["linux"] = json!({});
+        assert!(Inventory::from_value_for_controller(value.clone(), "linux").is_err());
+        value["projections"]["byControllerPlatform"]["linux"] = json!({"deploy": {"settings": {}}});
+        assert!(Inventory::from_value_for_controller(value, "linux").is_err());
+    }
 
     /// The injected aggregate from the retired Python `test_inventory.py` (`_inv`):
     /// members web/cache/router, groups k3s=[cache,web], gateway=[router].

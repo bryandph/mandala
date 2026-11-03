@@ -25,6 +25,19 @@ in {
       deploySettings = config.mandala.projections.deploy.settings;
     };
 
+    # Explicit pure controller selection for direct deploy-rs consumers.
+    # These nodes carry derivations and stay outside the aggregate.
+    flake.deployByControllerPlatform =
+      lib.mapAttrs
+      (_: projection: {
+        nodes = engine.projections.deployNodes {
+          inherit (inputs) deploy-rs nixpkgs;
+          nixosConfigurations = inputs.self.nixosConfigurations or {};
+          deploySettings = projection.deploy.settings;
+        };
+      })
+      config.mandala.controllerProjections;
+
     # The data view for the aggregate: node NAMES only — the nodes
     # themselves carry derivations and must not enter flake.mandala.
     mandala.projections.deploy.nodes = lib.attrNames config.flake.deploy.nodes;

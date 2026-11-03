@@ -135,6 +135,59 @@ for root-to-root fleets. See `schema/member.nix`,
 `flake-modules/fleet.nix`, and `lib/deploy-settings.nix` for the source of
 truth, and `examples/showcase/` for an evaluated member/group example.
 
+### Explicit controller-platform identities
+
+A fleet may optionally author controller OS identities as pure absolute path
+strings (never keys or Nix paths):
+
+```nix
+mandala.deployment.controllerSettings = {
+  darwin.identityFile = "/Users/bryan/.ssh/id_rsa";
+  linux.identityFile = "/home/bryan/.ssh/id_rsa";
+};
+```
+
+Only `darwin` and `linux` keys and the required `identityFile` field are
+accepted. The selected identity overrides the fleet default **before** the
+existing group and member tiers: fleet < controller < sorted groups < member.
+Thus an explicit group/member identity still wins. Other settings and option
+ordering are unchanged. This map describes the controller, not a target's
+`host.platform` or build system. No evaluator platform, `builtins.currentSystem`,
+`HOME`, environment discovery, SSH agent, or key-file reads select an identity.
+
+The aggregate exports pure
+`projections.byControllerPlatform.<platform>.deploy.settings` and (when the
+Ansible module is imported) `.ansibleInventory`. Native CLI/TUI/MCP share one
+`Inventory` constructor which selects by runtime OS (`macos` → `darwin`,
+`linux` → `linux`), once, for both connection accessors. A configured map with
+an unsupported runtime OS or missing selected entry fails clearly, without
+falling back to the global identity. Full aggregate inspection remains lossless
+and authored; connection callers must use the selected accessors, not read raw
+aggregate projections themselves.
+
+Direct tool consumers explicitly select
+`ansibleInventoryByControllerPlatform.<platform>` or
+`deployByControllerPlatform.<platform>.nodes`. The deploy-rs projection encodes
+only the resolved connection into `sshOpts`, preserving `IdentitiesOnly=yes`
+and `IdentityAgent=none`; no map authoring fields enter deploy-rs node settings.
+The old global `ansibleInventory`, `deploy.nodes`, and aggregate deploy settings
+remain the fleet/group/member view for compatibility. When the map is absent,
+no aggregate controller projections are added, no runtime selection occurs,
+and legacy inventory/settings JSON and SSH argv remain unchanged.
+
+External Ansible ping, state survey, and reboot routes use the consuming
+fleet's default inventory script/configuration, not the native inventory
+accessor. Their script must explicitly map the controller OS (for example,
+`uname -s` Darwin/Linux) to the tested pure
+`#ansibleInventoryByControllerPlatform.<platform>` output and fail on an
+unsupported OS when the map is configured. Updating that script is a separate
+consumer integration step: importing this module alone does **not** switch
+those external routes. They continue to use the compatible global output
+until the consumer adopts selection. Synthetic contract tests are in
+`tests/controller-platform.nix`; runtime OS selection and complete native
+SSH/nix-copy argument parity are covered by core Rust tests. Synthetic Darwin
+selection on Linux does not constitute Darwin runtime qualification.
+
 ## 7. Hooks, not forks
 
 Repo-specific values enter through hook options, never by patching the

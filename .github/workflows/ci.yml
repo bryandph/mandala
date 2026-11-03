@@ -14,6 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v22
+      - name: Synthetic controller identity contract
+        run: |
+          source_ref="git+file://$(pwd)?rev=$(git rev-parse HEAD)&shallow=1"
+          nix eval --json --no-write-lock-file --expr "let source = builtins.getFlake \"$source_ref\"; in import (source.outPath + \"/tests/controller-platform.nix\") { lib = source.inputs.nixpkgs.lib; }"
       - run: nix flake check
       - run: nix fmt -- --check .
       # The template is a real flake; eval it against THIS checkout's

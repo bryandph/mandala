@@ -2970,6 +2970,52 @@ exit 0
     }
 
     #[tokio::test]
+    async fn controller_platform_selection_reaches_ssh_and_nix_copy() {
+        let base = tmp_base("controller-platform");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let (programs, trace_path) = effect_programs(&base, 0, 0);
+        let mut value = serde_json::to_value(inv().aggregate()).unwrap();
+        let baseline = minimal_parent_deploy_settings();
+        value["projections"]["deploy"]["settings"]["cache"] = baseline.clone();
+        let baseline_inv = Inventory::from_value(value.clone()).unwrap();
+        let mut run = prepare_run(&baseline_inv, "cache", 4, true).unwrap();
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Confirmed);
+        let baseline_trace = std::fs::read_to_string(&trace_path).unwrap();
+        let sorted_lines = |trace: &str| {
+            let mut lines: Vec<String> = trace.lines().map(str::to_owned).collect();
+            lines.sort();
+            lines
+        };
+        for (os, identity) in [
+            ("macos", "/Users/bryan/.ssh/id_rsa"),
+            ("linux", "/home/bryan/.ssh/id_rsa"),
+        ] {
+            let platform = if os == "macos" { "darwin" } else { "linux" };
+            let mut settings = baseline.clone();
+            settings["identityFile"] = Value::from(identity);
+            value["projections"]["byControllerPlatform"] = json!({
+                (platform): {"deploy": {"settings": {"cache": settings}}}
+            });
+            let selected = Inventory::from_value_for_controller(value.clone(), os).unwrap();
+            run.plan = plan_run(&selected, "cache", 4, true).unwrap();
+            std::fs::write(&trace_path, "").unwrap();
+            let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+            assert_eq!(result.state, HostState::Confirmed);
+            let trace = std::fs::read_to_string(&trace_path).unwrap();
+            // Compare complete SSH argv and nix-copy environment/argv bytes,
+            // allowing only independent subprocess arrival order to vary.
+            let expected = baseline_trace.replace("/Users/bryan/.ssh/id_rsa", identity);
+            assert_eq!(sorted_lines(&trace), sorted_lines(&expected));
+            assert!(trace.contains(&format!("NIX_SSHOPTS=-p 22 -i {identity} -o IdentitiesOnly=yes -o IdentityAgent=none args=copy")));
+            assert!(trace.contains(&format!("args=root@172.16.42.7 -p 22 -i {identity} -o IdentitiesOnly=yes -o IdentityAgent=none")));
+            if os == "linux" {
+                assert!(!trace.contains("/Users/"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn omitted_empty_ssh_opts_deserializes_and_reaches_effects() {
         let settings = minimal_parent_deploy_settings();
         let parsed = serde_json::from_value::<FlattenedDeploySettings>(settings.clone()).unwrap();
