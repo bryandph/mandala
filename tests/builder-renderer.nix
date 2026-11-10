@@ -19,6 +19,7 @@ in
     {hostname = "host\nHost *\n  StrictHostKeyChecking no";}
     {identityFile = "/key\nProxyCommand evil";}
     {sshUser = "builder other";}
+    {remoteProgram = "/bin/nix\ncommand";}
     {jumpAlias = "missing";}
     {hostKeyAlias = "*.example";}
     {strictHostKeyChecking = false;}
@@ -27,6 +28,8 @@ in
   ];
   assert lib.all (p: fails (engine.renderBuilders p)) [
     (badMachine "hostName" "host?remote-program=x\nnext")
+    (badMachine "hostName" ((lib.head (lib.splitString "?" (lib.head model.wsl.buildMachines).hostName)) + "?remote-program=%2Fbin%2Fnix%0Aevil"))
+    (badMachine "publicHostKey" "AAAA")
     (badMachine "systems" ["x86_64-linux,evil"])
     (badMachine "sshKey" "/key with spaces")
     (badMachine "publicHostKey" "key\nnext")

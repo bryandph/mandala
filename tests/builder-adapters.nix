@@ -68,6 +68,8 @@
     } {}));
     # Ordinary true settings conflict with explicit false (not mkDefault).
     assert fails (normalize (eval (enabled "wsl") {nix.distributedBuilds = false;}));
+    # NixOS's actual generated trust file must match the shared renderer.
+    assert platform != "nixos" || lib.all (id: id == "empty" || (eval (enabled id) {}).environment.etc."ssh/ssh_known_hosts".text == cases.${id}.rendered.knownHostsText) (lib.attrNames model);
     # NixOS's actual generated machines file must match inspection exactly.
     assert platform != "nixos" || lib.all (id: id == "empty" || (eval (enabled id) {}).environment.etc."nix/machines".text == cases.${id}.rendered.machinesFile) (lib.attrNames model); true;
 in

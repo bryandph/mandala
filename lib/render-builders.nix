@@ -17,6 +17,7 @@
     && user r.sshUser
     && port r.port
     && path r.identityFile
+    && (r.remoteProgram == null || path r.remoteProgram)
     && endpoint r.hostKeyAlias
     && (r.jumpAlias == null || (alias r.jumpAlias && profile.ssh ? ${r.jumpAlias}))
     && r.strictHostKeyChecking == true
@@ -40,18 +41,31 @@
       then r.hostKeyAlias == r.trust.principal
       else r.trust.kind == "pin"
     );
-  machineValid = m:
-    safe "[A-Za-z0-9][A-Za-z0-9._-]*(\\?remote-program=([A-Za-z0-9._~%-]|%[A-Fa-f0-9][A-Fa-f0-9])*)?" m.hostName
-    && profile.ssh ? ${lib.head (lib.splitString "?" m.hostName)}
+  machineValid = m: let
+    name = lib.head (lib.splitString "?" m.hostName);
+    r = profile.ssh.${name};
+    connection = name + lib.optionalString (r.remoteProgram != null) "?remote-program=${lib.strings.escapeURL r.remoteProgram}";
+    pin =
+      if r.trust.kind == "ca"
+      then null
+      else (import ./builders.nix {inherit lib;}).base64 r.trust.publicKey;
+  in
+    alias name
+    && profile.ssh ? ${name}
+    && m.hostName == connection
     && m.protocol == "ssh-ng"
     && user m.sshUser
+    && m.sshUser == r.sshUser
     && path m.sshKey
+    && m.sshKey == r.identityFile
+    && m.publicHostKey == pin
     && list token m.systems
     && m.systems != []
     && positive m.maxJobs
     && positive m.speedFactor
     && list token m.supportedFeatures
     && list token m.mandatoryFeatures
+    && lib.all (feature: lib.elem feature m.supportedFeatures) m.mandatoryFeatures
     && (m.publicHostKey == null || safe "[A-Za-z0-9+/]+={0,2}" m.publicHostKey);
   valid =
     lib.all (name: sshValid name profile.ssh.${name}) (lib.attrNames profile.ssh)
