@@ -16,3 +16,6 @@ target/
 # ansible/collections/.../plugins) — regenerated at runtime, never tracked.
 __pycache__/
 *.py[cod]
+
+# Serena MCP per-checkout project config/cache
+.serena/
