@@ -179,6 +179,10 @@
           )
         else pkgs.runCommand "mandala-switch-inhibitor-staging-skipped" {} "touch $out";
 
+      builder-schema = assert import ./tests/builder-schema.nix {inherit lib;}; pkgs.runCommand "builder-schema" {} "touch $out";
+      builder-controllers = assert import ./tests/builder-controllers.nix {inherit lib;}; pkgs.runCommand "builder-controllers" {} "touch $out";
+      builder-projection = assert import ./tests/builder-projection.nix {inherit lib;}; pkgs.runCommand "builder-projection" {} "touch $out";
+      builder-compat = assert import ./tests/builder-compat.nix {inherit lib;}; pkgs.runCommand "builder-compat" {} "touch $out";
       fake-fleet = let
         op = self.lib.evalOperator (import ./examples/fake-fleet/operator.nix);
         topo = self.lib.evalTopology (import ./examples/fake-fleet/topology.nix);
@@ -235,8 +239,8 @@
             modules = [
               ./flake-modules/fleet.nix
               {
-                options.flake.mandala = lib.mkOption {
-                  type = lib.types.raw;
+                options.flake = lib.mkOption {
+                  type = lib.types.lazyAttrsOf lib.types.raw;
                 };
                 config.mandala = {
                   extraMembers = members;

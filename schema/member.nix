@@ -98,6 +98,8 @@ in {
       example = ["raspberry-pi" "edge-device"];
     };
 
+    builder = (import ../lib/builders.nix {inherit lib;}).facetOption;
+
     build = mkOption {
       type = types.nullOr (types.submodule {
         options = {
