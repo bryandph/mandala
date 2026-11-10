@@ -23,6 +23,10 @@
 }: let
   engine = import ../lib {inherit lib;};
   cfg = config.mandala;
+  builderProjection = engine.projections.builders {
+    inherit (cfg) members;
+    controllers = cfg.build.controllers;
+  };
   nixosMembers = lib.mapAttrs (_: c: c.config.host) (inputs.self.nixosConfigurations or {});
   collisions = lib.intersectLists (lib.attrNames nixosMembers) (lib.attrNames cfg.extraMembers);
   mergedMembers = nixosMembers // cfg.extraMembers;
@@ -158,6 +162,11 @@
   mismatchedNames = lib.filter (name: !(mergedMembers.${name} ? name) || mergedMembers.${name}.name != name) (lib.attrNames mergedMembers);
 in {
   options.mandala = {
+    build.controllers = lib.mkOption {
+      type = lib.types.attrsOf engine.builders.controllerType;
+      default = {};
+      description = "Explicit named builder controller profiles, independent of controller OS and deploy identity.";
+    };
     extraMembers = lib.mkOption {
       type = lib.types.lazyAttrsOf lib.types.raw;
       default = {};
@@ -219,6 +228,9 @@ in {
       {
         deploy.settings = flattenedDeploySettings;
       }
+      // lib.optionalAttrs (cfg.build.controllers != {}) {
+        builders.byController = builderProjection;
+      }
       // lib.optionalAttrs (cfg.deployment.controllerSettings != {}) {
         byControllerPlatform = cfg.controllerProjections;
       };
@@ -238,6 +250,8 @@ in {
     "mandala deployment.controllerSettings keys must be darwin or linux";
     assert lib.assertMsg (unknownDeploymentGroups == [])
     "mandala deployment.groupSettings keys must name known sanitized groups: ${lib.concatStringsSep ", " unknownDeploymentGroups}"; mergedMembers;
+
+    flake.buildMachinesByController = lib.mapAttrs (_: projection: projection.buildMachines) builderProjection;
 
     flake.mandala = engine.aggregate {
       inherit (cfg) members projections operator;
