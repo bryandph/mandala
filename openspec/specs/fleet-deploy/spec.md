@@ -65,6 +65,19 @@ later host's failure.
 - **THEN** activate-rs restores that host's previous generation, and the run
   reports the rollback as that host's sticky terminal state
 
+#### Scenario: activation cancels its waiter before rollback completes
+- **WHEN** activate-rs signals cancellation and the concurrent waiter fails
+- **THEN** the controller keeps activation and its output pipes alive until it
+  finishes, bounded by `activationTimeout` (240 seconds when unset)
+- **AND** a nonzero activation exit with `autoRollback` enabled is a typed
+  rollback outcome; with it disabled, or if the bound expires, it is failure
+- **AND** termination or expiry still kills the owned local activation group
+
+#### Scenario: retrying a closure with stale sentinels
+- **WHEN** a magic-rollback attempt starts for a previously attempted closure
+- **THEN** both its deterministic canary and cancel files are removed before
+  activation or the waiter starts, including with older activate-rs versions
+
 #### Scenario: a failure does not revoke siblings
 - **WHEN** one host of a multi-host run fails and rolls back
 - **THEN** hosts that already confirmed stay on the new generation, pending
