@@ -231,6 +231,7 @@ in rec {
 
   # Shared builder types/normalization serve both member modules and projections.
   builders = import ./builders.nix {inherit lib;};
+  renderBuilders = import ./render-builders.nix {inherit lib;};
 
   # Projections: pure functions from validated fleet data to tool-shaped
   # output. Toolchains (pkgs, deploy-rs, …) are injected as ARGUMENTS by

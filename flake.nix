@@ -29,6 +29,10 @@
       default = ./flake-modules/fleet.nix;
     };
 
+    # Both platforms consume the same precomputed model and pure renderer.
+    nixosModules.builders = ./modules/builders.nix;
+    darwinModules.builders = ./modules/builders.nix;
+
     templates.fleet = {
       path = ./templates/fleet;
       description = "A mandala fleet: one NixOS member, operator skeleton, fleet + ansible flakeModules wired";
@@ -179,6 +183,30 @@
           )
         else pkgs.runCommand "mandala-switch-inhibitor-staging-skipped" {} "touch $out";
 
+      builder-ssh-scope = let
+        model = import ./tests/fixtures/builder-adapter-model.nix {inherit lib;};
+        rendered = self.lib.renderBuilders model.wsl;
+        sshConfig = pkgs.writeText "builder-ssh-scope.conf" (rendered.sshConfig + "\nServerAliveInterval 37\n");
+        names = lib.attrNames model.wsl.ssh;
+      in
+        pkgs.runCommand "builder-ssh-scope" {nativeBuildInputs = [pkgs.openssh];} ''
+          for host in unrelated.globex.example ${lib.escapeShellArgs names}; do
+            ssh -G -F ${sshConfig} "$host" > effective
+            grep -qx 'serveraliveinterval 37' effective
+          done
+          ${lib.concatMapStrings (name: ''
+              ssh -G -F ${sshConfig} ${lib.escapeShellArg name} > effective
+              grep -qx 'identitiesonly yes' effective
+              grep -qx 'identityagent none' effective
+              grep -qx 'stricthostkeychecking true' effective
+              grep -qx 'port ${toString model.wsl.ssh.${name}.port}' effective
+              grep -qx 'hostkeyalias ${model.wsl.ssh.${name}.hostKeyAlias}' effective
+            '')
+            names}
+          touch $out
+        '';
+      builder-renderer = assert import ./tests/builder-renderer.nix {inherit lib;}; pkgs.runCommand "builder-renderer" {} "touch $out";
+      builder-adapters = assert import ./tests/builder-adapters.nix {inherit lib nixpkgs;}; pkgs.runCommand "builder-adapters" {} "touch $out";
       builder-schema = assert import ./tests/builder-schema.nix {inherit lib;}; pkgs.runCommand "builder-schema" {} "touch $out";
       builder-controllers = assert import ./tests/builder-controllers.nix {inherit lib;}; pkgs.runCommand "builder-controllers" {} "touch $out";
       builder-projection = assert import ./tests/builder-projection.nix {inherit lib;}; pkgs.runCommand "builder-projection" {} "touch $out";
