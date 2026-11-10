@@ -192,13 +192,22 @@ pub fn make_deploy_data<'a>(
 
 #[must_use]
 pub fn make_lock_path(temp_path: &Path, closure: &str) -> PathBuf {
-    let hash = closure
+    temp_path.join(format!("deploy-rs-canary-{}", closure_hash(closure)))
+}
+
+/// The activate-rs 1.0 cancellation sentinel uses the same store hash as the canary.
+#[must_use]
+pub fn make_cancel_path(temp_path: &Path, closure: &str) -> PathBuf {
+    temp_path.join(format!("deploy-rs-cancel-{}", closure_hash(closure)))
+}
+
+fn closure_hash(closure: &str) -> &str {
+    closure
         .strip_prefix("/nix/store/")
         .unwrap_or(closure)
         .split('-')
         .next()
-        .unwrap_or(closure);
-    temp_path.join(format!("deploy-rs-canary-{hash}"))
+        .unwrap_or(closure)
 }
 
 #[cfg(test)]
@@ -207,6 +216,20 @@ mod tests {
 
     use super::*;
     use crate::data::{GenericSettings, Node, NodeSettings, Profile, ProfileSettings};
+
+    #[test]
+    fn cancel_and_canary_paths_share_upstream_store_hash() {
+        for closure in ["/nix/store/somehash-profile", "/nix/store/somehash"] {
+            assert_eq!(
+                make_lock_path(Path::new("/tmp"), closure),
+                PathBuf::from("/tmp/deploy-rs-canary-somehash")
+            );
+            assert_eq!(
+                make_cancel_path(Path::new("/tmp"), closure),
+                PathBuf::from("/tmp/deploy-rs-cancel-somehash")
+            );
+        }
+    }
 
     #[derive(Default)]
     struct NullSink;

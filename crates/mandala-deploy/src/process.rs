@@ -259,6 +259,19 @@ impl SignalForwarder {
     }
 }
 
+impl Drop for SignalForwarder {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        children()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopping = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,18 +359,5 @@ mod tests {
             reaped: false,
         });
         assert_eq!(recorder.count(), 1);
-    }
-}
-
-impl Drop for SignalForwarder {
-    fn drop(&mut self) {
-        self.handle.close();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        children()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stopping = false;
     }
 }

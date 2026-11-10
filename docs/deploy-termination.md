@@ -17,9 +17,17 @@ race between a successful wait and removing its now-reusable PGID.
 
 Group guards clean up when an operation is cancelled or returns early while its
 leader is still unreaped. A successful wait disarms the guard: dropping a
-completed operation never signals a PGID that could belong to another process. In particular, a failed waiter or failure to spawn the waiter drops the
-activate-SSH future and kills that group; cancelling confirmation or boot staging
-does not detach SSH. Tokio children additionally use `kill_on_drop` for direct
+completed operation never signals a PGID that could belong to another process.
+A failed waiter retains and awaits the owned activate-SSH future: activate-rs
+1.0 writes its cancel sentinel before running rollback, so closing SSH at that
+point could cut rollback output pipes short. This post-waiter wait is bounded
+by `activationTimeout` (240 seconds when unset), measured from waiter failure.
+If activation exits nonzero with `autoRollback` enabled, the typed result reports
+rollback; with it disabled the result is failure. A timeout reports failure,
+drops the activate future and kills its still-owned group. Termination during
+the wait still forwards signals to that group; no child is detached. Failure
+to spawn the waiter still drops activation immediately, and cancelling
+confirmation or boot staging does not detach SSH. Tokio children additionally use `kill_on_drop` for direct
 child reaping. Capture drains stdout/stderr concurrently with waiting and
 unregisters a reaped leader immediately, even if descendants still hold pipes
 open. Deliberately choosing the simpler safe policy, descendants of a normally
@@ -72,7 +80,10 @@ registry's existing conservative liveness caveat.
 `crates/mandala/tests/termination.rs` exercises real engine and supervisor binaries
 with isolated shell-only Nix/SSH effects. It checks build/copy/SSH descendant
 cleanup, both forwarded signals, escalation for a signal-ignoring build, and the
-failed-waiter/activate race. Unit tests intercept the group-signal operation to
+cancel-before-rollback ordering (including captured stdout/stderr and rollback
+versus failure classification), the bounded failed-waiter/activate race, and
+termination during that post-waiter wait. Unit tests also check removal of both
+stale canary and cancel sentinels before activation/wait startup and intercept the group-signal operation to
 assert successful std/async waits never signal on drop and an unreaped guard
 still does. `crates/mandala/tests/supervisor_metadata.rs` exercises real
 `DeployRun::start` metadata, supervisor-death detection, active-run retention,

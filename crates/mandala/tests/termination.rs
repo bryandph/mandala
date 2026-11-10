@@ -61,8 +61,8 @@ impl Fixture {
         let setting = |host: &str| {
             json!({
                 "activation":"switch", "hostname":format!("{host}.invalid"), "sshUser":"deployer", "sshPort":22,
-                "sshOpts":[], "autoRollback":true, "fastConnection":false, "magicRollback":true,
-                "confirmTimeout":30, "activationTimeout":60, "tempPath":"/tmp/mandala-test", "sudo":null, "user":"root"
+                "sshOpts":[], "autoRollback":phase != "no-auto-rollback", "fastConnection":false, "magicRollback":true,
+                "confirmTimeout":30, "activationTimeout":if phase == "wait-failure" { 1 } else { 60 }, "tempPath":"/tmp/mandala-test", "sudo":null, "user":"root"
             })
         };
         fs::write(root.join("aggregate.json"), json!({
@@ -126,9 +126,21 @@ case "$*" in
  *'rm -f '*) exit 0 ;;
  *'activate-rs activate '*)
   echo $$ > "$MANDALA_FLEET_STATE/activate-$host.pid"
-  exec sleep 60 ;;
+  # Model activate-rs 1.0: signal cancellation before rollback finishes.
+  touch "$MANDALA_FLEET_STATE/cancel-$host"
+  if [ "$TEST_PHASE" = rollback ] || [ "$TEST_PHASE" = no-auto-rollback ]; then
+    while [ ! -f "$MANDALA_FLEET_STATE/waited-$host" ]; do sleep 0.02; done
+    sleep 0.2
+    echo "rollback-output-$host"
+    echo "rollback-stderr-$host" >&2
+    touch "$MANDALA_FLEET_STATE/finished-$host"
+    exit 1
+  fi
+  sh -c 'echo $$ > "$1"; exec sleep 60' sh "$MANDALA_FLEET_STATE/activate-$host-leaf.pid" &
+  wait ;;
  *'activate-rs wait '*)
-  while [ ! -f "$MANDALA_FLEET_STATE/activate-$host.pid" ]; do sleep 0.02; done
+  while [ ! -f "$MANDALA_FLEET_STATE/cancel-$host" ]; do sleep 0.02; done
+  touch "$MANDALA_FLEET_STATE/waited-$host"
   exit 1 ;;
  *) exit 0 ;;
 esac
@@ -291,8 +303,64 @@ fn engine_escalates_when_build_ignores_sigint() {
 }
 
 #[test]
-fn failed_waiter_does_not_detach_activate_ssh() {
+fn failed_waiter_bounds_activation_wait_and_kills_owned_group() {
     let mut fixture = Fixture::start("wait-failure", false);
-    let pids = [fixture.pid("activate-cache"), fixture.pid("activate-web")];
+    let pids = [
+        fixture.pid("activate-cache"),
+        fixture.pid("activate-web"),
+        fixture.pid("activate-cache-leaf"),
+        fixture.pid("activate-web-leaf"),
+    ];
     fixture.assert_settled(&pids);
+    let log = fs::read_to_string(fixture.root.join("engine.log")).unwrap();
+    assert!(log.contains("activation did not finish within 1s"), "{log}");
+}
+
+#[test]
+fn terminate_during_post_waiter_rollback_wait_kills_activate_group() {
+    let mut fixture = Fixture::start("terminate-rollback", false);
+    let pids = [
+        fixture.pid("activate-cache"),
+        fixture.pid("activate-web"),
+        fixture.pid("activate-cache-leaf"),
+        fixture.pid("activate-web-leaf"),
+    ];
+    let run_dir = fixture.run_dir();
+    until(|| {
+        ["cache", "web"].iter().all(|host| {
+            fs::read_to_string(run_dir.join(format!("{host}.jsonl")))
+                .unwrap_or_default()
+                .contains("activation waiter failed; waiting")
+        })
+    });
+    let mut run = DeployRun::new("@fleet");
+    run.events_dir = Some(fixture.run_dir());
+    run.terminate();
+    fixture.assert_settled(&pids);
+}
+
+#[test]
+fn cancel_before_rollback_completion_preserves_output_and_terminal_state() {
+    for (phase, expected) in [("rollback", "rolled_back"), ("no-auto-rollback", "failed")] {
+        let mut fixture = Fixture::start(phase, false);
+        let pids = [fixture.pid("activate-cache"), fixture.pid("activate-web")];
+        fixture.assert_settled(&pids);
+        for host in ["cache", "web"] {
+            assert!(fixture.root.join(format!("finished-{host}")).exists());
+            let events =
+                fs::read_to_string(fixture.run_dir().join(format!("{host}.jsonl"))).unwrap();
+            assert!(
+                events.contains(&format!("rollback-output-{host}")),
+                "{events}"
+            );
+            assert!(
+                events.contains(&format!("rollback-stderr-{host}")),
+                "{events}"
+            );
+        }
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(fixture.run_dir().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["summary"][expected], 2, "{meta}");
+    }
 }

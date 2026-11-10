@@ -156,6 +156,18 @@ pub enum DeployProfileError {
     CanaryCleanupExit(ExitStatus),
     #[error("activation rolled back with {0} before confirmation completed")]
     RollbackExit(ExitStatus),
+    #[error("activation rolled back with {activate_status} after waiter failed with {wait_status}")]
+    WaitRollback {
+        wait_status: ExitStatus,
+        activate_status: ExitStatus,
+    },
+    #[error(
+        "activation did not finish within {timeout_secs}s after waiter failed with {wait_status}"
+    )]
+    WaitActivationTimeout {
+        wait_status: ExitStatus,
+        timeout_secs: u16,
+    },
     #[error("failed to run activation waiter over ssh: {0}")]
     WaitSpawn(std::io::Error),
     #[error("ssh activation waiter failed with {0}")]
@@ -183,14 +195,18 @@ pub enum DeployProfileError {
 }
 
 impl DeployProfileError {
-    /// Once the waiter has completed, either a failed confirmation or the
-    /// activation process winning with a non-zero exit means the canary was
-    /// not removed in time and activate-rs restored the prior generation.
+    /// Typed rollback outcomes include failed confirmation/canary expiry and
+    /// a failed waiter followed by completed nonzero activation when automatic
+    /// rollback is enabled. A timed-out activation remains a failure: the
+    /// controller cannot claim that remote recovery completed.
     #[must_use]
     pub fn rolled_back(&self) -> bool {
         matches!(
             self,
-            Self::RollbackExit(_) | Self::ConfirmSpawn(_) | Self::ConfirmExit(_)
+            Self::RollbackExit(_)
+                | Self::WaitRollback { .. }
+                | Self::ConfirmSpawn(_)
+                | Self::ConfirmExit(_)
         )
     }
 }
@@ -499,7 +515,14 @@ async fn clear_stale_canary(
     ssh_addr: &str,
 ) -> Result<(), DeployProfileError> {
     let lock_path = crate::make_lock_path(temp_path, &deploy_data.profile.profile_settings.path);
-    let mut cleanup = format!("rm -f {}", lock_path.display());
+    // deploy-rs v1.0.0 derives both sentinels from the closure's store hash.
+    let cancel_path =
+        crate::make_cancel_path(temp_path, &deploy_data.profile.profile_settings.path);
+    let mut cleanup = format!(
+        "rm -f {} {}",
+        crate::shell_word(&lock_path.to_string_lossy()),
+        crate::shell_word(&cancel_path.to_string_lossy())
+    );
     if let Some(sudo) = &deploy_defs.sudo {
         cleanup = format!("{sudo} {cleanup}");
     }
@@ -579,7 +602,8 @@ pub async fn deploy_profile(
     // activate-rs leaves its deterministic canary behind when confirmation
     // times out. Its waiter treats mere existence as readiness, so a retry of
     // the same immutable closure must remove that stale predecessor before
-    // either the new activation or waiter can observe it.
+    // either the new activation or waiter can observe it. v1.0.0 also leaves
+    // a cancel sentinel on failure; wait checks it at startup, so clear both.
     clear_stale_canary(deploy_data, deploy_defs, temp_path, &ssh_addr).await?;
 
     let (activate_child, activate_group) =
@@ -606,7 +630,36 @@ pub async fn deploy_profile(
         biased;
         output = &mut wait_output => {
             let output = output.map_err(DeployProfileError::WaitSpawn)?;
-            checked_output(output, deploy_data, DeployProfileError::WaitExit)?;
+            emit_output(deploy_data.sink, &output);
+            if !output.status.success() {
+                // activate-rs 1.0 signals cancel BEFORE running deactivate().
+                // Keep the owned activation future and its output pipes alive
+                // until rollback finishes. Cancellation/termination still drops
+                // the guard; a bounded timeout uses that same group-kill path.
+                let timeout_secs = deploy_data.merged_settings.activation_timeout.unwrap_or(240);
+                deploy_data.sink.emit(Level::Info, "activation waiter failed; waiting for activation/rollback to finish");
+                let activation = tokio::time::timeout(
+                    std::time::Duration::from_secs(u64::from(timeout_secs)),
+                    &mut activate_output,
+                )
+                .await
+                .map_err(|_| DeployProfileError::WaitActivationTimeout {
+                    wait_status: output.status,
+                    timeout_secs,
+                })?
+                .map_err(DeployProfileError::ActivateSpawn)?;
+                emit_output(deploy_data.sink, &activation);
+                return Err(if !activation.status.success()
+                    && deploy_data.merged_settings.auto_rollback.unwrap_or(true)
+                {
+                    DeployProfileError::WaitRollback {
+                        wait_status: output.status,
+                        activate_status: activation.status,
+                    }
+                } else {
+                    DeployProfileError::WaitExit(output.status)
+                });
+            }
             deploy_data.sink.emit(Level::Info, "activation waiter complete");
         }
         output = &mut activate_output => {
@@ -816,6 +869,165 @@ mod tests {
         let trace = std::fs::read_to_string(trace).unwrap_or_default();
         let messages = sink.0.into_inner().unwrap();
         (result, trace, messages)
+    }
+
+    async fn cancel_case(
+        name: &str,
+        auto_rollback: bool,
+        timeout: Option<u16>,
+        body: &str,
+    ) -> (Result<(), DeployProfileError>, Vec<String>, PathBuf) {
+        let (ssh, _) = effect_program(name, body);
+        let base = ssh.parent().unwrap().to_path_buf();
+        let closure = "/nix/store/00000000000000000000000000000000-new-system";
+        // Both sentinels really exist before deploy starts, not just in argv.
+        for path in [
+            crate::make_lock_path(&base, closure),
+            crate::make_cancel_path(&base, closure),
+        ] {
+            std::fs::write(path, "stale").unwrap();
+        }
+        let profile = Profile {
+            profile_settings: ProfileSettings {
+                path: closure.into(),
+                profile_path: None,
+            },
+            generic_settings: GenericSettings::default(),
+        };
+        let node = Node {
+            generic_settings: GenericSettings {
+                ssh_user: Some("root".into()),
+                user: Some("root".into()),
+                auto_rollback: Some(auto_rollback),
+                activation_timeout: timeout,
+                temp_path: Some(base.clone()),
+                ..GenericSettings::default()
+            },
+            node_settings: NodeSettings {
+                hostname: "host.invalid".into(),
+                profiles: HashMap::from([("system".into(), profile.clone())]),
+                profiles_order: Vec::new(),
+            },
+        };
+        let overrides = crate::CmdOverrides {
+            ssh_program: Some(ssh),
+            environment: vec![("TEST_ROOT".into(), base.to_string_lossy().into_owned())],
+            ..crate::CmdOverrides::default()
+        };
+        let sink = RecordingSink::default();
+        let deploy = crate::make_deploy_data(
+            &GenericSettings::default(),
+            &node,
+            "host",
+            &profile,
+            "system",
+            &overrides,
+            &sink,
+        );
+        let result = deploy_profile(&deploy, &deploy.defs().unwrap(), false).await;
+        (result, sink.0.into_inner().unwrap(), base)
+    }
+
+    const CANCEL_EFFECT: &str = r#"for command do :; done
+case "$command" in
+  'rm -f '*) sh -c "$command"; exit $? ;;
+  *'activate-rs activate '*)
+    test ! -e "$TEST_ROOT/deploy-rs-canary-00000000000000000000000000000000" || exit 91
+    test ! -e "$TEST_ROOT/deploy-rs-cancel-00000000000000000000000000000000" || exit 92
+    touch "$TEST_ROOT/clean-start"
+    touch "$TEST_ROOT/deploy-rs-cancel-00000000000000000000000000000000"
+    while [ ! -f "$TEST_ROOT/waited" ]; do sleep 0.02; done
+    sleep 0.1
+    echo rollback-finished-stdout
+    echo rollback-finished-stderr >&2
+    touch "$TEST_ROOT/finished"
+    exit 1 ;;
+  *'activate-rs wait '*)
+    while [ ! -f "$TEST_ROOT/clean-start" ]; do sleep 0.02; done
+    test -e "$TEST_ROOT/deploy-rs-cancel-00000000000000000000000000000000" || exit 93
+    touch "$TEST_ROOT/waited"
+    exit 1 ;;
+esac
+exit 99"#;
+
+    #[tokio::test]
+    async fn cancel_waits_for_rollback_output_and_has_typed_result() {
+        let (result, messages, base) =
+            cancel_case("cancel-rollback", true, None, CANCEL_EFFECT).await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, DeployProfileError::WaitRollback { .. }),
+            "{error}"
+        );
+        assert!(error.rolled_back());
+        assert!(base.join("finished").exists());
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("rollback-finished-stdout"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("rollback-finished-stderr"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_without_auto_rollback_is_failed_after_activation_finishes() {
+        let (result, _, base) = cancel_case("cancel-no-auto", false, Some(2), CANCEL_EFFECT).await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, DeployProfileError::WaitExit(_)), "{error}");
+        assert!(!error.rolled_back());
+        assert!(base.join("finished").exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_with_hanging_activation_has_typed_timeout_not_rollback() {
+        let body = CANCEL_EFFECT.replace("sleep 0.1", "sleep 60");
+        let start = std::time::Instant::now();
+        let (result, _, base) = cancel_case("cancel-timeout", true, Some(1), &body).await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DeployProfileError::WaitActivationTimeout {
+                    timeout_secs: 1,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(!error.rolled_back());
+        assert!(!base.join("finished").exists());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn failed_waiter_with_successful_activation_is_not_claimed_as_rollback() {
+        let body = CANCEL_EFFECT.replace(
+            "touch \"$TEST_ROOT/finished\"\n    exit 1",
+            "touch \"$TEST_ROOT/finished\"\n    exit 0",
+        );
+        let (result, _, _) = cancel_case("cancel-activation-success", true, Some(2), &body).await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, DeployProfileError::WaitExit(_)), "{error}");
+        assert!(!error.rolled_back());
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_and_canary_are_removed_before_new_attempt() {
+        let (result, _, base) = cancel_case("cancel-stale", true, Some(2), CANCEL_EFFECT).await;
+        assert!(matches!(
+            result,
+            Err(DeployProfileError::WaitRollback { .. })
+        ));
+        assert!(base.join("clean-start").exists());
+        assert!(
+            !base
+                .join("deploy-rs-canary-00000000000000000000000000000000")
+                .exists()
+        );
     }
 
     #[test]
