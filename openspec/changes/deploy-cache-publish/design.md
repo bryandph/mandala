@@ -88,7 +88,7 @@ Status, runs views, owned/attached TUI and MCP `deploy_status` project `cache-pu
 
 Implement additive option/argv and safe-record types first, then the shared phase, then launch/observer wiring. Keep publishing opt-in at every step. Use stub Nix programs and temporary run directories for tests, never a live cache or fleet. Test exact argv, union ordering, the build/recovery/publish/fan-out barrier, partial builds, fallback, redaction and termination. Exercise CLI, TUI and MCP through the same engine policy and durable projections, with serialization compatibility gates.
 
-The targeted existing checks are `nix build .#checks.<system>.fake-fleet` for contract preservation and `nix build .#packages.<system>.mandala-rs` for workspace tests, including the termination integrations. Run `nix fmt -- --check .` and `nix flake check` as final gates; `flake.nix` is authoritative for current target names. Implementation must extend `docs/deploy-termination.md` and relevant frontend/format specs when the behavior ships.
+The targeted existing checks are `nix build .#checks.<system>.fake-fleet` for contract preservation and `nix build .#packages.<system>.mandala-rs` for workspace tests, including the termination integrations. Run `nix fmt -- --check .` and `nix flake check` as final gates; `flake.nix` is authoritative for current target names. Implementation must extend `docs/deploy-termination.md` and add the relevant frontend/format delta specs inside this change. Canonical specs synchronize at archive, separately after merge.
 
 ## Approval and Open Questions
 

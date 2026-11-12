@@ -144,6 +144,7 @@ pub struct DeployConfig {
     pub dry_activate: bool,
     pub boot: bool,
     pub halt_on_build_failure: bool,
+    pub cache_push: Option<bool>,
     pub throttle: i64,
     /// Test seam: override the launched argv verbatim (`DeployRun::program`)
     /// — never a real native deploy in tests.
@@ -177,6 +178,7 @@ pub async fn run_deploy(cfg: DeployConfig) -> io::Result<i64> {
     run.dry_activate = cfg.dry_activate;
     run.boot = cfg.boot;
     run.halt_on_build_failure = cfg.halt_on_build_failure;
+    run.cache_push = cfg.cache_push;
     run.throttle = cfg.throttle;
     run.program = cfg.program.clone();
 

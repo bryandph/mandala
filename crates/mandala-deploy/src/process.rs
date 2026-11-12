@@ -72,7 +72,26 @@ impl Drop for ChildGroup {
     }
 }
 
+/// Whether termination has started; callers must not convert it to fallback.
+#[must_use]
+pub fn is_stopping() -> bool {
+    children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stopping
+}
+
 pub fn spawn_std(command: &mut Command) -> io::Result<(Child, ChildGroup)> {
+    command
+        .env_remove("MANDALA_CACHE_NETRC_FILE")
+        .env_remove("MANDALA_CACHE_URL");
+    spawn_engine_handoff(command)
+}
+
+/// Supervisor-to-engine handoff only: keep controller upload configuration in
+/// the engine environment. All ordinary effects use spawn_std/spawn instead.
+/// Ownership and signal registration are identical for both boundaries.
+pub fn spawn_engine_handoff(command: &mut Command) -> io::Result<(Child, ChildGroup)> {
     let mut children = children()
         .lock()
         .map_err(|_| io::Error::other("child registry lock poisoned"))?;
@@ -103,6 +122,28 @@ pub fn output_std(command: &mut Command) -> io::Result<Output> {
             .stderr(Stdio::piped()),
     )?;
     wait_std_with_output(child, group)
+}
+
+/// Drain both output pipes concurrently into a sink without retaining any bytes.
+/// This preserves owned-process capture semantics for credential-bearing effects.
+pub fn discard_output_std(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    let (mut child, mut group) = spawn_std(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
+    let drain = |mut pipe: Box<dyn io::Read + Send>| {
+        std::thread::spawn(move || io::copy(&mut pipe, &mut io::sink()).map(|_| ()))
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("piped stdout")));
+    let stderr = drain(Box::new(child.stderr.take().expect("piped stderr")));
+    let status = wait_std(&mut child, &mut group)?;
+    for task in [stdout, stderr] {
+        task.join()
+            .map_err(|_| io::Error::other("discard reader panicked"))??;
+    }
+    Ok(status)
 }
 
 /// Reap and unregister under the forwarder's lock. Poll rather than holding
@@ -151,6 +192,9 @@ pub fn wait_std_with_output(mut child: Child, mut group: ChildGroup) -> io::Resu
 pub fn spawn(
     command: &mut tokio::process::Command,
 ) -> io::Result<(tokio::process::Child, ChildGroup)> {
+    command
+        .env_remove("MANDALA_CACHE_NETRC_FILE")
+        .env_remove("MANDALA_CACHE_URL");
     let mut children = children()
         .lock()
         .map_err(|_| io::Error::other("child registry lock poisoned"))?;
@@ -275,6 +319,43 @@ impl Drop for SignalForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn std_effects_do_not_inherit_upload_netrc_hint() {
+        let output = output_std(
+            Command::new("sh")
+                .args(["-c", "test -z \"${MANDALA_CACHE_NETRC_FILE+x}\""])
+                .env("MANDALA_CACHE_NETRC_FILE", "/fictional/private-netrc"),
+        )
+        .unwrap();
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn supervisor_handoff_preserves_netrc_for_engine_only() {
+        let (mut child, mut group) = spawn_engine_handoff(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "test \"$MANDALA_CACHE_NETRC_FILE\" = /fictional/private-netrc",
+                ])
+                .env("MANDALA_CACHE_NETRC_FILE", "/fictional/private-netrc"),
+        )
+        .unwrap();
+        assert!(wait_std(&mut child, &mut group).unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn async_effects_do_not_inherit_upload_netrc_hint() {
+        let output = output(
+            tokio::process::Command::new("sh")
+                .args(["-c", "test -z \"${MANDALA_CACHE_NETRC_FILE+x}\""])
+                .env("MANDALA_CACHE_NETRC_FILE", "/fictional/private-netrc"),
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+    }
 
     struct SignalRecorder;
     impl SignalRecorder {

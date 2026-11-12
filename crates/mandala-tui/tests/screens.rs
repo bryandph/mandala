@@ -211,11 +211,47 @@ fn confirm_modal_renders_message_and_trailer() {
             "",
             "[ ] Use boot activation for every target (b to toggle)",
             "[ ] Halt on build failure (h to toggle)",
+            "Cache publish: auto (c to cycle auto/on/off)",
             "Default: deploy targets that build successfully.",
             "",
             "y to run   esc to cancel",
         ]
     );
+}
+
+#[test]
+fn shared_publish_is_visible_during_attach_and_in_successful_summary() {
+    let mut tailer =
+        mandala_core::runner::EventTailer::new(std::path::Path::new("/nonexistent-fixture"));
+    tailer.publish =
+        Some(serde_json::json!({"outcome":"running","cache_url":"https://cache.acme.example"}));
+    let mut view = DeployViewState::new("web", false, false, true, false);
+    view.sync(Some(&tailer), &[], false, None, 1);
+    assert!(
+        view.build_line
+            .contains("cache-publish: running https://cache.acme.example")
+    );
+    assert!(view.hosts.is_empty());
+    tailer.publish = Some(
+        serde_json::json!({"outcome":"failed","reason":"copy-exit","process_rc":23,"cache_url":"https://cache.acme.example"}),
+    );
+    view.sync(Some(&tailer), &[], true, Some(0), 2);
+    let summary = view.summary.unwrap();
+    assert!(summary.ok);
+    assert!(
+        summary
+            .build_line
+            .contains("warning: continuing per-host SSH copy")
+    );
+    let row = mandala_tui::screen::RunRow {
+        run_id: "fixture".into(),
+        kind: "deploy".into(),
+        limit: "web".into(),
+        live: true,
+        rc: None,
+        publish: Some(serde_json::json!({"outcome":"running"})),
+    };
+    assert_eq!(row.status(), "cache-publish");
 }
 
 #[test]
@@ -615,7 +651,7 @@ fn snapshot_confirm_modal() {
             target: "web".into(),
         },
     )));
-    let terminal = draw(&state, 90, 12);
+    let terminal = draw(&state, 90, 14);
     let border = terminal.backend().buffer().cell((10, 1)).unwrap();
     assert_eq!(border.symbol(), "┌");
     assert_eq!(border.style().fg, Some(Color::LightCyan));

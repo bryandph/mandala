@@ -66,6 +66,7 @@ pub enum Action {
     ToggleMcp,
     ToggleHalt,
     ToggleBoot,
+    CycleCachePush,
     Confirm,
     Cancel,
     OrderOne,
@@ -439,6 +440,11 @@ const BINDINGS: &[Binding] = &[
         Context::Confirm,
         &[KeyPattern::plain(KeyCode::Char('b'))],
         Action::ToggleBoot,
+    ),
+    binding(
+        Context::Confirm,
+        &[KeyPattern::plain(KeyCode::Char('c'))],
+        Action::CycleCachePush,
     ),
     binding(
         Context::Confirm,

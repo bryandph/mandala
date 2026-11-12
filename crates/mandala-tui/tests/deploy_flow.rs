@@ -228,6 +228,48 @@ async fn deploy_boot_option_defaults_off_toggles_and_resets_on_reopen() {
     }
 }
 
+#[tokio::test]
+async fn deploy_publish_option_cycles_auto_on_off_and_resets() {
+    registry_env();
+    for (keys, expected) in [
+        (vec![KeyCode::Char('D')], None),
+        (vec![KeyCode::Char('D'), KeyCode::Char('c')], Some(true)),
+        (
+            vec![KeyCode::Char('D'), KeyCode::Char('c'), KeyCode::Char('c')],
+            Some(false),
+        ),
+        (
+            vec![
+                KeyCode::Char('D'),
+                KeyCode::Char('c'),
+                KeyCode::Char('c'),
+                KeyCode::Char('c'),
+            ],
+            None,
+        ),
+        (
+            vec![
+                KeyCode::Char('D'),
+                KeyCode::Char('c'),
+                KeyCode::Esc,
+                KeyCode::Char('D'),
+            ],
+            None,
+        ),
+    ] {
+        let app = drive(
+            App::new(filled_state(), stub_cfg(&["sh", "-c", "exit 0"])),
+            keys.into_iter().map(|key| (0, key)).collect(),
+            10,
+        )
+        .await;
+        let Some(ScreenState::Confirm(confirm)) = &app.state.screen else {
+            panic!("confirmation missing");
+        };
+        assert_eq!(confirm.cache_push, expected);
+    }
+}
+
 // ---- owned mode (confirm-gated launch from the explorer) --------------------
 
 /// The confirm-gated launch streams the run's own event files back into the

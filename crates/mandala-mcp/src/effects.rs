@@ -115,6 +115,7 @@ pub trait Effects: Send + Sync {
         limit: &str,
         dry_activate: bool,
         boot: bool,
+        cache_push: Option<bool>,
         throttle: i64,
     ) -> io::Result<DeployLaunch>;
 
@@ -253,6 +254,8 @@ impl Effects for RealEffects {
         // `output()` captures both streams for MCP diagnostics and also keeps
         // the TUI leader's alternate screen quiet.
         let output = tokio::process::Command::new("ansible-playbook")
+            .env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL")
             .arg("mandala.fleet.state")
             .current_dir(&self.ansible_dir)
             .env("MANDALA_FLEET_STATE", drift::state_dir())
@@ -268,7 +271,9 @@ impl Effects for RealEffects {
 
     async fn run_adhoc(&self, argv: Vec<String>) -> Result<AdhocOutput, AdhocError> {
         let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
+        cmd.env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL")
+            .args(&argv[1..])
             .current_dir(&self.ansible_dir)
             // Silence deprecation chatter that would otherwise ride along in
             // every tool result (the Python `_adhoc_env`).
@@ -292,12 +297,14 @@ impl Effects for RealEffects {
         limit: &str,
         dry_activate: bool,
         boot: bool,
+        cache_push: Option<bool>,
         throttle: i64,
     ) -> io::Result<DeployLaunch> {
         let mut run = DeployRun::new(limit);
         run.flake = flake.to_string();
         run.dry_activate = dry_activate;
         run.boot = boot;
+        run.cache_push = cache_push;
         run.throttle = throttle;
         run.start().await?;
         loop {

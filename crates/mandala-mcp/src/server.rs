@@ -780,6 +780,7 @@ impl MandalaHandler {
                 &target,
                 dry_activate,
                 boot,
+                t.cache_push,
                 DEPLOY_THROTTLE,
             )
             .await
@@ -1069,6 +1070,13 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
     // events yet), then fans out per host.
     let phase = if liveness != RunLiveness::Running {
         "done"
+    } else if obs
+        .tailer
+        .publish
+        .as_ref()
+        .is_some_and(|p| p["outcome"] == "running")
+    {
+        "cache-publish"
     } else if hosts.is_empty() {
         "batch-build"
     } else {
@@ -1138,7 +1146,8 @@ fn bounded_forest_summary(value: Value) -> Value {
 /// projection, not a second source of truth: `diagnostics=true` returns the
 /// raw meta verbatim, so nothing is unreachable.
 fn curated_meta(meta: &Meta) -> Value {
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
+        "publish",
         "summary",
         "rc",
         "process_rc",
@@ -1277,6 +1286,64 @@ mod tests {
     fn round3_matches_python_round() {
         assert_eq!(round3(1.234_567), 1.235);
         assert_eq!(round3(0.0004), 0.0);
+    }
+
+    #[test]
+    fn publish_status_reconstructs_running_and_advisory_completion() {
+        let path = std::env::temp_dir().join(format!("mandala-mcp-publish-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let mut meta = Meta::from_iter([
+            ("kind".into(), json!("deploy")),
+            ("pid".into(), json!(std::process::id())),
+            (
+                "publish".into(),
+                json!({"enabled":true,"outcome":"running","cache_url":"https://cache.acme.example","path_count":1}),
+            ),
+        ]);
+        registry::write_meta(&path, &meta).unwrap();
+        let mut obs = ObservedRun {
+            info: registry::RunInfo {
+                run_id: "fixture".into(),
+                path: path.clone(),
+                meta: meta.clone(),
+            },
+            tailer: mandala_core::runner::EventTailer::new(&path),
+        };
+        let snapshot = run_snapshot(
+            &mut obs,
+            SnapshotDetail::Full {
+                forest: false,
+                forest_nodes: false,
+                diagnostics: false,
+            },
+        );
+        assert_eq!(snapshot["phase"], "cache-publish");
+        assert!(snapshot["hosts"].as_object().unwrap().is_empty());
+        assert_eq!(
+            snapshot["meta"]["publish"]["cache_url"],
+            "https://cache.acme.example"
+        );
+        meta.insert(
+            "publish".into(),
+            json!({"enabled":true,"outcome":"failed","reason":"copy-exit","process_rc":23}),
+        );
+        meta.insert("rc".into(), json!(0));
+        meta.insert("pid".into(), json!(0));
+        registry::write_meta(&path, &meta).unwrap();
+        obs.info.meta = meta;
+        obs.tailer = mandala_core::runner::EventTailer::new(&path);
+        let snapshot = run_snapshot(
+            &mut obs,
+            SnapshotDetail::Full {
+                forest: false,
+                forest_nodes: false,
+                diagnostics: false,
+            },
+        );
+        assert_eq!(snapshot["phase"], "done");
+        assert_eq!(snapshot["meta"]["rc"], 0);
+        assert_eq!(snapshot["meta"]["publish"]["reason"], "copy-exit");
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

@@ -127,7 +127,8 @@ impl EventWriter {
     /// Invalid stream/host labels or any file-open failure.
     pub fn new(directory: &Path, stream: &str, host: &str, plugin: &str) -> std::io::Result<Self> {
         if !crate::inventory::is_valid_member_name(stream)
-            || !crate::inventory::is_valid_member_name(host)
+            || !(crate::inventory::is_valid_member_name(host)
+                || (host.is_empty() && stream == "publish" && plugin == "publish"))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -499,6 +500,8 @@ pub struct EventTailer {
     offsets: BTreeMap<PathBuf, u64>,
     pub hosts: BTreeMap<String, HostRun>,
     pub build: BuildModel,
+    /// Latest shared publish milestone (never a fleet host).
+    pub publish: Option<Value>,
     /// Native, tolerant Nix activity state shared by every frontend.
     pub forest: nix_build_forest::BuildForest,
     forest_resolver: Option<ForestResolver>,
@@ -531,6 +534,7 @@ impl EventTailer {
             offsets: BTreeMap::new(),
             hosts: BTreeMap::new(),
             build: BuildModel::default(),
+            publish: registry::read_meta(directory).get("publish").cloned(),
             forest: nix_build_forest::BuildForest::with_duration_estimates(duration_estimates),
             forest_resolver: None,
             nixlog_sink: None,
@@ -646,6 +650,12 @@ impl EventTailer {
             self.forest.feed_line(l);
             if let Some(sink) = self.nixlog_sink.as_mut() {
                 sink(l.to_string());
+            }
+            return;
+        }
+        if event.get("plugin").and_then(Value::as_str) == Some("publish") {
+            if event.get("event").and_then(Value::as_str) == Some("milestone") {
+                self.publish = Some(event);
             }
             return;
         }
@@ -872,7 +882,7 @@ fn prune_deploy_launches(base: &Path, keep: usize, days: u64, now: SystemTime) {
             inactive.push((stamp, path));
         }
     }
-    inactive.sort_by(|a, b| b.0.cmp(&a.0));
+    inactive.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let now = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1002,15 +1012,16 @@ pub fn run_deploy_supervisor(launch_dir: &Path) -> std::io::Result<i64> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    let (mut child, mut engine_group) = match mandala_deploy::process::spawn_std(&mut command) {
-        Ok(child) => child,
-        Err(error) => {
-            if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
-                let _ = writeln!(log, "failed to launch {}: {error}", request.argv[0]);
+    let (mut child, mut engine_group) =
+        match mandala_deploy::process::spawn_engine_handoff(&mut command) {
+            Ok(child) => child,
+            Err(error) => {
+                if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                    let _ = writeln!(log, "failed to launch {}: {error}", request.argv[0]);
+                }
+                return Ok(127);
             }
-            return Ok(127);
-        }
-    };
+        };
     let status = mandala_deploy::process::wait_std(&mut child, &mut engine_group)?;
     Ok(exit_code(status))
 }
@@ -1034,6 +1045,7 @@ pub struct DeployRun {
     pub dry_activate: bool,
     pub boot: bool,
     pub halt_on_build_failure: bool,
+    pub cache_push: Option<bool>,
     pub throttle: i64,
     pub events_dir: Option<PathBuf>,
     pub run_id: Option<String>,
@@ -1068,6 +1080,7 @@ impl DeployRun {
             dry_activate: false,
             boot: false,
             halt_on_build_failure: false,
+            cache_push: None,
             throttle: 4,
             events_dir: None,
             run_id: None,
@@ -1141,6 +1154,16 @@ impl DeployRun {
         }
         if self.boot {
             argv.push("--boot".to_string());
+        }
+        if let Some(enabled) = self.cache_push {
+            argv.push(
+                if enabled {
+                    "--cache-push"
+                } else {
+                    "--no-cache-push"
+                }
+                .into(),
+            );
         }
         argv
     }
@@ -1547,7 +1570,10 @@ impl CommandRun {
         }
 
         let mut cmd = tokio::process::Command::new(&self.argv[0]);
-        cmd.args(&self.argv[1..]).env("PYTHONUNBUFFERED", "1");
+        cmd.args(&self.argv[1..])
+            .env("PYTHONUNBUFFERED", "1")
+            .env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL");
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
@@ -2359,6 +2385,7 @@ mod write_tests {
         run.dry_activate = true;
         run.boot = true;
         assert!(!run.halt_on_build_failure);
+        assert_eq!(run.cache_push, None);
         run.halt_on_build_failure = true;
         let argv = run.argv();
         assert_eq!(
@@ -2377,6 +2404,10 @@ mod write_tests {
                 "--boot",
             ]
         );
+        for (enabled, flag) in [(true, "--cache-push"), (false, "--no-cache-push")] {
+            run.cache_push = Some(enabled);
+            assert_eq!(run.argv().last().map(String::as_str), Some(flag));
+        }
     }
 
     #[test]

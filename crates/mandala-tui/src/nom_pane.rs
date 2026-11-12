@@ -155,6 +155,8 @@ impl NomPane {
             }
         };
         let child = Command::new(cmd)
+            .env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(slave_clone))
@@ -483,6 +485,24 @@ impl Widget for &NomPane {
     }
 }
 
+/// Drain thread: pty master → emulator. Exits on EOF/EIO (child gone).
+fn drain_pty(fd: OwnedFd, parser: Arc<Mutex<vt100::Parser>>, dirty: Arc<AtomicBool>) {
+    let mut file = File::from(fd);
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                parser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .process(&buf[..n]);
+                dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,23 +528,5 @@ mod tests {
         pane.scroll_to_bottom();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 70, 15));
         (&pane).render(buffer.area, &mut buffer);
-    }
-}
-
-/// Drain thread: pty master → emulator. Exits on EOF/EIO (child gone).
-fn drain_pty(fd: OwnedFd, parser: Arc<Mutex<vt100::Parser>>, dirty: Arc<AtomicBool>) {
-    let mut file = File::from(fd);
-    let mut buf = [0u8; 8192];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                parser
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .process(&buf[..n]);
-                dirty.store(true, Ordering::Release);
-            }
-        }
     }
 }

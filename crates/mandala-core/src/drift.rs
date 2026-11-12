@@ -423,6 +423,8 @@ where
 /// non-zero, or emits non-UTF-8.
 fn git_output(flake: &str, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        .env_remove("MANDALA_CACHE_NETRC_FILE")
+        .env_remove("MANDALA_CACHE_URL")
         .arg("-C")
         .arg(flake)
         .args(args)
@@ -715,6 +717,8 @@ pub fn refresh_snapshots(
 ) -> std::io::Result<i32> {
     let state = directory.map_or_else(state_dir, PathBuf::from);
     let mut cmd = Command::new("ansible-playbook");
+    cmd.env_remove("MANDALA_CACHE_NETRC_FILE")
+        .env_remove("MANDALA_CACHE_URL");
     cmd.arg("mandala.fleet.state");
     if let Some(l) = limit {
         cmd.arg("-l").arg(l);

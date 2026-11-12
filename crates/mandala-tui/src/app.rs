@@ -737,6 +737,14 @@ impl App {
         match self.state.screen.as_mut().expect("screen present") {
             // ConfirmScreen: y confirm, esc/n cancel.
             ScreenState::Confirm(confirm) => match action {
+                Some(KeyAction::CycleCachePush) => {
+                    confirm.cache_push = match confirm.cache_push {
+                        None => Some(true),
+                        Some(true) => Some(false),
+                        Some(false) => None,
+                    };
+                    self.dirty = true;
+                }
                 Some(KeyAction::ToggleHalt) => {
                     confirm.halt_on_build_failure = !confirm.halt_on_build_failure;
                     self.dirty = true;
@@ -755,6 +763,7 @@ impl App {
                             let mut run = DeployRun::new(target);
                             run.flake = self.cfg.flake.clone();
                             run.boot = confirm.boot;
+                            run.cache_push = confirm.cache_push;
                             run.halt_on_build_failure = confirm.halt_on_build_failure;
                             if let Some(program) = self.cfg.deploy_program.clone() {
                                 run.program = Some(program);
@@ -1311,7 +1320,9 @@ impl App {
             return;
         }
         let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
+        cmd.env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL")
+            .args(&argv[1..])
             .current_dir(&cwd)
             .env("PYTHONUNBUFFERED", "1")
             .env("ANSIBLE_FORCE_COLOR", "0")

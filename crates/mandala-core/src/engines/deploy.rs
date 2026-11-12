@@ -31,6 +31,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use super::cache_publish;
 use crate::cli::Engine;
 use crate::inventory::{Inventory, InventoryError};
 use crate::registry::{self, Meta};
@@ -45,6 +46,7 @@ pub fn engine() -> Engine {
         .arg_required_else_help(true)
         .subcommand(
             Command::new("run")
+                .args(cache_publish::flags())
                 .about("Run the native eval-once + fan-out deploy")
                 .arg(
                     Arg::new("limit")
@@ -112,6 +114,8 @@ pub struct DeployPlan {
     pub boot: bool,
     /// Opt-in fail-fast build policy; defaults to best effort.
     pub halt_on_build_failure: bool,
+    /// Resolved once before registration; raw credentials are never serialized.
+    pub publish: cache_publish::Config,
     /// Maximum per-host concurrency for the later fan-out stage.
     pub throttle: i64,
 }
@@ -460,6 +464,7 @@ pub fn plan_run_with_boot(
         dry_activate,
         boot,
         halt_on_build_failure: false,
+        publish: cache_publish::Config::default(),
         throttle,
     })
 }
@@ -491,6 +496,7 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
     meta.insert("skipped".into(), Value::from(plan.skipped.clone()));
     meta.insert("dry_activate".into(), Value::from(plan.dry_activate));
     meta.insert("boot".into(), Value::from(plan.boot));
+    meta.insert("publish".into(), plan.publish.initial());
     meta.insert("throttle".into(), Value::from(plan.throttle));
     meta.insert(
         "halt_on_build_failure".into(),
@@ -1625,6 +1631,11 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
             let prepared = plan_run_with_boot(inv, limit, throttle, dry_activate, boot).and_then(
                 |mut plan| {
                     plan.halt_on_build_failure = sm.get_flag("halt-on-build-failure");
+                    plan.publish = cache_publish::Config::resolve(
+                        cache_publish::choice(sm),
+                        std::env::var_os("MANDALA_CACHE_URL"),
+                        std::env::var_os("MANDALA_CACHE_NETRC_FILE"),
+                    )?;
                     register_run(plan)
                 },
             );
@@ -1643,6 +1654,12 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
                         Ok(built) => {
                             for (host, path) in &built.paths {
                                 eprintln!("mandala: built {host}: {}", path.display());
+                            }
+                            if let Err(error) =
+                                cache_publish::publish(&run, &built, OsStr::new("nix"))
+                            {
+                                record_controller_failure(&run, &error.to_string());
+                                return ExitCode::FAILURE;
                             }
                             let runtime = match tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
@@ -1670,6 +1687,9 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
                             }
                         }
                         Err(error) => {
+                            if let Err(event_error) = cache_publish::build_aborted(&run) {
+                                record_controller_failure(&run, &event_error.to_string());
+                            }
                             eprintln!("mandala: {error}");
                             ExitCode::from(exit_byte(Some(error.exit_code())))
                         }
@@ -2583,6 +2603,7 @@ exit 0
                 "pid",
                 "process_rc",
                 "profiles",
+                "publish",
                 "rc",
                 "run_id",
                 "skipped",

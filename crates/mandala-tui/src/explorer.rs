@@ -310,6 +310,8 @@ pub async fn run_survey(
     };
     let mut command = tokio::process::Command::new(program);
     command
+        .env_remove("MANDALA_CACHE_NETRC_FILE")
+        .env_remove("MANDALA_CACHE_URL")
         .args(args)
         .current_dir(&cwd)
         .env("MANDALA_FLEET_STATE", &state)
