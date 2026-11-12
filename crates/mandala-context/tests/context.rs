@@ -358,7 +358,7 @@ async fn heartbeats_cover_a_blocking_call() {
     assert!(seen >= 3, "expected heartbeats during the call, saw {seen}");
 }
 
-// ---- busy-leader discipline (bryan/nixspace#123) ----------------------------
+// ---- busy-leader discipline ----------------------------
 
 /// A bound endpoint that accepts connections but never completes the
 /// handshake is a live wedged leader. Acquisition must retry it and then

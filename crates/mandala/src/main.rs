@@ -2,7 +2,7 @@
 //!
 //! The public `mandala` binary: it assembles the `mandala-core` CLI (the
 //! fleet-generic root views) and registers only the fleet-generic built-in
-//! engines — `deploy` and `ansible`. A downstream operator binary (mandala-bph)
+//! engines — `deploy` and `ansible`. A downstream operator binary
 //! links `mandala-core` and registers its own engines (flux, terraform) on top,
 //! sharing the same in-process inventory (see the `fleet-cli` spec).
 //!

@@ -19,7 +19,7 @@ in {
           ip = mkOption {
             type = types.str;
             description = "Assigned overlay IPv4 address.";
-            example = "10.16.42.29";
+            example = "192.0.2.29";
           };
           ip6 = mkOption {
             type = types.nullOr types.str;
@@ -36,7 +36,7 @@ in {
             type = types.nullOr types.str;
             default = null;
             description = "Relative DNS name (within the operator's internal zone) that resolves to the overlay address — drives the mesh DNS-record projection. null = no mesh DNS record.";
-            example = "ash.hzn";
+            example = "example-node.mesh";
           };
         };
       });

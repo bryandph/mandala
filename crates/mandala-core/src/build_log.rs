@@ -96,7 +96,7 @@ mod tests {
         emit(r#"@nix {"action":"msg","level":0,"msg":"synthetic failure"}"#.into());
         let compact = std::fs::metadata(dir.join("build.jsonl")).unwrap().len();
         eprintln!(
-            "LAB-106 synthetic raw_internal_json={} compact_jsonl={compact} bytes",
+            "synthetic raw_internal_json={} compact_jsonl={compact} bytes",
             before.get()
         );
         assert!(compact < 4096);
@@ -126,7 +126,7 @@ mod tests {
             )
             .unwrap();
         let size = std::fs::metadata(dir.join("build.jsonl")).unwrap().len();
-        eprintln!("LAB-106 capped={size} limit={BUILD_LOG_MAX_BYTES} bytes");
+        eprintln!("capped={size} limit={BUILD_LOG_MAX_BYTES} bytes");
         assert!(size <= BUILD_LOG_MAX_BYTES);
         let text = std::fs::read_to_string(dir.join("build.jsonl")).unwrap();
         assert_eq!(text.matches("build log size cap reached").count(), 1);

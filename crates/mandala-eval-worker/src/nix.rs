@@ -123,7 +123,7 @@ impl Evaluator {
         // Experimental features: the CLI resolves these from global config PLUS
         // the target flake's `nixConfig.extra-experimental-features` (honoured
         // under `accept-flake-config`). The C flake settings do not replay a
-        // flake's nixConfig, so we set the union the parent nixspace flake needs
+        // flake's nixConfig, so we set the union the downstream operator flake needs
         // explicitly — `pipe-operators` for the `mightyiam/files` modules that
         // use `|>`, on top of the standard flake stack. Set before the
         // `EvalState` is built so it takes effect. Overridable via

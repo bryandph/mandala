@@ -11,7 +11,7 @@
 //! that with **compile-time registration** ([`Cli::register`]): an engine is a
 //! name + a [`clap::Command`] + a `run(&Inventory, &ArgMatches)` handler, and
 //! the public `mandala` binary registers only the fleet-generic built-ins
-//! (`deploy`, `ansible`). A downstream operator binary (mandala-bph) links
+//! (`deploy`, `ansible`). A downstream operator binary links
 //! `mandala-core` and registers its own engines on top, sharing the in-process
 //! [`Inventory`] — see the `fleet-cli` spec.
 //!

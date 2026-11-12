@@ -49,7 +49,7 @@ pub fn server_name() -> String {
 
 /// Blocking waits fit inside one MCP client call budget. Claude Code's call
 /// timeout is ~120s — the old 570s cap meant every long wait got forcibly
-/// backgrounded and its result arrived detached (bryan/nixspace#128). The
+/// backgrounded and its result arrived detached. The
 /// intended long-wait pattern is re-invocation: a timed-out wait returns a
 /// snapshot with `wait_timed_out`, and re-attaching via the run registry is
 /// a cheap idempotent read.
@@ -69,8 +69,7 @@ const COMMAND_TAIL_DEFAULT: usize = 40;
 /// Lines of a failed/rolled-back host's raw stream surfaced in a deploy
 /// snapshot. The full stream stays on disk in the run dir; the snapshot says
 /// how much it elided. Unbounded host streams were one of the two ways a
-/// fleet-scale `deploy_status` blew a client's 16MB single-message cap
-/// (bryan/nixspace#123).
+/// fleet-scale `deploy_status` blew a client's 16MB single-message cap.
 const HOST_RAW_TAIL: usize = 200;
 
 /// Node budget for the opt-in `forest_nodes` graph — active-first, with an
@@ -631,7 +630,7 @@ impl MandalaHandler {
             // Tailing a fleet-scale run parses megabytes of JSONL and clones
             // the forest — off the async loop, so the leader keeps answering
             // stdio calls and coordination hellos while a wait poll grinds
-            // (bryan/nixspace#123 starved joiners into connect timeouts). The
+            // (starving joiners into connect timeouts). The
             // same observer threads through every poll: its tail offsets and
             // forest state advance incrementally.
             let (mut obs, mut snap) = blocking_snapshot(obs, detail).await?;
@@ -986,7 +985,7 @@ fn read_log_lines(path: &std::path::Path) -> Vec<String> {
 
 /// How much of a run's state a snapshot carries. Every level is bounded by
 /// construction — no field grows with the size of the underlying run
-/// (bryan/nixspace#123: unbounded snapshots got the server disconnected for
+/// (unbounded snapshots got the server disconnected for
 /// flooding its stdio transport).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotDetail {
@@ -994,7 +993,7 @@ enum SnapshotDetail {
     /// state/rc, build counters — no forest, no raw streams, no milestones.
     Listing,
     /// One named run. The default is summary-first — enough to answer "did
-    /// it work" (bryan/nixspace#128): curated meta, per-host states, and
+    /// it work": curated meta, per-host states, and
     /// bounded raw tails for failed/rolled-back hosts. `forest` opts into
     /// the bounded forest summary, `forest_nodes` into the capped node
     /// graph (implying `forest`), `diagnostics` into per-host milestones
@@ -1142,7 +1141,7 @@ fn bounded_forest_summary(value: Value) -> Value {
 /// The default projection of a deploy run's meta: the outcome and identity
 /// keys an agent needs to answer "did it work", without the keys that grow
 /// with fleet size (`profiles` — per-host store paths — was a big chunk of
-/// the ~15k-token terminal snapshots in bryan/nixspace#128). This is a
+/// the ~15k-token terminal snapshots). This is a
 /// projection, not a second source of truth: `diagnostics=true` returns the
 /// raw meta verbatim, so nothing is unreachable.
 fn curated_meta(meta: &Meta) -> Value {
@@ -1454,7 +1453,7 @@ mod tests {
 
     /// The default single-run shape answers "did it work" and nothing more:
     /// no forest, no milestones, no store paths — failed-host raw tails and
-    /// the outcome counters stay (bryan/nixspace#128).
+    /// the outcome counters stay.
     #[test]
     fn default_single_run_snapshot_is_summary_first() {
         let mut engine = recorded_run("engine");

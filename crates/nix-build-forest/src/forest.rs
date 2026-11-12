@@ -78,7 +78,7 @@ pub struct ForestCounts {
     /// Graph nodes materialized only as dependency edges or transfer
     /// references, never observed by an activity. A coverage note, not a
     /// failure bucket — labeled `untracked` so a 13k-node count doesn't
-    /// read as breakage (bryan/nixspace#128), and excluded from
+    /// read as breakage, and excluded from
     /// [`ForestCounts::total`] so it never inflates completion denominators.
     pub untracked: usize,
     pub planned: usize,
@@ -140,7 +140,7 @@ pub const SUMMARY_ACTIVITY_ROW_CAP: usize = 256;
 /// keeps active/failed work visible; exact counts keep the full-forest shape
 /// legible. Fleet-scale terminal snapshots serialized past a client's
 /// single-message cap through `nodes` — the summary is bounded by
-/// construction (bryan/nixspace#123).
+/// construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ForestSummary {
     pub version: u64,
@@ -1086,7 +1086,7 @@ mod tests {
     /// A fleet-scale (or pathological) forest still summarizes small: the
     /// activity rows are hard-capped with an explicit truncation count, and
     /// the serialized summary stays orders of magnitude under the ~16MB
-    /// transport caps the full snapshot blew (bryan/nixspace#123).
+    /// transport caps the full snapshot blew.
     #[test]
     fn fleet_scale_summary_stays_bounded() {
         let mut forest = BuildForest::new();
@@ -1115,7 +1115,7 @@ mod tests {
 
     /// Never-observed graph nodes are a coverage note, not a failure bucket:
     /// serialized as `untracked` (never `unknown`) and excluded from the
-    /// completion denominator (bryan/nixspace#128 saw `unknown: 13093` read
+    /// completion denominator (`unknown: 13093` could be read
     /// as breakage).
     #[test]
     fn untracked_nodes_are_labeled_and_out_of_the_denominator() {

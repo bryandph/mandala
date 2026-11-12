@@ -13,7 +13,7 @@
   in {
     # The engine: schema modules + evaluators. Depends on nixpkgs.lib ONLY —
     # consumers get no transitive package closure from mandala. Operator
-    # values live in a separate data flake (e.g. mandala-bph) that fills
+    # values live in a separate downstream operator data flake that fills
     # this schema; nothing in this repo names a real fleet.
     lib = import ./lib {inherit lib;};
 
@@ -457,7 +457,7 @@
 
         # Aggregate contract output: the lib function the fleet flakeModule
         # wires (the module itself needs flake-parts, which the engine
-        # doesn't pin — nixspace + the template are its integration tests).
+        # doesn't pin — downstream operator flakes + the template are its integration tests).
         agg = self.lib.aggregate {
           members = {
             example-node = managedMember;

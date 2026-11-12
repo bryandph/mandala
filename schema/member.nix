@@ -35,7 +35,7 @@ in {
       type = types.nullOr types.str;
       default = null;
       description = "Domain name for the member";
-      example = "servers.bph";
+      example = "servers.acme.example";
     };
 
     fqdn = mkOption {
@@ -66,7 +66,7 @@ in {
       default = cfg.domain;
       defaultText = "config.host.domain";
       description = "Physical or logical location of the member";
-      example = "servers.bph";
+      example = "servers.acme.example";
     };
 
     platform = mkOption {
@@ -138,7 +138,7 @@ in {
             type = types.nullOr types.str;
             default = null;
             description = "IPv4 address on this network (no CIDR — prefix length derived from topology). Required when assignment = reservation. Derived from `id` when realized via lib.net.";
-            example = "172.16.15.100";
+            example = "192.0.2.100";
           };
           ula = mkOption {
             type = types.nullOr types.str;
@@ -304,7 +304,7 @@ in {
           type = types.listOf types.str;
           default = [];
           description = "Extra groups beyond those derived from host.{platform,architecture,category,role,tags} — see lib.groupsFor";
-          example = ["k8s_bph" "turing_pis"];
+          example = ["k8s_acme" "edge_nodes"];
         };
         vars = mkOption {
           type = types.attrsOf types.anything;
