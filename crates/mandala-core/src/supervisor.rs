@@ -19,6 +19,7 @@ static IDENTITY: OnceLock<Option<i32>> = OnceLock::new();
 /// environment removal is not safe concurrently with environment readers.
 ///
 /// ```no_run
+/// # #[allow(clippy::needless_doctest_main)]
 /// fn main() {
 ///     // SAFETY: first statement, before any threads/environment readers.
 ///     unsafe { mandala_core::supervisor::capture_at_entry() };

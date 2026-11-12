@@ -872,7 +872,7 @@ fn prune_deploy_launches(base: &Path, keep: usize, days: u64, now: SystemTime) {
             inactive.push((stamp, path));
         }
     }
-    inactive.sort_by(|a, b| b.0.cmp(&a.0));
+    inactive.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let now = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
