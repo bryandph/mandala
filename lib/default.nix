@@ -216,7 +216,12 @@ in rec {
   in
     {
       schemaVersion = 1;
-      inherit members projections;
+      inherit projections;
+      members = lib.mapAttrs (_: member:
+        if (member.builder or null) == null
+        then removeAttrs member ["builder"]
+        else member)
+      members;
       groups =
         lib.genAttrs
         (lib.unique (lib.concatMap (n: ansibleGroupsFor members.${n}) names))
@@ -224,10 +229,15 @@ in rec {
     }
     // lib.optionalAttrs (operator != null) {inherit operator;};
 
+  # Shared builder types/normalization serve both member modules and projections.
+  builders = import ./builders.nix {inherit lib;};
+  renderBuilders = import ./render-builders.nix {inherit lib;};
+
   # Projections: pure functions from validated fleet data to tool-shaped
   # output. Toolchains (pkgs, deploy-rs, …) are injected as ARGUMENTS by
   # the caller — the engine pins none of them.
   projections = {
+    builders = builders.project;
     ansibleInventory = import ./projections/ansible-inventory.nix {inherit lib ansibleGroupsFor;};
     sopsConfig = import ./projections/sops-config.nix {inherit lib;};
     deployNodes = import ./projections/deploy-nodes.nix {inherit lib;};

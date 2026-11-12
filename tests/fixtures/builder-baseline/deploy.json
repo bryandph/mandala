@@ -1,0 +1,1 @@
+{"settings":{"example-node":{"activation":"switch","autoRollback":true,"fastConnection":true,"hostname":"example-node.example.test","sshPort":22,"sshUser":"root"}}}
