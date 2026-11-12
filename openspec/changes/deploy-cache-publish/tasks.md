@@ -23,7 +23,7 @@
 
 - [ ] 4.1 Wire `--cache-push` / `--no-cache-push` through headless and standalone TUI commands, preserve the tri-state in explorer and typed MCP launch paths, and retain existing confirmation/wrapper gates. Test omission/enable/disable parity against the same engine resolver.
 - [ ] 4.2 Test publishing during dry activation, run-level boot and mixed per-member modes. Assert no activation in dry mode, reboot-pending remains distinct from confirmed, and internal resolution/plan-only paths never upload.
-- [ ] 4.3 Document the opt-in environment and overrides, netrc process boundary, redacted diagnostics, direct-copy fallback, existing trust prerequisites and static cache-warming non-interference. Update `docs/deploy-termination.md` and align the shared fleet-cli/state-format specs with the reviewed additive contracts when implementation ships. Use fictional examples only.
+- [ ] 4.3 Document the opt-in environment and overrides, netrc process boundary, redacted diagnostics, direct-copy fallback, existing trust prerequisites and static cache-warming non-interference. Update `docs/deploy-termination.md` and add fleet-cli/state-format delta specs under this change. Canonical synchronization happens at archive in a separate step after merge; do not edit `openspec/specs/` directly. Use fictional examples only.
 
 ## 5. Verification and review
 

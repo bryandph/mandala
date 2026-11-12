@@ -22,8 +22,10 @@ None.
 ### Modified Capabilities
 
 - `fleet-deploy`: optional, observable, best-effort cache publishing between verified batch build and host fan-out, with credential and termination boundaries.
+- `fleet-cli`: consistent launch tri-state and safe shared publish observation across CLI, TUI and MCP.
+- `fleet-state-formats`: additive safe publish metadata, shared empty-host events and regression-gated compatibility.
 
-The delta includes additive registry and frontend requirements for this deploy phase. It does not replace the shared format compatibility rules in `openspec/specs/fleet-state-formats/spec.md` or the frontend contracts in `openspec/specs/fleet-cli/spec.md`.
+The deltas extend the existing frontend and shared-format contracts. Canonical specs under `openspec/specs/` synchronize when this change is archived, as a separate step after merge; implementation does not edit them directly.
 
 ## Impact
 
