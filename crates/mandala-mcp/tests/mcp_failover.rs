@@ -73,6 +73,7 @@ impl Effects for OrphanEffects {
         _limit: &str,
         _dry_activate: bool,
         _boot: bool,
+        _cache_push: Option<bool>,
         _throttle: i64,
     ) -> io::Result<DeployLaunch> {
         panic!("unexpected launch_deploy call")

@@ -88,6 +88,7 @@ pub struct ConfirmState {
     pub action: ConfirmAction,
     pub boot: bool,
     pub halt_on_build_failure: bool,
+    pub cache_push: Option<bool>,
 }
 
 impl ConfirmState {
@@ -98,6 +99,7 @@ impl ConfirmState {
             action,
             boot: false,
             halt_on_build_failure: false,
+            cache_push: None,
         }
     }
 }
@@ -127,6 +129,14 @@ pub fn confirm_lines(state: &ConfirmState) -> Vec<Line<'static>> {
             "x"
         } else {
             " "
+        }
+    )));
+    lines.push(Line::from(format!(
+        "Cache publish: {} (c to cycle auto/on/off)",
+        match state.cache_push {
+            None => "auto",
+            Some(true) => "on",
+            Some(false) => "off",
         }
     )));
     lines.push(Line::from(
@@ -432,6 +442,7 @@ pub struct RunRow {
     pub live: bool,
     /// The recorded effective rc, once settled.
     pub rc: Option<i64>,
+    pub publish: Option<serde_json::Value>,
 }
 
 impl RunRow {
@@ -439,7 +450,15 @@ impl RunRow {
     #[must_use]
     pub fn status(&self) -> String {
         if self.live {
-            return "running".to_string();
+            return if self
+                .publish
+                .as_ref()
+                .is_some_and(|p| p["outcome"] == "running")
+            {
+                "cache-publish".into()
+            } else {
+                "running".to_string()
+            };
         }
         match self.rc {
             Some(0) => "ok".to_string(),
@@ -474,6 +493,7 @@ impl RunsState {
                     .unwrap_or_default()
                     .to_string(),
                 rc: info.meta.get("rc").and_then(serde_json::Value::as_i64),
+                publish: info.meta.get("publish").cloned(),
                 run_id: info.run_id,
             })
             .collect();
@@ -544,11 +564,15 @@ pub fn render_runs(
         };
         lines.push(Line::from(Span::styled(
             format!(
-                "{:<30} {:<8} {:<9} {}",
+                "{:<30} {:<8} {:<9} {}{}",
                 row.run_id,
                 row.kind,
                 row.status(),
-                row.limit
+                row.limit,
+                row.publish.as_ref().map_or(String::new(), |p| format!(
+                    " · {}",
+                    mandala_core::engines::cache_publish::describe(p)
+                ))
             ),
             style,
         )));
@@ -783,6 +807,10 @@ impl DeployViewState {
             } else if !b.current.is_empty() {
                 head.push_str(&format!("  —  {}", b.current));
             }
+            if let Some(publish) = &tailer.publish {
+                head.push_str("  ·  ");
+                head.push_str(&mandala_core::engines::cache_publish::describe(publish));
+            }
             self.build_line = head;
             self.hosts = tailer
                 .hosts
@@ -862,6 +890,13 @@ impl DeployViewState {
                 )
             }
             None => (String::new(), false),
+        };
+        let build_line = match tailer.and_then(|t| t.publish.as_ref()) {
+            Some(publish) => format!(
+                "{build_line} · {}",
+                mandala_core::engines::cache_publish::describe(publish)
+            ),
+            None => build_line,
         };
         let recap_at = self
             .playbook_lines

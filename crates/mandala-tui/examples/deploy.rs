@@ -24,6 +24,7 @@ async fn main() {
         dry_activate: false,
         boot: false,
         halt_on_build_failure: false,
+        cache_push: None,
         throttle: 4,
         program: None,
     };

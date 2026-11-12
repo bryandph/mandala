@@ -479,7 +479,7 @@ async fn leader_and_follower_paths_are_byte_identical() {
         &fcall(
             follower,
             "deploy",
-            &json!({"selector": "@k3s", "boot": true}),
+            &json!({"selector": "@k3s", "boot": true, "cache_push": true}),
         )
         .await
         .expect("dry deploy ok"),
@@ -494,6 +494,7 @@ async fn leader_and_follower_paths_are_byte_identical() {
     assert_eq!(dry_run.info.meta["limit"], "cache,web");
     assert_eq!(dry_run.info.meta["dry_activate"], true);
     assert_eq!(dry_run.info.meta["boot"], true);
+    assert_eq!(dry_run.info.meta["cache_push_test"], true);
     assert_eq!(dry_run.info.meta["throttle"], 4);
     assert_eq!(
         actual["events_dir"],
@@ -529,6 +530,7 @@ async fn leader_and_follower_paths_are_byte_identical() {
                 "dry_activate": false,
                 "boot": true,
                 "confirm": "cache,web",
+                "cache_push": false,
             }),
         )
         .await
@@ -540,6 +542,7 @@ async fn leader_and_follower_paths_are_byte_identical() {
     let activated_run = registry::open_run(activated["run_id"].as_str().unwrap()).unwrap();
     assert_eq!(activated_run.info.meta["dry_activate"], false);
     assert_eq!(activated_run.info.meta["boot"], true);
+    assert_eq!(activated_run.info.meta["cache_push_test"], false);
     spacer().await;
 
     install(

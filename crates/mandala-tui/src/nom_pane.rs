@@ -155,6 +155,8 @@ impl NomPane {
             }
         };
         let child = Command::new(cmd)
+            .env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(slave_clone))

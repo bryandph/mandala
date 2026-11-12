@@ -368,6 +368,8 @@ impl Worker {
             return Err("evaluator shut down".to_string());
         }
         let mut child = Command::new(&bin)
+            .env_remove("MANDALA_CACHE_NETRC_FILE")
+            .env_remove("MANDALA_CACHE_URL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -515,6 +517,8 @@ fn worker_binary() -> PathBuf {
 
 fn run_nix_eval(args: &[String]) -> Result<Json, EvalError> {
     let out = Command::new("nix")
+        .env_remove("MANDALA_CACHE_NETRC_FILE")
+        .env_remove("MANDALA_CACHE_URL")
         .args(args)
         .output()
         .map_err(|e| format!("spawn nix: {e}"))?;

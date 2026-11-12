@@ -10,4 +10,5 @@
 //! builder ([`deploy::batch_argv`]) are public, pure test seams.
 
 pub mod ansible;
+pub mod cache_publish;
 pub mod deploy;

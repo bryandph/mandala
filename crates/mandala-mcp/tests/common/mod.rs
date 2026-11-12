@@ -131,11 +131,13 @@ impl Effects for FakeEffects {
         limit: &str,
         dry_activate: bool,
         boot: bool,
+        cache_push: Option<bool>,
         throttle: i64,
     ) -> io::Result<DeployLaunch> {
         assert!(self.fake_deploy, "unexpected launch_deploy call");
         assert_eq!(flake, ".");
         assert_eq!(throttle, 4);
+        // Persist the test seam value so proxy tests prove typed intent is preserved.
         // This boundary stands in for the native ENGINE after preflight: it,
         // not the frontend, owns the one registry allocation and metadata.
         let (run_id, events_dir) = registry::new_run_dir()?;
@@ -146,6 +148,7 @@ impl Effects for FakeEffects {
                 ("limit".into(), Value::from(limit)),
                 ("dry_activate".into(), Value::from(dry_activate)),
                 ("boot".into(), Value::from(boot)),
+                ("cache_push_test".into(), serde_json::json!(cache_push)),
                 ("throttle".into(), Value::from(throttle)),
                 ("pid".into(), Value::Null),
                 ("rc".into(), Value::from(0)),

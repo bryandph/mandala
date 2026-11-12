@@ -1,6 +1,7 @@
 # Terminating a deploy
 
-A native deploy owns its Nix build, copy and SSH subprocess groups. The engine
+A native deploy owns its Nix build, optional shared cache publish, per-host copy
+and SSH subprocess groups. The engine
 installs SIGTERM/SIGINT forwarding before registering and starting the run. Every
 build/profile-resolution/recovery/log-read process, copy process, and SSH leg
 (capability/preflight, boot staging/recovery, canary cleanup, activate, wait,
@@ -41,6 +42,14 @@ SIGTERM/SIGINT to it, and remains alive to reap it. `DeployRun::terminate` signa
 the isolated engine/supervisor group, falling back to the engine PID when it was
 launched directly rather than by a frontend. Screen dismissal still detaches;
 only explicit termination sends a signal.
+
+The optional cache publish phase follows the same group lifecycle. Its raw
+stdout/stderr pipes drain concurrently into a sink without retaining output. Ordinary
+upload errors warn and allow existing host copies, but termination is never
+converted into fallback: the engine records an interrupted publish outcome when
+it can, fails the run, and launches no host copy afterward. The shared phase's
+safe outcome remains available to attached observers. See
+[cache publishing](deploy-cache-publish.md) for configuration and diagnostics.
 
 This is local process ownership, not remote rollback authority. Ending a local
 SSH connection cannot undo a remote activation already in progress; deploy-rs's

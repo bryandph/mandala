@@ -174,7 +174,8 @@ pub struct ReloadTool {}
         "protocol's sticky terminal states, so a confirmed host stays\n",
         "confirmed and a rolled-back host stays flagged. `phase`\n",
         "summarizes where a live deploy is: `batch-build` (play 1, no\n",
-        "per-host events yet) → `fan-out` → `done`. Command runs report\n",
+        "per-host events yet) → optional `cache-publish` → `fan-out` → `done`.\n",
+        "Cache publish is advisory; its safe outcome and warning are in meta.publish. Command runs report\n",
         "liveness (pid, then the reaped exit code in `meta.rc`) plus the\n",
         "tail of their teed `output.log`.\n",
         "\n",
@@ -271,6 +272,9 @@ pub struct DeployTool {
     /// Use boot activation for every selected member (default false).
     #[json_schema(default = false)]
     pub boot: Option<bool>,
+    /// Cache publish override: true enables (URL required), false disables;
+    /// omit for engine environment detection. Does not change confirmation gates.
+    pub cache_push: Option<bool>,
     /// For a real activation: must equal the resolved `--limit` target.
     pub confirm: Option<String>,
 }

@@ -47,6 +47,7 @@ fn main() -> ExitCode {
                 dry_activate,
                 boot,
                 halt_on_build_failure,
+                cache_push,
                 throttle,
             } => {
                 let cfg = DeployConfig {
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
                     dry_activate,
                     boot,
                     halt_on_build_failure,
+                    cache_push,
                     throttle,
                     program: None,
                 };

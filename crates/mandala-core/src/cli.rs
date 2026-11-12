@@ -103,6 +103,8 @@ pub enum TuiRequest {
         boot: bool,
         /// Halt before deployment if any profile build fails.
         halt_on_build_failure: bool,
+        /// Cache publication override; absence preserves environment detection.
+        cache_push: Option<bool>,
         /// `--throttle`: per-host deploy parallelism (default 4).
         throttle: i64,
     },
@@ -237,6 +239,7 @@ impl Cli {
                     )
                     .subcommand(
                         Command::new("deploy")
+                            .args(crate::engines::cache_publish::flags())
                             .about("Standalone deploy runner (exit code = the run's rc)")
                             .arg(
                                 Arg::new("limit")
@@ -369,6 +372,7 @@ fn tui_request(m: &ArgMatches) -> TuiRequest {
             dry_activate: d.get_flag("dry-activate"),
             boot: d.get_flag("boot"),
             halt_on_build_failure: d.get_flag("halt-on-build-failure"),
+            cache_push: crate::engines::cache_publish::choice(d),
             throttle: d.get_one::<i64>("throttle").copied().unwrap_or(4),
         },
         Some(("attach", a)) => TuiRequest::Attach {
@@ -811,6 +815,7 @@ mod tests {
                 dry_activate: true,
                 boot: false,
                 halt_on_build_failure: false,
+                cache_push: None,
                 throttle: 4, // the Python default
             }
         );
@@ -831,9 +836,37 @@ mod tests {
                 dry_activate: false,
                 boot: true,
                 halt_on_build_failure: true,
+                cache_push: None,
                 throttle: 8,
             }
         );
+    }
+
+    #[test]
+    fn tui_deploy_preserves_cache_publish_tristate() {
+        for (flag, expected) in [
+            ("--cache-push", Some(true)),
+            ("--no-cache-push", Some(false)),
+        ] {
+            let request = parse_tui(&["mandala", "tui", "deploy", "-l", "web", flag]);
+            let TuiRequest::Deploy { cache_push, .. } = request else {
+                panic!("deploy request expected");
+            };
+            assert_eq!(cache_push, expected);
+        }
+        for pair in [
+            ["--cache-push", "--no-cache-push"],
+            ["--no-cache-push", "--cache-push"],
+        ] {
+            assert!(
+                Cli::new()
+                    .root_command()
+                    .try_get_matches_from([
+                        "mandala", "tui", "deploy", "-l", "web", pair[0], pair[1]
+                    ])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -910,6 +943,7 @@ mod tests {
                         dry_activate: false,
                         boot: false,
                         halt_on_build_failure: false,
+                        cache_push: None,
                         throttle: 4,
                     }
                 ),

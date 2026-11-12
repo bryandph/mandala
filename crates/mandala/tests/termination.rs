@@ -102,6 +102,11 @@ case "$1" in
   ln -s /nix/store/11111111111111111111111111111111-web-profile "$link-1"
   ;;
  copy)
+  case "$TEST_PHASE" in
+   publish) block publish ;;
+   stubborn-publish) trap '' TERM INT; echo $$ > "$MANDALA_FLEET_STATE/publish.pid"; exec sleep 60 ;;
+  esac
+  touch "$MANDALA_FLEET_STATE/host-copy-started"
   case "$TEST_PHASE:$*" in fanout:*cache.invalid*) block copy ;; esac
   ;;
  *) exit 90 ;;
@@ -178,7 +183,13 @@ esac
         )
         .unwrap();
         let log = fs::File::create(root.join("engine.log")).unwrap();
+        if phase.contains("publish") {
+            command.env("MANDALA_CACHE_URL", "file:///fictional-cache");
+        } else {
+            command.env_remove("MANDALA_CACHE_URL");
+        }
         let child = command
+            .env_remove("MANDALA_CACHE_NETRC_FILE")
             .env("PATH", path)
             .env("TEST_PHASE", phase)
             .env("MANDALA_FLEET_STATE", &root)
@@ -257,6 +268,29 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+#[test]
+fn terminate_during_publish_forwards_both_signals_without_fallback() {
+    for signal_name in ["TERM", "INT"] {
+        let mut fixture = Fixture::start("publish", true);
+        let pids = [fixture.pid("publish"), fixture.pid("publish-leaf")];
+        signal(fixture.child.id(), signal_name);
+        fixture.assert_settled(&pids);
+        assert!(!fixture.root.join("host-copy-started").exists());
+        let meta = registry::read_meta(&fixture.run_dir());
+        assert_eq!(meta["publish"]["outcome"], "interrupted");
+        assert_ne!(meta["rc"], 0);
+    }
+}
+
+#[test]
+fn publish_escalates_ignoring_child_without_starting_host_copy() {
+    let mut fixture = Fixture::start("stubborn-publish", false);
+    let pids = [fixture.pid("publish")];
+    signal(fixture.child.id(), "INT");
+    fixture.assert_settled(&pids);
+    assert!(!fixture.root.join("host-copy-started").exists());
 }
 
 #[test]
