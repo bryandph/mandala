@@ -672,7 +672,7 @@ async fn standalone_operator_cancel_exits_zero() {
     assert_eq!(app.exit_code, Some(0));
 }
 
-// ---- runs list: the foreground verb (bryan/nixspace#123) --------------------
+// ---- runs list: the foreground verb --------------------
 
 /// A settled run stays re-attachable any number of times: open the runs
 /// list (`a`), attach (`enter`), detach (`esc`), and do it again — the

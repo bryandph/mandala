@@ -39,5 +39,5 @@ find ./ansible -depth -type d -name __pycache__ -empty -delete
 Do not use a home-directory-wide cleanup or remove
 `~/.local/state/mandala`. No real state cleanup is part of this change.
 
-ForestWidget's unused optional ratatui feature is deferred to LAB-28,
-where wiring or removal can be decided alongside native build output.
+ForestWidget's unused optional ratatui feature is deferred;
+wiring or removal can be decided alongside native build output.

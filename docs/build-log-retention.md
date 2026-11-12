@@ -38,7 +38,7 @@ run. Dead allocations without metadata are eligible for pruning. Symlink entries
 are not traversed. PID reuse can conservatively retain an old run.
 
 This policy covers `runs/`, not `deploy-launches/`; the latter is separate launch
-state tracked by LAB-95. Pruning tests use temporary fixture directories only.
+state with its own lifecycle. Pruning tests use temporary fixture directories only.
 
 ## Consumers and verification
 

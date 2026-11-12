@@ -41,7 +41,7 @@ pub enum ConnectError {
     /// because a wedged-but-live leader looks exactly like this — acquisition
     /// must treat it as "busy, retry", never as a dead/foreign endpoint it
     /// may step past (stepping past a busy leader is how a checkout grew a
-    /// second leader — bryan/nixspace#123).
+    /// second leader).
     Timeout,
 }
 

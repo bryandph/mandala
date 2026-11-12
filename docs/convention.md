@@ -142,8 +142,8 @@ strings (never keys or Nix paths):
 
 ```nix
 mandala.deployment.controllerSettings = {
-  darwin.identityFile = "/Users/bryan/.ssh/id_rsa";
-  linux.identityFile = "/home/bryan/.ssh/id_rsa";
+  darwin.identityFile = "/Users/example/.ssh/id_rsa";
+  linux.identityFile = "/home/example/.ssh/id_rsa";
 };
 ```
 

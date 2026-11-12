@@ -47,15 +47,15 @@
       ];
     }).config;
   defaults = {
-    settings.identityFile = "/Users/bryan/.ssh/id_rsa";
+    settings.identityFile = "/Users/example/.ssh/id_rsa";
     groupSettings.edge.identityFile = "/keys/group";
   };
   baseline = eval defaults;
   configured = eval (defaults
     // {
       controllerSettings = {
-        darwin.identityFile = "/Users/bryan/.ssh/id_rsa";
-        linux.identityFile = "/home/bryan/.ssh/id_rsa";
+        darwin.identityFile = "/Users/example/.ssh/id_rsa";
+        linux.identityFile = "/home/example/.ssh/id_rsa";
       };
     });
   projections = configured.flake.mandala.projections;
@@ -74,7 +74,7 @@
       then "/keys/group"
       else if name == "member"
       then "/keys/member"
-      else "/Users/bryan/.ssh/id_rsa";
+      else "/Users/example/.ssh/id_rsa";
   };
   # Independent pre-map byte shape, not a second run of the new selector.
   expectedInventory = {
@@ -117,7 +117,7 @@ in
   assert builtins.toJSON configured.flake.ansibleInventory == builtins.toJSON baseline.flake.ansibleInventory;
   assert builtins.toJSON darwin.deploy.settings == builtins.toJSON baseline.flake.mandala.projections.deploy.settings;
   assert builtins.toJSON darwin.ansibleInventory == builtins.toJSON baseline.flake.ansibleInventory;
-  assert linux.deploy.settings.plain.identityFile == "/home/bryan/.ssh/id_rsa";
+  assert linux.deploy.settings.plain.identityFile == "/home/example/.ssh/id_rsa";
   assert linux.deploy.settings.grouped.identityFile == "/keys/group";
   assert linux.deploy.settings.member.identityFile == "/keys/member";
   assert linux.ansibleInventory.all.hosts.plain.ansible_ssh_private_key_file == linux.deploy.settings.plain.identityFile;
@@ -126,7 +126,7 @@ in
   assert linux.ansibleInventory.all.hosts.plain.ansible_ssh_common_args == "-o IdentitiesOnly=yes -o IdentityAgent=none";
   assert configured.flake.ansibleInventoryByControllerPlatform.linux == linux.ansibleInventory;
   assert builtins.toJSON darwinNode == builtins.toJSON oldNode;
-  assert linuxNode.sshOpts == ["-p" "22" "-i" "/home/bryan/.ssh/id_rsa" "-o" "IdentitiesOnly=yes" "-o" "IdentityAgent=none"];
+  assert linuxNode.sshOpts == ["-p" "22" "-i" "/home/example/.ssh/id_rsa" "-o" "IdentitiesOnly=yes" "-o" "IdentityAgent=none"];
   assert configured.flake.deployByControllerPlatform.linux.nodes.plain == linuxNode;
   assert configured.flake.deployByControllerPlatform.darwin.nodes.plain == oldNode;
   assert !(linuxNode ? identityFile) && !(linuxNode ? controllerSettings);

@@ -32,8 +32,8 @@
 @nix {"action":"result","fields":[6528,0,0,0],"id":23849953394690,"type":105}
 @nix {"action":"stop","id":23849953394689}
 @nix {"action":"stop","id":23849953394690}
-@nix {"action":"start","fields":["/nix/store/pwdq8hynakr9amh9b0b4biyigbb71cci-mandala-nom-fixture","https://nix-cache.servers.bph"],"id":23849953394691,"level":4,"parent":0,"text":"querying info about '/nix/store/pwdq8hynakr9amh9b0b4biyigbb71cci-mandala-nom-fixture' on 'https://nix-cache.servers.bph'","type":109}
-@nix {"action":"start","fields":["https://nix-cache.servers.bph/pwdq8hynakr9amh9b0b4biyigbb71cci.narinfo"],"id":23849953394692,"level":4,"parent":23849953394691,"text":"downloading 'https://nix-cache.servers.bph/pwdq8hynakr9amh9b0b4biyigbb71cci.narinfo'","type":101}
+@nix {"action":"start","fields":["/nix/store/pwdq8hynakr9amh9b0b4biyigbb71cci-mandala-nom-fixture","https://nix-cache.acme.example"],"id":23849953394691,"level":4,"parent":0,"text":"querying info about '/nix/store/pwdq8hynakr9amh9b0b4biyigbb71cci-mandala-nom-fixture' on 'https://nix-cache.acme.example'","type":109}
+@nix {"action":"start","fields":["https://nix-cache.acme.example/pwdq8hynakr9amh9b0b4biyigbb71cci.narinfo"],"id":23849953394692,"level":4,"parent":23849953394691,"text":"downloading 'https://nix-cache.acme.example/pwdq8hynakr9amh9b0b4biyigbb71cci.narinfo'","type":101}
 @nix {"action":"result","fields":[0,0,0,0],"id":23849953394692,"type":105}
 @nix {"action":"result","fields":[0,0,0,0],"id":23849953394692,"type":105}
 @nix {"action":"result","fields":[0,0,0,0],"id":23849953394692,"type":105}

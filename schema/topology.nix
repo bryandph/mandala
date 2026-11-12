@@ -81,7 +81,7 @@
         type = types.nullOr types.str;
         default = null;
         description = "IPv4 CIDR; null for id-only networks.";
-        example = "172.16.15.0/24";
+        example = "192.0.2.0/24";
       };
       prefixLength = mkOption {
         type = types.nullOr types.int;

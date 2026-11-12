@@ -1,5 +1,5 @@
 # Operator identity schema. Authored once in the operator-data flake
-# (e.g. mandala-bph); the short GPG key-id forms are DERIVED from the
+# supplied by a downstream operator; the short GPG key-id forms are DERIVED from the
 # full fingerprint so only one representation is ever hand-authored.
 {
   config,

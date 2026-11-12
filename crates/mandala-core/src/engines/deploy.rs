@@ -2227,10 +2227,10 @@ exit 0
     fn minimal_parent_deploy_settings() -> Value {
         json!({
             "activation": "switch",
-            "hostname": "172.16.42.7",
+            "hostname": "192.0.2.7",
             "sshUser": "root",
             "sshPort": 22,
-            "identityFile": "/Users/bryan/.ssh/id_rsa",
+            "identityFile": "/Users/example/.ssh/id_rsa",
             "autoRollback": true,
             "fastConnection": true
         })
@@ -3009,8 +3009,8 @@ exit 0
             lines
         };
         for (os, identity) in [
-            ("macos", "/Users/bryan/.ssh/id_rsa"),
-            ("linux", "/home/bryan/.ssh/id_rsa"),
+            ("macos", "/Users/example/.ssh/id_rsa"),
+            ("linux", "/home/example/.ssh/id_rsa"),
         ] {
             let platform = if os == "macos" { "darwin" } else { "linux" };
             let mut settings = baseline.clone();
@@ -3026,10 +3026,10 @@ exit 0
             let trace = std::fs::read_to_string(&trace_path).unwrap();
             // Compare complete SSH argv and nix-copy environment/argv bytes,
             // allowing only independent subprocess arrival order to vary.
-            let expected = baseline_trace.replace("/Users/bryan/.ssh/id_rsa", identity);
+            let expected = baseline_trace.replace("/Users/example/.ssh/id_rsa", identity);
             assert_eq!(sorted_lines(&trace), sorted_lines(&expected));
             assert!(trace.contains(&format!("NIX_SSHOPTS=-p 22 -i {identity} -o IdentitiesOnly=yes -o IdentityAgent=none args=copy")));
-            assert!(trace.contains(&format!("args=root@172.16.42.7 -p 22 -i {identity} -o IdentitiesOnly=yes -o IdentityAgent=none")));
+            assert!(trace.contains(&format!("args=root@192.0.2.7 -p 22 -i {identity} -o IdentitiesOnly=yes -o IdentityAgent=none")));
             if os == "linux" {
                 assert!(!trace.contains("/Users/"));
             }
@@ -3054,10 +3054,10 @@ exit 0
 
         let trace = std::fs::read_to_string(trace).unwrap();
         assert!(trace.contains(
-            "NIX_SSHOPTS=-p 22 -i /Users/bryan/.ssh/id_rsa -o IdentitiesOnly=yes -o IdentityAgent=none args=copy"
+            "NIX_SSHOPTS=-p 22 -i /Users/example/.ssh/id_rsa -o IdentitiesOnly=yes -o IdentityAgent=none args=copy"
         ));
         assert!(trace.contains(
-            "args=root@172.16.42.7 -p 22 -i /Users/bryan/.ssh/id_rsa -o IdentitiesOnly=yes -o IdentityAgent=none"
+            "args=root@192.0.2.7 -p 22 -i /Users/example/.ssh/id_rsa -o IdentitiesOnly=yes -o IdentityAgent=none"
         ));
     }
 

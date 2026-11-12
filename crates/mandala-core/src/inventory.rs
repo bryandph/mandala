@@ -434,7 +434,7 @@ impl Inventory {
             if exclude.is_empty() {
                 return Err(InventoryError::EmptySelector);
             }
-            // Bare exclusion (`!vishnu`) implies `all` as the base set.
+            // Bare exclusion (`!example-node`) implies `all` as the base set.
             include = self.aggregate.members.keys().cloned().collect();
         }
 
@@ -567,8 +567,8 @@ mod tests {
             );
         }
         for (platform, identity) in [
-            ("darwin", "/Users/bryan/.ssh/id_rsa"),
-            ("linux", "/home/bryan/.ssh/id_rsa"),
+            ("darwin", "/Users/example/.ssh/id_rsa"),
+            ("linux", "/home/example/.ssh/id_rsa"),
         ] {
             value["projections"]["byControllerPlatform"][platform] = json!({
                 "deploy": {"settings": {"node": {"identityFile": identity}}},

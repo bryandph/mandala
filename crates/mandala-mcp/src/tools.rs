@@ -55,7 +55,7 @@ pub struct GroupsTool {
         "`--limit` set a deploy would fan out to. The algebra: `@group`,\n",
         "a member name, or the fleet-wide keyword `all` (also spelled\n",
         "`@all`); combine with `,` or `:` separators; a `!`-prefixed part\n",
-        "excludes (`@all,!vishnu`), and a bare exclusion implies `all` as\n",
+        "excludes (`@all,!example-node`), and a bare exclusion implies `all` as\n",
         "the base set. Returns the sorted `members` plus the comma-joined\n",
         "`limit` string, which is exactly the `confirm` value the gated\n",
         "actions (deploy, reboot, restart_service) require."
@@ -436,8 +436,8 @@ mod tests {
     fn restart_service_reads_as_the_smaller_hammer() {
         // Harness permission classifiers weigh the description's framing:
         // the old "via ad-hoc ansible … Mutating" lead got the bounded
-        // middle verb blocked while a full drain+reboot sailed through
-        // (bryan/nixspace#128). Lead with what it does and its bounds.
+        // middle verb blocked while a full drain+reboot sailed through.
+        // Lead with what it does and its bounds.
         let desc = RestartServiceTool::tool().description.unwrap_or_default();
         let first = desc.lines().next().unwrap_or_default().to_string();
         assert!(first.contains("Restart one systemd unit"), "{first}");

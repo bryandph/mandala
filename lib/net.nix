@@ -4,7 +4,7 @@
 #
 # Conventions (mirrored in the member schema's `id` description):
 # - `id` is the integer host offset from the VLAN subnet's network
-#   address: id 102 on 172.16.15.0/24 → 172.16.15.102; id 261 on
+#   address: id 102 on 192.0.2.0/24 → 192.0.2.102; id 261 on
 #   10.5.0.0/16 → 10.5.1.5.
 # - The ULA host part is the id spelled as ONE decimal-literal hex group
 #   on the VLAN's ULA /64: id 102 → ::102, id 261 → ::261. The id maps
