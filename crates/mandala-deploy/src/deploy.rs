@@ -934,8 +934,8 @@ case "$command" in
   *'activate-rs activate '*)
     test ! -e "$TEST_ROOT/deploy-rs-canary-00000000000000000000000000000000" || exit 91
     test ! -e "$TEST_ROOT/deploy-rs-cancel-00000000000000000000000000000000" || exit 92
-    touch "$TEST_ROOT/clean-start"
     touch "$TEST_ROOT/deploy-rs-cancel-00000000000000000000000000000000"
+    touch "$TEST_ROOT/clean-start"
     while [ ! -f "$TEST_ROOT/waited" ]; do sleep 0.02; done
     sleep 0.1
     echo rollback-finished-stdout
