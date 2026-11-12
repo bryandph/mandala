@@ -2,12 +2,32 @@
   engine = import ../lib {inherit lib;};
   model = import ./fixtures/builder-adapter-model.nix {inherit lib;};
   rendered = lib.mapAttrs (_: engine.renderBuilders) model;
+  f = import ./fixtures/builders.nix {inherit lib;};
+  defaultCA =
+    engine.renderBuilders
+    (engine.builders.project {
+      inherit (f) members;
+      controllers.acme = {
+        selfMember = "linux";
+        allowedBuilders = ["workstation"];
+        routes.workstation =
+          f.route
+          // {
+            hostname = "build-short";
+            trust = {
+              kind = "ca";
+              publicKey = f.pin.publicKey;
+            };
+          };
+      };
+    }).acme;
   fails = value: !(builtins.tryEval (builtins.deepSeq value true)).success;
   name = lib.head (lib.attrNames model.wsl.ssh);
   alter = changes: model.wsl // {ssh = model.wsl.ssh // {${name} = model.wsl.ssh.${name} // changes;};};
   badMachine = field: value: model.wsl // {buildMachines = [(lib.head model.wsl.buildMachines // {${field} = value;})];};
 in
   assert lib.all (id: builtins.toJSON rendered.${id} == lib.removeSuffix "\n" (builtins.readFile (./fixtures/builder-adapter-golden + "/${id}.json"))) (lib.attrNames model);
+  assert builtins.toJSON defaultCA == lib.removeSuffix "\n" (builtins.readFile ./fixtures/builder-adapter-golden/ca-default.json);
   assert rendered.empty
   == {
     sshConfig = "";

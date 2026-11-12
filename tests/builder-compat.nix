@@ -29,12 +29,12 @@
   };
   collision =
     (lib.evalModules {
-      specialArgs.inputs.self.nixosConfigurations.vm.config.host = f.members.vm;
+      specialArgs.inputs.self.nixosConfigurations.builder.config.host = f.members.builder;
       modules = [
         ../flake-modules/fleet.nix
         {
           options.flake = lib.mkOption {type = lib.types.lazyAttrsOf lib.types.raw;};
-          config.mandala.extraMembers.vm = f.members.vm;
+          config.mandala.extraMembers.builder = f.members.builder;
         }
       ];
     }).config.flake.mandala;
@@ -44,7 +44,7 @@ in
   assert absent.flake.buildMachinesByController == {};
   assert !(absent.flake.mandala.projections ? builders);
   assert !(facetOnly.flake.mandala.projections ? builders);
-  assert facetOnly.flake.mandala.members.vm.builder != null;
+  assert facetOnly.flake.mandala.members.builder.builder != null;
   assert !(facetOnly.flake.mandala.members.wsl ? builder);
   assert empty.flake.buildMachinesByController.empty == [];
   assert empty.flake.mandala.projections.builders.byController.empty

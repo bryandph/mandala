@@ -2,7 +2,8 @@
 
 Build capacity is an optional member fact, not a closure-build instruction or a
 deploy identity. The projection layer is pure inspection. Optional system adapters below install
-its intended daemon configuration; neither layer starts VMs or proves connectivity.
+its intended daemon configuration; neither layer manages builder lifecycle or proves connectivity.
+VM members are out of scope pending a separate host-type design.
 
 ## Member capacity
 
@@ -69,7 +70,7 @@ Profiles are selected explicitly, never by OS, hostname, HOME, or reachability.
 `selfMember` must exist even if it offers no capacity. `allowedBuilders` is
 required and duplicate-free; an explicit empty list selects nothing. Every
 reference is checked, even when self-exclusion removes its output. A separately
-enrolled VM is not its controller's identity. Profile and lane labels use
+enrolled builder is not its controller's identity. Profile and lane labels use
 letters, digits, underscores and hyphens, starting with a letter or digit.
 
 Each selected builder needs an explicit route and an absolute **string**
@@ -89,8 +90,15 @@ Only selected targets and their transitive jumps are emitted.
 Trust is either `{ kind = "pin"; publicKey = "ssh-ed25519 ..."; }` or
 `{ kind = "ca"; publicKey = "ssh-ed25519 ..."; principal = "builder.acme.example"; }`.
 Keys are canonical public-key text (algorithm and base64 blob, without comments).
-A pin cannot declare a principal; a CA requires one. No keyscan, interactive
+A pin cannot declare a principal. A CA's optional `principal` defaults to the
+resolved dialled hostname: route hostname, then member builder hostname, then
+member FQDN. Explicit principals win. This is the endpoint name alone, not the
+port, jump hostname or generated SSH alias. The certificate must cover that name;
+missing or invalid endpoint data fails evaluation, never weakening trust.
+No keyscan, interactive
 acceptance, agent identity, or strict-checking bypass exists in this model.
+See the [CA endpoint-default change](../openspec/changes/builder-ca-endpoint-default/proposal.md)
+for the additive update to the original explicit-principal contract.
 
 ## Output contract
 
@@ -116,9 +124,9 @@ controller/member/lane identity (separate target and jump namespaces). Records
 retain member/lane identity, typed endpoint, user, port, identity path,
 remoteProgram, trust, jumpMember/jumpAlias and hostKeyAlias, plus
 `strictHostKeyChecking = true`, `identitiesOnly = true`, `identityAgent = "none"`.
-Pins use a member-specific host-key alias independent of localhost or lane.
-For CA routes, hostKeyAlias is the explicit principal so OpenSSH verifies the
-certificate against the authored name rather than the generated dial alias.
+Pins use a member-specific host-key alias independent of endpoint spelling or lane.
+For CA routes, hostKeyAlias is the resolved principal so OpenSSH verifies the
+certificate against the explicit or defaulted name rather than the generated dial alias.
 
 `knownHosts` is keyed by the same SSH alias and carries member, hostname, port,
 hostKeyAlias, kind, publicKey, principal, matchName, hostNames and certAuthority.
@@ -206,7 +214,8 @@ nor proof of installed daemon state. The adapter installs the ordinary
 `builder-schema`, `builder-controllers`, `builder-projection`, and
 `builder-compat` are flake checks alongside `fake-fleet`. Synthetic fixtures cover
 acme/globex-style roles, two Linux controllers (including WSL), a macOS
-controller, a localhost-port Linux VM, and a workstation. Golden JSON in
+controller acting as a bastion, a non-VM Linux builder reached on a nondefault
+port (through the bastion or directly), and a workstation. Golden JSON in
 `tests/fixtures/builder-baseline/` was captured before schema defaults were added,
 using `tests/fixtures/builder-legacy.nix`. Additional `managed-*` goldens include
 active inventory and direct deploy-rs nodes (only the toolchain is mocked),

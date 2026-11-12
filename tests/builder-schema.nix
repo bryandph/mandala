@@ -32,6 +32,22 @@ in
   assert !good.deployment.deployRs.enable && !good.deployment.ansible.enable;
   assert good.build == null;
   assert (member capacity).builder == (direct capacity).builder;
+  assert (member (capacity
+    // {
+      trust = {
+        kind = "ca";
+        publicKey = f.pin.publicKey;
+      };
+    })).builder.trust.principal
+  == null;
+  assert (direct (capacity
+    // {
+      trust = {
+        kind = "ca";
+        publicKey = f.pin.publicKey;
+      };
+    })).builder.trust.principal
+  == null;
   assert good.builder.systems == ["aarch64-linux" "x86_64-linux"];
   assert good.builder.supportedFeatures == ["big-parallel" "kvm"];
   assert builtins.attrNames (engine.builders.effectiveLanes good.builder) == ["default"];
@@ -57,8 +73,9 @@ in
     {hostname = "host?query";}
     {
       trust = {
-        kind = "ca";
+        kind = "pin";
         publicKey = f.pin.publicKey;
+        principal = "not-for-pins";
       };
     }
     {

@@ -81,8 +81,8 @@ Profile and lane names must be nonempty safe labels suitable for stable aliases,
 with no whitespace, control characters, directive delimiters, or alias collisions.
 No OS/hostname/HOME/environment inference selects a profile. Consumers explicitly
 name it; an unknown requested profile is an error. A profile returns no lane of
-`selfMember`, even if explicitly allowlisted, but retains a separate VM member
-hosted there. Validate authored references even if self-exclusion removes output.
+`selfMember`, even if explicitly allowlisted, but retains a separate external
+builder member reached through it. Validate authored references even if self-exclusion removes output.
 
 Alternative: extend `deployment.controllerSettings` with machine names or select
 by runtime hostname. Rejected: OS identity and per-machine policy are distinct,
@@ -112,7 +112,7 @@ final endpoint has trust; ordinary login identity is not host trust.
 
 Project stable, collision-free SSH aliases and host-key aliases from controller,
 member, and lane identities, with deterministic escaping/length handling. Keep
-a localhost VM's host identity separate from its controller/jump host and retain
+a nondefault-port builder's host identity separate from its controller/jump host and retain
 nondefault port information. Produce a single canonical structured SSH model
 requiring strict checking, IdentitiesOnly, and IdentityAgent none; later adapters
 install it system-wide for the daemon, not just in a user's SSH file.
@@ -170,7 +170,7 @@ there is no claim that the aggregate describes the currently activated daemon.
 
 Use fictional acme/globex fleets and operator-alice only. Include a Linux
 controller under WSL, a macOS controller, two controllers sharing an OS, a
-localhost-port Linux builder VM, and an x86_64 workstation builder. Keep fixtures
+nondefault-port non-VM Linux builder, and an x86_64 workstation builder. Keep fixtures
 pure; public test keys are synthetic, never live credentials.
 
 Planned targeted checks are `builder-schema`, `builder-controllers`,
@@ -191,7 +191,7 @@ checks. Run `nix fmt -- --check .` and `nix flake check` as final gates.
 2. **Consumer migration:** separately authorized repository work captures existing
    machine lists and daemon-effective SSH/trust first; enrolls only missing
    members; proves parity before changing systems, lanes or allowlists; resolves
-   module-contributed duplicate builders explicitly. Preserve VM lifecycle.
+   module-contributed duplicate builders explicitly. Preserve builder lifecycle.
    Bounded synthetic daemon-context builds require separate operator approval.
 3. **Raw run override:** later add optional Nix-compatible `--builders <spec>`.
    Omission preserves defaults, presence replaces, empty disables remote building

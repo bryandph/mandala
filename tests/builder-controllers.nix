@@ -8,21 +8,21 @@
       controllers.acme = p;
     }).flake.mandala;
   invalid = patch: fails (eval (lib.recursiveUpdate profile patch));
-  routeBad = patch: invalid {routes.vm = patch;};
+  routeBad = patch: invalid {routes.builder = patch;};
 in
   assert builtins.deepSeq f.configured.flake.mandala true;
   assert lib.all invalid [
     {selfMember = "missing";}
     {allowedBuilders = ["missing"];}
     {allowedBuilders = ["wsl"];}
-    {allowedBuilders = ["vm" "vm"];}
+    {allowedBuilders = ["builder" "builder"];}
     {lanes.mac = ["wide"];}
-    {lanes.vm = ["unknown"];}
-    {lanes.vm = ["wide" "wide"];}
+    {lanes.builder = ["unknown"];}
+    {lanes.builder = ["wide" "wide"];}
     {routes.unknown = f.route;}
-    {routes.vm.jumpMember = "unknown";}
-    {routes.vm.jumpMember = "vm";}
-    {routes.mac.jumpMember = "vm";}
+    {routes.builder.jumpMember = "unknown";}
+    {routes.builder.jumpMember = "builder";}
+    {routes.mac.jumpMember = "builder";}
     {routes.workstation.jumpMember = "missing";}
     {routes.mac.identityFile = null;}
   ];
@@ -44,12 +44,6 @@ in
     {trust = {};}
     {
       trust = {
-        kind = "ca";
-        publicKey = f.pin.publicKey;
-      };
-    }
-    {
-      trust = {
         kind = "pin";
         publicKey = "ssh-ed25519 AA\nbad";
       };
@@ -58,7 +52,7 @@ in
   ];
   assert fails (eval (removeAttrs profile ["selfMember"]));
   assert fails (eval (removeAttrs profile ["allowedBuilders"]));
-  assert fails (eval (profile // {routes = removeAttrs profile.routes ["vm"];}));
+  assert fails (eval (profile // {routes = removeAttrs profile.routes ["builder"];}));
   assert fails ((f.eval {
     inherit (f) members;
     controllers."unsafe name" = profile;
@@ -68,8 +62,8 @@ in
     members =
       f.members
       // {
-        vm = f.engine.evalMember {
-          name = "vm";
+        builder = f.engine.evalMember {
+          name = "builder";
           builder = {systems = ["x86_64-linux"];};
         };
       };
@@ -88,7 +82,7 @@ in
       };
     controllers.acme = profile;
   }).flake.mandala);
-  assert (eval (profile // {lanes.vm = [];})).projections.builders.byController.acme.buildMachines != [];
+  assert (eval (profile // {lanes.builder = [];})).projections.builders.byController.acme.buildMachines != [];
   assert (eval (profile
     // {
       allowedBuilders = [];

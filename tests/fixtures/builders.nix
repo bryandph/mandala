@@ -27,8 +27,8 @@
       platform = "darwin";
       builder = capacity;
     };
-    vm = {
-      category = "vm";
+    builder = {
+      category = "server";
       build = null;
       builder = capacity;
     };
@@ -41,13 +41,13 @@
   controllers = {
     wsl = {
       selfMember = "wsl";
-      allowedBuilders = ["workstation" "vm"];
+      allowedBuilders = ["workstation" "builder"];
       routes = {
         workstation = route;
-        vm =
+        builder =
           route
           // {
-            hostname = "localhost";
+            hostname = "build-node";
             port = 2222;
             jumpMember = "mac";
             remoteProgram = "/opt/nix%bin/nix-daemon";
@@ -70,14 +70,14 @@
     };
     mac = {
       selfMember = "mac";
-      allowedBuilders = ["mac" "vm"];
-      lanes.vm = ["serial"];
+      allowedBuilders = ["mac" "builder"];
+      lanes.builder = ["serial"];
       routes = {
         mac = route;
-        vm =
+        builder =
           route
           // {
-            hostname = "localhost";
+            hostname = "build-node";
             port = 2222;
           };
       };

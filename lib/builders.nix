@@ -68,7 +68,8 @@
       then t.principal != null
       else t.principal == null
     );
-  validateTrust = context: t: require "${context}: pin requires only publicKey; CA requires publicKey and principal" (t == null || validTrust t) t;
+  # A CA principal is optional until the effective connection is resolved.
+  validateTrust = context: t: require "${context}: pin requires only publicKey" (t == null || t.kind == "ca" || t.principal == null) t;
   normalizeFacet = f: let
     base = normalizeSchedule "host.builder" (schedule f);
     lanes =
@@ -220,7 +221,7 @@ in rec {
           then {}
           else lib.getAttrs (lib.attrNames connectionOptions) host.builder;
         authored = lib.filterAttrs (_: v: v != null) routes.${member};
-        r =
+        connection =
           {
             hostname = host.fqdn or null;
             sshUser = null;
@@ -232,6 +233,16 @@ in rec {
             jumpMember = null;
           }
           // lib.filterAttrs (_: v: v != null) defaults // authored;
+        # Resolve against the dialled endpoint, never the member name, jump
+        # hostname, generated SSH alias or host:port spelling.
+        r =
+          connection
+          // {
+            trust =
+              if connection.trust != null && connection.trust.kind == "ca" && connection.trust.principal == null
+              then connection.trust // {principal = connection.hostname;}
+              else connection.trust;
+          };
       in
         require "${context} route ${member}: endpoint, login, key and strict trust required"
         (r.hostname != null && endpoint.check r.hostname && r.sshUser != null && r.identityFile != null && validTrust r.trust)

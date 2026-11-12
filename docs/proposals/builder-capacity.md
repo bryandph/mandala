@@ -15,9 +15,9 @@ independent concern. Capacity belongs to a member; access and selection policy
 belong to the controller that will use it.
 
 Consider fictional acme and globex fleets. Operator-alice may use a Linux
-controller under WSL, a macOS controller, a Linux builder VM hosted on the macOS
-controller and reached on a localhost port, and an x86_64 workstation builder.
-The same VM can require a jump from one controller and a direct connection from
+controller under WSL, a macOS controller acting as a bastion, a non-VM Linux
+builder reached on a nondefault port, and an x86_64 workstation builder.
+The same builder can require a jump from one controller and a direct connection from
 another. Two Linux controllers can also have different permissions and keys.
 An OS selector or opaque alias list cannot capture those distinctions reliably.
 
@@ -55,7 +55,7 @@ Global budgets or exclusive memory need builder-side controls or separate work.
 
 Enroll a builder without a managed closure through existing
 `extraMembers` / `evalMember`, with management surfaces disabled and host.build
-null when appropriate. Give a hosted VM its own identity. Do not fabricate network
+null when appropriate. Give an external builder its own identity. Do not fabricate network
 attachments, shadow existing members, or create a separate external registry.
 
 Membership can change all-member selectors, inventory, DNS and documentation
@@ -77,9 +77,11 @@ not read keys; the consuming daemon must later be able to read them
 noninteractively. Builder routes do not inherit deploy identity implicitly.
 
 Require public host-key pins or an explicit public CA and a name/principal it
-actually covers. Both jump and final endpoints need trust. No interactive
-acceptance, runtime keyscan, or strict-checking bypass is permitted. Localhost
-VMs need stable distinct HostKeyAlias/known-host identities and correct
+actually covers. An omitted CA principal defaults to the resolved dialled endpoint
+hostname (route, then builder default, then member FQDN); an explicit principal
+wins. Missing endpoint data fails closed. Both jump and final endpoints need trust. No interactive
+acceptance, runtime keyscan, or strict-checking bypass is permitted. Builders
+need stable distinct HostKeyAlias/known-host identities and correct
 nondefault-port matching. A knownHosts pin and nix.buildMachines.publicHostKey
 have different representations: the latter encodes the full SSH public-key text,
 not merely its base64 key blob.
@@ -91,9 +93,9 @@ sshOpts strings were rejected because they hide routing and weaken validation.
 Treat endpoints and remote-program paths as typed data: reject directive/field
 injection and encode URI query data once.
 
-The VM route can dial a localhost port through a macOS jump from the Linux
-controller and dial directly from macOS. This projects access; it does not create
-or start the VM. Keep VM lifecycle owned by its existing configuration.
+The non-VM builder route can dial a nondefault port through a macOS bastion
+from the Linux controller and dial directly from macOS. This projects access;
+it does not create or start the builder.
 
 ## Decision 4: Explicit named controller profiles
 
@@ -101,7 +103,7 @@ Use `mandala.build.controllers.<id>`, with explicit selfMember, builder member
 allowlists, optional selected lanes and route data. Select profiles explicitly;
 never infer from OS, runtime hostname, reachability or evaluator platform.
 Exclude all lanes of selfMember by inventory identity, not by endpoint or OS.
-Do not exclude a separately enrolled VM hosted there.
+Do not exclude a separately enrolled external builder reached through it.
 
 Reject unknown member/lane/controller references and incomplete route/key/trust
 data. Do not union every profile or fall back to another profile's keys.
@@ -191,7 +193,7 @@ than per-target builds.
    machine lists and root-effective SSH/trust, inspect existing membership,
    enroll only missing facts-only builders, prove baseline parity, then approve
    any capability/lane reconciliation or allowlist expansion explicitly.
-   Preserve VM lifecycle and resolve duplicate module entries deliberately.
+   Preserve builder lifecycle and resolve duplicate module entries deliberately.
    Bounded synthetic daemon-context route/build tests need separate approval.
 4. **Run override:** omission/empty/raw/@file request and argv tests, supervisor
    forwarding, unchanged single-build reuse and recovery isolation, normal

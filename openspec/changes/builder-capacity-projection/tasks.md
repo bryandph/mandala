@@ -6,12 +6,12 @@
 
 ## 2. Controller contract and route validation
 
-- [x] 2.1 Add the empty-default controllers map, explicit selfMember, member allowlists and optional lane selection. Add `builder-controllers` cases for unknown/missing members, null facets, duplicate references, unknown lanes, empty selection, two same-OS profiles and self/VM distinction. Run `nix build .#checks.<system>.builder-controllers`.
+- [x] 2.1 Add the empty-default controllers map, explicit selfMember, member allowlists and optional lane selection. Add `builder-controllers` cases for unknown/missing members, null facets, duplicate references, unknown lanes, empty selection, two same-OS profiles and self/external-builder distinction. Run `nix build .#checks.<system>.builder-controllers`.
 - [x] 2.2 Add typed routes and fieldwise overrides, whole trust replacement, string-only absolute identities, pin/CA declarations and jump references. Fully force invalid path/type, missing endpoint/login/key/trust, unknown routes, cycles, alias collision and injection cases in `builder-controllers`. Run `nix fmt -- --check .` and `nix build .#checks.<system>.builder-controllers`.
 
 ## 3. Pure projection and additive wiring
 
-- [x] 3.1 Implement one pure normalized controller projection with self exclusion and sorted member/lane output. Add `builder-projection` fixtures for direct/jump localhost VM routes, distinct lanes, explicit lane filtering and two controllers on one OS. Run `nix build .#checks.<system>.builder-projection`.
+- [x] 3.1 Implement one pure normalized controller projection with self exclusion and sorted member/lane output. Add `builder-projection` fixtures for direct/jump nondefault-port builder routes, distinct lanes, explicit lane filtering and two controllers on one OS. Run `nix build .#checks.<system>.builder-projection`.
 - [x] 3.2 Project nix.buildMachines-shaped lists and structured SSH/knownHosts, with stable aliases, strict trust policy, nondefault ports, remote-program encoding and full-public-key-text encoding assertions. Test pin and CA representations using synthetic public data only. Run `nix build .#checks.<system>.builder-projection`.
 - [x] 3.3 Wire direct `buildMachinesByController` and optional aggregate `projections.builders.byController` from that same model; force JSON-only serialization and exact direct/aggregate list equality. Test absent declarations, facet-only declarations, declared empty profiles and unchanged deploy projections in `builder-compat`. Run `nix build .#checks.<system>.builder-compat`.
 

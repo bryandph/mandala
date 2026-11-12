@@ -41,8 +41,8 @@ enable deployment/Ansible management, require a fabricated network attachment,
 or bypass member source collision checks. Such members remain visible to normal
 all-member selectors and inventory projections.
 
-#### Scenario: A builder VM has no managed closure
-- **WHEN** acme enrolls a Linux builder VM as a facts-only extra member with explicit builder endpoint data
+#### Scenario: An external builder has no managed closure
+- **WHEN** acme enrolls a Linux external builder as a facts-only extra member with explicit builder endpoint data
 - **THEN** it can offer build capacity without producing a deployment/Ansible push target or requiring an invented network attachment
 
 #### Scenario: Enrollment cannot shadow a member
@@ -77,7 +77,7 @@ that one lane's maxJobs constrains another lane or controller.
 - **THEN** evaluation fails naming the member and lane instead of silently unioning the feature lists
 
 #### Scenario: Shared endpoint is not reserved capacity
-- **WHEN** wide and serial lanes share one VM and another controller can use it
+- **WHEN** wide and serial lanes share one builder and another controller can use it
 - **THEN** the output preserves both lanes without claiming exclusive memory or a fleet-wide job budget
 
 ### Requirement: Controllers select explicit members and lanes
@@ -94,16 +94,17 @@ Duplicate lane references SHALL fail validation.
 Profiles SHALL be selected explicitly. Unknown requested profiles SHALL fail,
 not fall back. Selection SHALL NOT infer from controller OS, hostname, evaluation
 platform, environment, HOME, or reachability. Every lane of selfMember SHALL be
-excluded by member identity, without excluding a separate VM member hosted there.
+excluded by member identity, without excluding a separate external builder
+member reached through it.
 Authored member/lane/route references SHALL be validated even if self-excluded.
 
 #### Scenario: Same OS does not mean same policy
 - **WHEN** two Linux controller profiles declare different allowlists and identities
 - **THEN** each output uses only its own selected builders and routes without union or OS fallback
 
-#### Scenario: Self exclusion retains a hosted VM
-- **WHEN** a macOS controller allowlists itself and its separately enrolled builder VM
-- **THEN** every self lane is absent and the selected VM lanes remain
+#### Scenario: Self exclusion retains an external builder
+- **WHEN** a macOS controller allowlists itself and its separately enrolled external builder
+- **THEN** every self lane is absent and the selected builder lanes remain
 
 #### Scenario: Bad references fail explicitly
 - **WHEN** a profile has an unknown selfMember, unknown or non-builder allowlist member, duplicate member/lane, or a lane selection outside the allowlist or effective lanes
@@ -140,9 +141,9 @@ SHALL be safe and collision-free. No route SHALL request interactive acceptance,
 runtime keyscan, StrictHostKeyChecking=no, SSH-agent signing or invoking-user HOME
 discovery.
 
-#### Scenario: A VM is reached differently by two controllers
-- **WHEN** a Linux controller under WSL routes a VM through a macOS jump route and the macOS controller routes it directly on a localhost port
-- **THEN** each profile preserves its authored route and identity, pins both jump and final hosts where used, and identifies the VM separately from the controller
+#### Scenario: A builder is reached differently by two controllers
+- **WHEN** a Linux controller under WSL routes a builder through a macOS jump route and the macOS controller routes it directly on a nondefault port
+- **THEN** each profile preserves its authored route and identity, pins both jump and final hosts where used, and identifies the builder separately from the controller
 
 #### Scenario: Route overrides replace defaults
 - **WHEN** a builder has default endpoint/trust and a profile authors another endpoint and a complete replacement trust declaration
@@ -173,7 +174,7 @@ SSH data SHALL preserve typed endpoints, ports, logins, identity paths,
 remote-program data, jump aliases, host-key aliases, and strict host/identity
 policy (strict checking, IdentitiesOnly and IdentityAgent none). knownHosts data
 SHALL preserve public pins or CA trust and the names/ports/principals they match.
-A localhost VM SHALL have a distinct stable host-key identity.
+A nondefault-port builder SHALL have a distinct stable host-key identity.
 Nix publicHostKey pin encoding SHALL base64-encode the complete SSH public-key
 text, not reuse only its existing base64 key blob.
 
@@ -196,8 +197,8 @@ or render machines/SSH files.
 - **THEN** fully forced JSON projection bytes are identical and each direct list equals its aggregate counterpart
 
 #### Scenario: Trust encodings and ports are preserved
-- **WHEN** synthetic fixtures use a full SSH public-key pin, a CA, and a nondefault-port localhost VM
-- **THEN** machine pin encoding, public knownHosts matching, CA principal/name data and stable VM host-key identity are represented distinctly and correctly
+- **WHEN** synthetic fixtures use a full SSH public-key pin, a CA, and a nondefault-port builder
+- **THEN** machine pin encoding, public knownHosts matching, CA principal/name data and stable builder host-key identity are represented distinctly and correctly
 
 ### Requirement: Absent configuration preserves legacy bytes
 

@@ -58,7 +58,7 @@ consumer configuration. No private source is required for its tests.
 - Slice 4: raw `mandala deploy run --builders` passthrough, supervisor/run-options
   changes, or CLI/TUI/MCP runtime controller selection.
 - Altering `deployment.controllerSettings`, its OS keys, or deploy precedence.
-- VM creation/startup, key enrollment/rotation, trust expansion, global resource
+- Builder creation/startup, key enrollment/rotation, trust expansion, global resource
   reservations, discovery of reachability, or a separate external-builder registry.
 - Binary-cache publication, target-local builds, deploy-rs remoteBuild, or changes
   to the single batch build and effect-free recovery behavior.
