@@ -1,11 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: Additive CLI and TUI campaign lifecycle
-CLI and TUI SHALL expose campaign create, inspect, retry, explicit exclusion updates, reboot, verify and close alongside existing deploy/run interfaces. Creation SHALL bind only, with no host effects; retry SHALL execute eligible pending or failed work. Inspection SHALL show source and target identity, source-moved state, membership/exclusions/reasons, outcome provenance, attempts and verification separately from lifecycle. CLI SHALL offer structured reads; TUI SHALL link attempts to existing run attachment. Real mutations SHALL retain explicit confirmation and dispatch revalidation of exact names and campaign generation.
+CLI and TUI SHALL expose campaign create, inspect, retry, explicit exclusion updates, reboot, verify and close alongside existing deploy/run interfaces. Real creation SHALL bind the target and start the first deployment attempt in one operation after the same real-mutation confirmation gate as deploy runs. An explicit creation preview SHALL bind and display the target without launching an attempt or performing host effects, leaving real work pending. Retry SHALL execute eligible pending or failed work, including work left pending by a creation preview. Inspection SHALL show source and target identity, source-moved state, membership/exclusions/reasons, outcome provenance, attempts and verification separately from lifecycle. CLI SHALL offer structured reads; TUI SHALL link attempts to existing run attachment. Real mutations SHALL retain explicit confirmation and dispatch revalidation of exact names and campaign generation.
 
-#### Scenario: creation does not activate
-- **WHEN** an operator creates a campaign for a selection
-- **THEN** the target is bound for review and no host deployment or reboot starts
+#### Scenario: creation starts the first deployment
+- **WHEN** an operator confirms real campaign creation after reviewing the captured target and exact eligible names
+- **THEN** the target and first attempt/run link are persisted before host effects and the first deployment starts without a separate retry command
+
+#### Scenario: creation preview preserves target review
+- **WHEN** an operator requests a campaign creation preview
+- **THEN** the target is bound and displayed without an attempt or host effects and real deployment remains pending
+
+#### Scenario: real creation is not confirmed
+- **WHEN** an operator declines or omits the required real-mutation confirmation
+- **THEN** no first deployment attempt starts
 
 #### Scenario: legacy run attachment still works
 - **WHEN** an operator attaches to an older unlinked run
