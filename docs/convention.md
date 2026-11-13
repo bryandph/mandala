@@ -25,7 +25,10 @@ The validated `config.host` IS the member: there is no registry to
 update and nothing to keep in sync — the arrow points outward, from
 configurations to projections. Management surfaces (`deployment.ansible`,
 `deployment.deployRs`) default OFF; a fleet's configuration factory
-typically `mkDefault`s them on for the hosts it builds.
+typically `mkDefault`s them on for standalone hosts it builds. VM guests must
+keep both enables false, including factory defaults; see the
+[VM member contract](vm-members.md) for explicit ownership and the owner-side
+application declaration. The pure contract alone does not enable VM deployment.
 
 ## 2. Non-NixOS members are validated plain data
 
@@ -75,8 +78,11 @@ one eval, gated by `schemaVersion`. The CLI and plugged engines read
 ONLY this; per-tool outputs (`.#ansibleInventory`, `.#sopsConfig`,
 `deploy.nodes`, `.#deployBatch.<group>`) remain for direct tool
 consumption. Groups use the ansible-safe spelling everywhere, so
-`@k3s`, `ansible -l k3s`, and `.#deployBatch.k3s` are one name for one
-member set.
+`@k3s`, `ansible -l k3s`, and `.#deployBatch.k3s` share one canonical taxonomy.
+Transport eligibility is applied after taxonomy: standalone SSH-eligible fleets
+retain equal membership, while VM identities remain canonical members but never
+SSH targets or independent static batch entries. Raw batches do not expand guest
+selections to owners; the pure owner resolver exposes that impact explicitly.
 
 ## 6. Deploy settings are flattened once
 

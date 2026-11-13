@@ -1,0 +1,1 @@
+{"nodes":{"example-node":{"autoRollback":true,"fastConnection":true,"hostname":"example-node.example.test","profiles":{"system":{"path":"/synthetic/activate"}},"sshOpts":["-p","22"],"sshUser":"root"}}}

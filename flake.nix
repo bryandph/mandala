@@ -205,6 +205,8 @@
             names}
           touch $out
         '';
+      vm-member-schema = assert import ./tests/vm-member-schema.nix {inherit lib;}; pkgs.runCommand "vm-member-schema" {} "touch $out";
+      vm-projections = assert import ./tests/vm-projections.nix {inherit lib;}; pkgs.runCommand "vm-projections" {} "touch $out";
       builder-renderer = assert import ./tests/builder-renderer.nix {inherit lib;}; pkgs.runCommand "builder-renderer" {} "touch $out";
       builder-adapters = assert import ./tests/builder-adapters.nix {inherit lib nixpkgs;}; pkgs.runCommand "builder-adapters" {} "touch $out";
       builder-schema = assert import ./tests/builder-schema.nix {inherit lib;}; pkgs.runCommand "builder-schema" {} "touch $out";

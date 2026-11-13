@@ -249,7 +249,11 @@ in {
       (lib.attrNames cfg.deployment.controllerSettings))
     "mandala deployment.controllerSettings keys must be darwin or linux";
     assert lib.assertMsg (unknownDeploymentGroups == [])
-    "mandala deployment.groupSettings keys must name known sanitized groups: ${lib.concatStringsSep ", " unknownDeploymentGroups}"; mergedMembers;
+    "mandala deployment.groupSettings keys must name known sanitized groups: ${lib.concatStringsSep ", " unknownDeploymentGroups}";
+      engine.vm.validate {
+        members = mergedMembers;
+        configurations = inputs.self.nixosConfigurations or {};
+      };
 
     flake.buildMachinesByController = lib.mapAttrs (_: projection: projection.buildMachines) builderProjection;
 
