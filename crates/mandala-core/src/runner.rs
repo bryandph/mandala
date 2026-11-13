@@ -337,6 +337,8 @@ pub struct HostRun {
     pub state: HostState,
     pub lines: VecDeque<String>,
     pub milestones: Vec<String>,
+    /// Latest additive copy observation; absent on legacy runs.
+    pub copy: Option<mandala_deploy::push::CopyStats>,
     pub rc: Option<i64>,
 }
 
@@ -348,6 +350,7 @@ impl HostRun {
             state: HostState::Pending,
             lines: VecDeque::new(),
             milestones: Vec::new(),
+            copy: None,
             rc: None,
         }
     }
@@ -366,6 +369,11 @@ impl HostRun {
             Some("line") => {
                 let line = event.get("line").and_then(Value::as_str).unwrap_or("");
                 push_capped(&mut self.lines, line.to_string(), MAX_LINES);
+            }
+            Some("copy") => {
+                if let Ok(copy) = serde_json::from_value(event.clone()) {
+                    self.copy = Some(copy);
+                }
             }
             Some("milestone") => {
                 let name = event.get("milestone").and_then(Value::as_str).unwrap_or("");

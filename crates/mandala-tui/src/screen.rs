@@ -819,7 +819,12 @@ impl DeployViewState {
                     name: h.name.clone(),
                     state: h.state,
                     rc: h.rc,
-                    lines: h.lines.iter().cloned().collect(),
+                    lines: h
+                        .copy
+                        .iter()
+                        .map(|copy| copy.describe())
+                        .chain(h.lines.iter().cloned())
+                        .collect(),
                 })
                 .collect();
             for host in &self.hosts {

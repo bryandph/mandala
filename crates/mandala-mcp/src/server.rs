@@ -1043,6 +1043,9 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
             "state": h.state.as_str(),
             "rc": h.rc,
         });
+        if let Some(copy) = &h.copy {
+            entry["copy"] = serde_json::to_value(copy).expect("copy stats serialize");
+        }
         if let SnapshotDetail::Full { .. } = detail {
             if diagnostics {
                 entry["milestones"] = Value::from(h.milestones.clone());
@@ -1285,6 +1288,44 @@ mod tests {
     fn round3_matches_python_round() {
         assert_eq!(round3(1.234_567), 1.235);
         assert_eq!(round3(0.0004), 0.0);
+    }
+
+    #[test]
+    fn copy_status_is_additive_in_listing_and_detail() {
+        let path = std::env::temp_dir().join(format!("mandala-mcp-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let meta = Meta::from_iter([
+            ("kind".into(), json!("deploy")),
+            ("pid".into(), json!(0)),
+            ("rc".into(), json!(0)),
+        ]);
+        registry::write_meta(&path, &meta).unwrap();
+        let mut obs = ObservedRun {
+            info: registry::RunInfo {
+                run_id: "fixture".into(),
+                path: path.clone(),
+                meta,
+            },
+            tailer: mandala_core::runner::EventTailer::new(&path),
+        };
+        obs.tailer.host("legacy");
+        obs.tailer.host("alpha").feed(&json!({"event":"copy","substitute_on_destination":true,"duration_ms":5,"success":true,"paths_copied":1,"controller_nar_bytes":128}));
+        for detail in [
+            SnapshotDetail::Listing,
+            SnapshotDetail::Full {
+                forest: false,
+                forest_nodes: false,
+                diagnostics: false,
+            },
+        ] {
+            let snapshot = run_snapshot(&mut obs, detail);
+            assert!(snapshot["hosts"]["legacy"].get("copy").is_none());
+            assert_eq!(
+                snapshot["hosts"]["alpha"]["copy"],
+                json!({"substitute_on_destination":true,"duration_ms":5,"success":true,"paths_copied":1,"controller_nar_bytes":128})
+            );
+        }
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
