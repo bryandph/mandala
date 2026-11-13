@@ -202,7 +202,8 @@ in rec {
       referencesValid =
         lib.all (n: lib.elem n names) ([p.selfMember] ++ allowed ++ routeNames)
         && builtins.length allowed == builtins.length (lib.unique allowed)
-        && lib.all (n: (members.${n}.builder or null) != null) allowed
+        && lib.all (n: (members.${n}.builder or null) != null && (members.${n}.kind or "standalone") != "vm") allowed
+        && lib.all (n: (members.${n}.kind or "standalone") != "vm") routeNames
         && lib.all (n: lib.elem n allowed) (lib.attrNames p.lanes);
       visit = seen: member:
         require "${context} route ${member}: cyclic jump graph" (!(lib.elem member seen))

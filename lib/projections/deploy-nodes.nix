@@ -30,7 +30,7 @@
 }: let
   deployable =
     lib.filterAttrs
-    (_: cfg: cfg.config.host.deployment.deployRs.enable)
+    (_: cfg: (cfg.config.host.kind or "standalone") != "vm" && cfg.config.host.deployment.deployRs.enable)
     nixosConfigurations;
 
   # Systems deploy-rs ships lib machinery for — the fallback decision is

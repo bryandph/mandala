@@ -22,6 +22,10 @@ Derive sorted `projections.vm.guestsByOwner.<owner> = [ guest-id ... ]` from `me
 
 **Alternatives:** only category tags cannot validate authority; using platform would conflate OS and ownership; owner-only opaque guests lose inventory/status; guest SSH creates a competing lifecycle authority. Reject all four.
 
+#### Phase-A authoring surface
+
+The approved Nix contract uses nullable owner-side `host.vmApplication = { backend; manifestVersion; supportedSystems; guests.<guestId>.system; }`, authored by the consumer's runtime module in the owner's configuration. This is a compatibility summary whose guest IDs and systems must exactly agree with the guest relations, not a fleet-level second configuration authority. The application is the existing owner deploy profile/toplevel: the pure `projections.vm.applications.<owner>` view derives IDs, backend/version, systems and `application = ".#deploy.nodes.<owner>.profiles.system.path"`; it accepts no free installable override and forces no artifact. Phase B supplies the readiness/recovery runtime manifest inside that artifact. The pure Nix phase does not implement frontend negotiation or authorize VM deployment.
+
 ### 2. Fail closed at transport projection boundaries
 
 VMs remain in the aggregate's members, canonical groups, DNS/DHCP when their real address facts qualify, and documentation. The owner is not substituted into their network records.

@@ -48,6 +48,42 @@ in {
       description = "Fully qualified domain name (derived from name and domain)";
     };
 
+    kind = mkOption {
+      type = types.enum ["standalone" "vm"];
+      default = "standalone";
+      description = "Execution ownership, independent of category, platform and closure construction.";
+    };
+
+    vm = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          owner = mkOption {type = hostLabel;};
+          backend = mkOption {type = types.enum ["nixos-module"];};
+        };
+      });
+      default = null;
+      description = "One canonical lifecycle owner and backend; required only for VM members.";
+    };
+
+    vmApplication = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          backend = mkOption {type = types.enum ["nixos-module"];};
+          manifestVersion = mkOption {type = types.enum [1];};
+          supportedSystems = mkOption {
+            type = types.listOf (types.strMatching "[A-Za-z0-9_+-]+-[A-Za-z0-9_+-]+");
+          };
+          guests = mkOption {
+            type = types.attrsOf (types.submodule {
+              options.system = mkOption {type = types.str;};
+            });
+          };
+        };
+      });
+      default = null;
+      description = "Consumer runtime module's pure owner-side application declaration, not a second guest authority or runtime readiness manifest.";
+    };
+
     category = mkOption {
       type = types.enum ["workstation" "server" "gateway" "appliance" "vm" "container"];
       default = "server";
@@ -317,6 +353,22 @@ in {
   };
 
   config.assertions = [
+    {
+      assertion = (cfg.kind == "vm") == (cfg.vm != null);
+      message = "member ${cfg.name}: VM kind requires one vm relation; standalone forbids it";
+    }
+    {
+      assertion = cfg.kind != "vm" || (!cfg.deployment.deployRs.enable && !cfg.deployment.ansible.enable && cfg.builder == null);
+      message = "member ${cfg.name} (owner ${
+        if cfg.vm == null
+        then "missing"
+        else cfg.vm.owner
+      }): VM SSH enables and builder advertisements are forbidden";
+    }
+    {
+      assertion = cfg.vmApplication == null || (cfg.kind == "standalone" && cfg.platform == "nixos" && cfg.deployment.deployRs.enable && cfg.build != null);
+      message = "member ${cfg.name}: vmApplication requires a standalone deploy-rs-managed NixOS owner with build metadata";
+    }
     {
       assertion = lib.toLower cfg.name != "all";
       message = "member ${cfg.name}: 'all' is reserved by the selector language";

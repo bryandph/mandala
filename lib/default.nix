@@ -195,6 +195,9 @@ in rec {
   # reinterpret precedence or sshOpts ordering.
   mergeDeploySettings = import ./deploy-settings.nix {inherit lib;};
 
+  # Pure VM relation, application-reference and owner-selection contracts.
+  vm = import ./vm.nix {inherit lib;};
+
   # The versioned aggregate contract output — the one eval surface for
   # porcelain (CLI/TUI, plugged engines): `nix eval --json .#mandala`
   # returns this shape, gated by schemaVersion, so no porcelain code
@@ -212,16 +215,27 @@ in rec {
     # them (the flakeModules merge theirs in here).
     projections ? {},
   }: let
-    names = lib.attrNames members;
+    checkedMembers = vm.validate {inherit members;};
+    names = lib.attrNames checkedMembers;
+    vmFleet = vm.hasVM checkedMembers;
   in
     {
-      schemaVersion = 1;
-      inherit projections;
-      members = lib.mapAttrs (_: member:
-        if (member.builder or null) == null
-        then removeAttrs member ["builder"]
-        else member)
-      members;
+      schemaVersion =
+        if vmFleet
+        then 2
+        else 1;
+      projections = projections // lib.optionalAttrs vmFleet {vm = vm.project checkedMembers;};
+      members =
+        lib.mapAttrs (_: member:
+          if (member.builder or null) == null
+          then removeAttrs member ["builder"]
+          else member)
+        # Preserve the version-1 bytes, including the absence of new defaults.
+        (lib.mapAttrs (_: member:
+          if vmFleet
+          then member
+          else removeAttrs member ["kind" "vm" "vmApplication"])
+        checkedMembers);
       groups =
         lib.genAttrs
         (lib.unique (lib.concatMap (n: ansibleGroupsFor members.${n}) names))

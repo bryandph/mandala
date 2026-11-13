@@ -31,7 +31,7 @@
   hosts,
 }: let
   deployable =
-    lib.filterAttrs (_: host: host.deployment.deployRs.enable) hosts;
+    lib.filterAttrs (_: host: (host.kind or "standalone") != "vm" && host.deployment.deployRs.enable) hosts;
 
   allGroupKeys =
     lib.unique (lib.concatLists (lib.mapAttrsToList (_: ansibleGroupsFor) deployable));

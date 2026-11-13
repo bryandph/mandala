@@ -40,7 +40,7 @@
   # Name of the synthetic deploy-rs guard group.
   guardGroup ? "deploy_rs",
 }: let
-  members = lib.filterAttrs (_: host: host.deployment.ansible.enable) hosts;
+  members = lib.filterAttrs (_: host: (host.kind or "standalone") != "vm" && host.deployment.ansible.enable) hosts;
 
   names = lib.attrNames members;
 
