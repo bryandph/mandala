@@ -71,6 +71,21 @@ CI runs. While evaluation is quiet, the build tab shows a waiting message.
 The nom process starts with the first Nix log record, avoiding its no-input
 warning during long evaluations.
 
+Native host copies also record their resolved substitution mode and elapsed
+milliseconds in durable per-host `copy` events. Headless CLI completion lines,
+TUI host tabs (including attached runs), and MCP `deploy_status` host `copy`
+objects expose `paths_copied` and `controller_nar_bytes` when Nix reports them.
+`substitute_on_destination` is the inverse of resolved `fastConnection`; its
+default remains unchanged. Counts come from `nix copy --log-format internal-json`
+activity progress, not closure-size estimates. Bytes are uncompressed NAR payload
+read by the controller for the destination: they exclude SSH overhead and cache
+downloads performed by the destination. Silent or unrecognized output leaves
+counts absent (`unknown` in text), never an assumed zero. Explicit reported zeros
+are preserved, and failed copies retain any reported partial counts. Runs written
+before this telemetry have no `copy` object. See
+[the copy observation design](openspec/changes/deploy-copy-observability/design.md)
+for the event shape and protocol compatibility notes.
+
 The TUI supports mouse clicks and wheel scrolling. Because mouse capture sends
 pointer events to Mandala, hold Shift while dragging when you want the terminal
 emulator to select text instead.

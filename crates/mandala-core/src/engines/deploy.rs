@@ -234,13 +234,15 @@ struct DeployPrograms {
 }
 
 struct RegistryDeploySink {
+    host: String,
     writer: Arc<EventWriter>,
     error: Mutex<Option<String>>,
 }
 
 impl RegistryDeploySink {
-    fn new(writer: Arc<EventWriter>) -> Self {
+    fn new(writer: Arc<EventWriter>, host: &str) -> Self {
         Self {
+            host: host.to_string(),
             writer,
             error: Mutex::new(None),
         }
@@ -252,6 +254,25 @@ impl RegistryDeploySink {
 }
 
 impl EventSink for RegistryDeploySink {
+    fn copy(&self, stats: &mandala_deploy::push::CopyStats) {
+        if stats.duration_ms.is_some() {
+            eprintln!("mandala: {}: {}", self.host, stats.describe());
+        }
+        let fields = serde_json::to_value(stats)
+            .expect("copy stats serialize")
+            .as_object()
+            .expect("copy stats are an object")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if let Err(error) = self.writer.emit("copy", fields)
+            && let Ok(mut slot) = self.error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(error.to_string());
+        }
+    }
+
     fn emit(&self, _level: Level, message: &str) {
         let result = self.writer.emit(
             "line",
@@ -1248,7 +1269,7 @@ async fn deploy_host_with(
         ssh_program: programs.ssh.clone(),
         environment: programs.environment.clone(),
     };
-    let sink = RegistryDeploySink::new(Arc::clone(&writer));
+    let sink = RegistryDeploySink::new(Arc::clone(&writer), host);
     let deploy = make_deploy_data(
         &GenericSettings::default(),
         &node,
@@ -2799,6 +2820,104 @@ exit 0
     }
 
     #[tokio::test]
+    async fn copy_telemetry_modes_counts_empty_silent_and_failure() {
+        for (case, fast, paths, rc) in [
+            ("direct", true, Some(3), 0),
+            ("substitute", false, Some(1), 0),
+            ("empty", false, Some(0), 0),
+            ("silent", true, None, 0),
+            ("failed", false, Some(1), 23),
+        ] {
+            let base = tmp_base(&format!("copy-telemetry-{case}"));
+            let _guard = registry::test_hooks::install_runs_base(base.clone());
+            let mut run = prepare_run(&inv(), "cache", 4, true).unwrap();
+            let mut settings = deploy_settings("switch");
+            settings["fastConnection"] = Value::Bool(fast);
+            run.plan.settings.insert("cache".into(), settings);
+            let (programs, _) = effect_programs(&base, 0, 0);
+            let nix = programs.nix.as_ref().unwrap();
+            let mut script = format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *' --log-format internal-json '*) ;;\n  *) exit 90;;\nesac\ncase \" $* \" in\n  *' --substitute-on-destination '*) test '{fast}' = false || exit 91;;\n  *) test '{fast}' = true || exit 92;;\nesac\n"
+            );
+            if let Some(paths) = paths {
+                let bytes = paths * 128;
+                for record in [
+                    serde_json::json!({"action":"start","id":1,"type":103,"parent":0,"text":"copying paths"}),
+                    serde_json::json!({"action":"result","id":1,"type":105,"fields":[paths,paths,0,0]}),
+                    serde_json::json!({"action":"start","id":2,"type":100,"parent":0,"text":"copying path","fields":["/nix/store/profile","local","ssh://deployer@cache.example.test"]}),
+                    serde_json::json!({"action":"result","id":2,"type":105,"fields":[64,bytes]}),
+                    serde_json::json!({"action":"result","id":2,"type":105,"fields":[bytes,bytes]}),
+                    serde_json::json!({"action":"msg","level":0,"msg":"copy diagnostic"}),
+                ] {
+                    script.push_str(&format!("printf '%s\\n' '@nix {record}' >&2\n"));
+                }
+            }
+            script.push_str(&format!("exit {rc}\n"));
+            std::fs::write(nix, script).unwrap();
+            let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+            assert_eq!(result.state == HostState::Failed, rc != 0, "{case}");
+            let events = jsonl(&run.path.join("cache.jsonl"));
+            let copies: Vec<_> = events
+                .iter()
+                .filter(|event| event["event"] == "copy")
+                .collect();
+            assert_eq!(copies.len(), 2);
+            assert_eq!(copies[0]["substitute_on_destination"], !fast);
+            assert!(copies[0].get("duration_ms").is_none());
+            assert_eq!(copies[1]["success"], rc == 0);
+            assert!(copies[1]["duration_ms"].is_u64());
+            assert_eq!(copies[1].get("paths_copied").and_then(Value::as_u64), paths);
+            assert_eq!(
+                copies[1]
+                    .get("controller_nar_bytes")
+                    .and_then(Value::as_u64),
+                paths.map(|n| n * 128)
+            );
+            assert!(!events.iter().any(|event| {
+                event["line"]
+                    .as_str()
+                    .is_some_and(|line| line.starts_with("@nix "))
+            }));
+            let mut tailer = crate::runner::EventTailer::new(&run.path);
+            tailer.poll();
+            let copy = tailer.hosts["cache"].copy.as_ref().unwrap();
+            assert_eq!(copy.substitute_on_destination, !fast);
+            assert_eq!(copy.paths_copied, paths);
+            if paths.is_some() {
+                assert!(
+                    tailer.hosts["cache"]
+                        .lines
+                        .iter()
+                        .any(|line| line == "copy diagnostic")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_spawn_failure_records_mode_and_duration() {
+        let base = tmp_base("copy-spawn-failure");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "cache", 4, true).unwrap();
+        let programs = DeployPrograms {
+            nix: Some(base.join("missing-nix")),
+            ..DeployPrograms::default()
+        };
+        let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
+        assert_eq!(result.state, HostState::Failed);
+        let events = jsonl(&run.path.join("cache.jsonl"));
+        let copy = events
+            .iter()
+            .rev()
+            .find(|event| event["event"] == "copy")
+            .unwrap();
+        assert_eq!(copy["success"], false);
+        assert!(copy["duration_ms"].is_u64());
+        assert!(copy.get("paths_copied").is_none());
+        assert!(copy.get("controller_nar_bytes").is_none());
+    }
+
+    #[tokio::test]
     async fn one_host_uses_flattened_settings_prebuilt_path_and_boot_mode() {
         let base = tmp_base("host-boot");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
@@ -2814,7 +2933,7 @@ exit 0
 
         let trace = std::fs::read_to_string(trace).unwrap();
         assert!(trace.contains(
-            "nix USER=ambient-user-must-not-win HOME=/ambient/home/must-not-win SSH_AUTH_SOCK=/ambient/agent/must-not-win NIX_SSHOPTS=-p 2222 -i /keys/mandala-test -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no args=copy --substitute-on-destination --no-check-sigs --to ssh://deployer@cache.example.test /nix/store/00000000000000000000000000000000-cache-profile"
+            "nix USER=ambient-user-must-not-win HOME=/ambient/home/must-not-win SSH_AUTH_SOCK=/ambient/agent/must-not-win NIX_SSHOPTS=-p 2222 -i /keys/mandala-test -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no args=copy --log-format internal-json --substitute-on-destination --no-check-sigs --to ssh://deployer@cache.example.test /nix/store/00000000000000000000000000000000-cache-profile"
         ));
         assert!(trace.contains("nix-env --profile /nix/var/nix/profiles/per-user/app/system --set /nix/store/00000000000000000000000000000000-cache-profile"));
         assert!(trace.contains("cache-profile/bin/switch-to-configuration boot"));

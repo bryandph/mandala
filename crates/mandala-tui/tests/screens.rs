@@ -220,6 +220,36 @@ fn confirm_modal_renders_message_and_trailer() {
 }
 
 #[test]
+fn host_copy_measurements_reconstruct_on_attach_and_unknown_is_not_zero() {
+    let mut tailer =
+        mandala_core::runner::EventTailer::new(std::path::Path::new("/nonexistent-fixture"));
+    tailer.host("web").feed(&serde_json::json!({"event":"copy","substitute_on_destination":true,"duration_ms":7,"success":true,"paths_copied":1,"controller_nar_bytes":128}));
+    tailer.host("silent").feed(&serde_json::json!({"event":"copy","substitute_on_destination":false,"duration_ms":8,"success":true}));
+    tailer.host("legacy");
+    let mut view = DeployViewState::new("web", false, false, true, false);
+    view.sync(Some(&tailer), &[], false, None, 1);
+    let web = view.hosts.iter().find(|host| host.name == "web").unwrap();
+    assert_eq!(
+        web.lines[0],
+        "copy: substitute-on-destination=true paths=1 controller-nar-bytes=128 duration-ms=7"
+    );
+    let silent = view
+        .hosts
+        .iter()
+        .find(|host| host.name == "silent")
+        .unwrap();
+    assert!(silent.lines[0].contains("paths=unknown controller-nar-bytes=unknown"));
+    assert!(
+        view.hosts
+            .iter()
+            .find(|host| host.name == "legacy")
+            .unwrap()
+            .lines
+            .is_empty()
+    );
+}
+
+#[test]
 fn shared_publish_is_visible_during_attach_and_in_successful_summary() {
     let mut tailer =
         mandala_core::runner::EventTailer::new(std::path::Path::new("/nonexistent-fixture"));

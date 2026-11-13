@@ -591,6 +591,48 @@ mod tests {
         })
     }
 
+    #[test]
+    fn copy_events_round_trip_and_legacy_records_remain_absent() {
+        let path = tmp();
+        std::fs::create_dir_all(&path).unwrap();
+        write_events(
+            &path.join("legacy.jsonl"),
+            &milestones("legacy", &["copy", "confirm"]),
+        );
+        let writer = crate::runner::EventWriter::new(&path, "alpha", "alpha", "deploy").unwrap();
+        writer
+            .emit(
+                "copy",
+                serde_json::from_value(serde_json::json!({
+                    "substitute_on_destination": true,
+                    "duration_ms": 125,
+                    "success": true,
+                    "paths_copied": 2,
+                    "controller_nar_bytes": 4096,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let line = std::fs::read_to_string(path.join("alpha.jsonl")).unwrap();
+        let timestamp = serde_json::from_str::<Value>(&line).unwrap()["ts"].clone();
+        assert!(timestamp.is_number());
+        let line = line.replace(&format!("\"ts\":{timestamp}"), "\"ts\":42.0");
+        assert_eq!(
+            line.trim(),
+            r#"{"v":2,"ts":42.0,"host":"alpha","plugin":"deploy","event":"copy","controller_nar_bytes":4096,"duration_ms":125,"paths_copied":2,"substitute_on_destination":true,"success":true}"#
+        );
+        let mut tailer = EventTailer::new(&path);
+        tailer.poll();
+        let copy = tailer.hosts["alpha"].copy.as_ref().unwrap();
+        assert_eq!(copy.paths_copied, Some(2));
+        assert_eq!(copy.controller_nar_bytes, Some(4096));
+        assert_eq!(copy.duration_ms, Some(125));
+        assert_eq!(tailer.hosts["alpha"].state, HostState::Pending);
+        assert!(tailer.hosts["legacy"].copy.is_none());
+        assert_eq!(tailer.hosts["legacy"].state, HostState::Confirmed);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     // ---- meta round-trip + list ordering ------------------------------------
 
     /// Parallel same-process allocations must never share a run dir: the

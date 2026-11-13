@@ -1,0 +1,11 @@
+@nix {"action":"start","id":1,"level":0,"parent":0,"text":"","type":103}
+@nix {"action":"stop","id":1}
+@nix {"action":"start","id":2,"level":3,"parent":0,"text":"copying 1 paths","type":103}
+@nix {"action":"result","fields":[100,4488],"id":2,"type":106}
+@nix {"action":"result","fields":[0,1,1,0],"id":2,"type":105}
+@nix {"action":"start","fields":["/nix/store/00000000000000000000000000000000-example.patch","daemon","local://"],"id":3,"level":3,"parent":0,"text":"copying path to local store","type":100}
+@nix {"action":"result","fields":[8,4488,0,0],"id":3,"type":105}
+@nix {"action":"result","fields":[4488,4488,0,0],"id":3,"type":105}
+@nix {"action":"stop","id":3}
+@nix {"action":"result","fields":[1,1,0,0],"id":2,"type":105}
+@nix {"action":"stop","id":2}

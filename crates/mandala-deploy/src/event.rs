@@ -17,6 +17,9 @@ pub enum Level {
 
 pub trait EventSink: Send + Sync {
     fn emit(&self, level: Level, message: &str);
+
+    /// Optional structured copy observer; existing sinks remain compatible.
+    fn copy(&self, _stats: &crate::push::CopyStats) {}
 }
 
 #[derive(Serialize)]
