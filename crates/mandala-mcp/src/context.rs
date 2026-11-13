@@ -59,7 +59,14 @@ use crate::tools::all_tools;
 pub fn tool_is_idempotent(name: &str) -> bool {
     matches!(
         name,
-        "members" | "groups" | "resolve" | "ping" | "host_eval" | "drift" | "deploy_status"
+        "members"
+            | "groups"
+            | "resolve"
+            | "ping"
+            | "host_eval"
+            | "drift"
+            | "deploy_status"
+            | "campaign_inspect"
     )
 }
 

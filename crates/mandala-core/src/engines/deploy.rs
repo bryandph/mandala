@@ -897,6 +897,25 @@ fn build_profiles_with(
     flake: &str,
     program: &OsStr,
 ) -> Result<BuiltProfiles, BuildError> {
+    build_profiles_pinned(run, flake, program, None)
+}
+
+/// Realize campaign profiles using only already captured derivation/output
+/// identities. No flake installable is evaluated, including during recovery.
+/// Result links must still match every recorded intended output exactly.
+pub fn build_bound_profiles(
+    run: &RegisteredDeployRun,
+    resolved: &[(String, String)],
+) -> Result<BuiltProfiles, BuildError> {
+    build_profiles_pinned(run, "", OsStr::new("nix"), Some(resolved))
+}
+
+fn build_profiles_pinned(
+    run: &RegisteredDeployRun,
+    flake: &str,
+    program: &OsStr,
+    pinned: Option<&[(String, String)]>,
+) -> Result<BuiltProfiles, BuildError> {
     let out_link = run.path.join("profile");
     let mut duration_cache = crate::runner::build_duration_cache_path(&run.path).and_then(|path| {
         match nix_build_forest::DurationCache::load(&path) {
@@ -915,7 +934,14 @@ fn build_profiles_with(
         argv.retain(|arg| arg != "--keep-going");
         argv.extend(["--option".into(), "keep-going".into(), "false".into()]);
     }
-    let resolved = match resolve_profiles(program, &argv, run.plan.targets.len()) {
+    let resolution = match pinned {
+        Some(resolved) if resolved.len() == run.plan.targets.len() => Ok(resolved.to_vec()),
+        Some(_) => {
+            Err(io::Error::other("bound profile count differs from campaign attempt").into())
+        }
+        None => resolve_profiles(program, &argv, run.plan.targets.len()),
+    };
+    let resolved = match resolution {
         Ok(resolved) => resolved,
         Err(error) => {
             record_build_failure(run, error.exit_code(), &error.to_string());
@@ -927,7 +953,11 @@ fn build_profiles_with(
     }
     let mut event_argv = argv.clone();
     event_argv[0] = program.to_string_lossy().into_owned();
-    let writer = Arc::new(EventWriter::new(&run.path, "build", "controller", "build")?);
+    let writer = Arc::new(if pinned.is_some() {
+        EventWriter::controller(&run.path, "build", "build")?
+    } else {
+        EventWriter::new(&run.path, "build", "controller", "build")?
+    });
     if let Err(error) = writer.emit(
         "status",
         event_fields([
@@ -1061,9 +1091,19 @@ fn build_profiles_with(
     } else if process_rc != 0 {
         recover_profiles(run, program, &resolved, process_rc)
     } else {
-        map_profile_links(&run.plan.targets, &out_link).map(|paths| BuiltProfiles {
-            paths,
-            failures: BTreeMap::new(),
+        map_profile_links(&run.plan.targets, &out_link).and_then(|paths| {
+            for (host, (_, expected)) in run.plan.targets.iter().zip(&resolved) {
+                if pinned.is_some() && paths[host] != Path::new(expected) {
+                    return Err(BuildError::InvalidProfilePath {
+                        host: host.clone(),
+                        path: paths[host].clone(),
+                    });
+                }
+            }
+            Ok(BuiltProfiles {
+                paths,
+                failures: BTreeMap::new(),
+            })
         })
     };
     let rc = outcome
@@ -1475,7 +1515,7 @@ fn settle_fan_out(
     })
 }
 
-fn record_controller_failure(run: &RegisteredDeployRun, error: &str) {
+pub(crate) fn record_controller_failure(run: &RegisteredDeployRun, error: &str) {
     let mut fields = Meta::new();
     fields.insert("process_rc".into(), Value::from(1));
     fields.insert("rc".into(), Value::from(1));
@@ -2471,6 +2511,85 @@ exit 0
     }
 
     #[test]
+    fn campaign_build_uses_recorded_derivations_without_any_resolution() {
+        let base = tmp_base("campaign-pinned");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        let (stub, _, args) = build_stub(&base, 0);
+        let script = std::fs::read_to_string(&stub).unwrap().replacen(
+            "#!/bin/sh",
+            "#!/bin/sh\ncase \" $* \" in *' --dry-run '*) exit 99;; esac",
+            1,
+        );
+        std::fs::write(&stub, script).unwrap();
+        let resolved = vec![(
+            "/nix/store/00000000000000000000000000000000-cache-profile.drv^out".into(),
+            "/nix/store/00000000000000000000000000000000-cache-profile".into(),
+        )];
+        let built = build_profiles_pinned(
+            &run,
+            "/must-not-evaluate",
+            stub.as_os_str(),
+            Some(&resolved),
+        )
+        .unwrap();
+        assert_eq!(built.paths["cache"], Path::new(&resolved[0].1));
+        let args = std::fs::read_to_string(args).unwrap();
+        assert!(args.contains(&resolved[0].0));
+        assert!(!args.contains('#'));
+        assert!(!args.contains("must-not-evaluate"));
+        for line in std::fs::read_to_string(run.path.join("build.jsonl"))
+            .unwrap()
+            .lines()
+        {
+            let event: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(event["host"], "");
+            assert_eq!(event["actor"], "controller");
+            assert_eq!(event["v"], 2);
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_build_keeps_its_existing_out_link_mapping_semantics() {
+        let base = tmp_base("legacy-output-mapping");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        let (stub, _, _) = build_stub(&base, 0);
+        let prefix = r#"#!/bin/sh
+case " $* " in *' --dry-run '*)
+printf '%s\n' '[{"drvPath":"/nix/store/00000000000000000000000000000000-cache-profile.drv","outputs":{"out":"/nix/store/different-resolver-output"}}]'
+exit 0 ;; esac"#;
+        let script = std::fs::read_to_string(&stub)
+            .unwrap()
+            .replacen("#!/bin/sh", prefix, 1);
+        std::fs::write(&stub, script).unwrap();
+        let built = build_profiles_with(&run, "/legacy", stub.as_os_str()).unwrap();
+        assert_eq!(
+            built.paths["cache"],
+            Path::new("/nix/store/00000000000000000000000000000000-cache-profile")
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn campaign_build_rejects_a_link_not_matching_the_bound_output() {
+        let base = tmp_base("campaign-wrong-output");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        let (stub, _, _) = build_stub(&base, 0);
+        let resolved = vec![(
+            "/nix/store/00000000000000000000000000000000-cache-profile.drv^out".into(),
+            "/nix/store/00000000000000000000000000000000-unrelated-profile".into(),
+        )];
+        assert!(matches!(
+            build_profiles_pinned(&run, "", stub.as_os_str(), Some(&resolved)),
+            Err(BuildError::InvalidProfilePath { .. })
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn one_build_maps_profiles_and_tees_compatible_events() {
         let base = tmp_base("build-success");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
@@ -2670,6 +2789,15 @@ exit 0
 
     #[tokio::test]
     async fn partial_build_deploys_only_the_verified_sibling() {
+        partial_build_with_pins(false).await;
+    }
+
+    #[tokio::test]
+    async fn campaign_partial_build_recovers_exact_outputs_without_retargeting() {
+        partial_build_with_pins(true).await;
+    }
+
+    async fn partial_build_with_pins(pinned: bool) {
         let base = tmp_base("build-partial");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
         let run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
@@ -2690,7 +2818,30 @@ exit 0
             "#,
         );
         write_program(&stub, script).unwrap();
-        let built = build_profiles_with(&run, "/fleet", stub.as_os_str()).unwrap();
+        let built = if pinned {
+            let resolved: Vec<_> = run
+                .plan
+                .targets
+                .iter()
+                .map(|name| {
+                    (
+                        format!(
+                            "/nix/store/00000000000000000000000000000000-{name}-profile.drv^out"
+                        ),
+                        format!("/nix/store/00000000000000000000000000000000-{name}-profile"),
+                    )
+                })
+                .collect();
+            build_profiles_pinned(
+                &run,
+                "/must-not-evaluate",
+                stub.as_os_str(),
+                Some(&resolved),
+            )
+            .unwrap()
+        } else {
+            build_profiles_with(&run, "/fleet", stub.as_os_str()).unwrap()
+        };
         assert_eq!(built.paths.keys().collect::<Vec<_>>(), ["web"]);
         assert_eq!(built.failures.keys().collect::<Vec<_>>(), ["cache"]);
         assert_eq!(std::fs::read_to_string(invocations).unwrap(), "x\n");

@@ -63,6 +63,7 @@ pub enum Action {
     Reboot,
     Deploy,
     OpenRuns,
+    OpenCampaigns,
     ToggleMcp,
     ToggleHalt,
     ToggleBoot,
@@ -418,6 +419,15 @@ const BINDINGS: &[Binding] = &[
     ),
     hinted_binding(
         Context::Explorer,
+        &[KeyPattern::plain(KeyCode::Char('C'))],
+        Action::OpenCampaigns,
+        HintSpec::Static {
+            key: "C",
+            label: "campaigns",
+        },
+    ),
+    hinted_binding(
+        Context::Explorer,
         &[KeyPattern::plain(KeyCode::Char('m'))],
         Action::ToggleMcp,
         HintSpec::DebugMcp,
@@ -666,6 +676,7 @@ fn hint_order(context: Context, action: Action) -> usize {
             Action::Ping,
             Action::Reboot,
             Action::Deploy,
+            Action::OpenCampaigns,
             Action::Quit,
             Action::ToggleMcp,
         ],
@@ -756,7 +767,18 @@ mod tests {
                 .iter()
                 .map(|hint| hint.key)
                 .collect::<Vec<_>>(),
-            ["tab", "space", "shift+drag", "r", "S", "p", "R", "D", "q"]
+            [
+                "tab",
+                "space",
+                "shift+drag",
+                "r",
+                "S",
+                "p",
+                "R",
+                "D",
+                "C",
+                "q"
+            ]
         );
         state.debug_mcp = true;
         assert_eq!(

@@ -40,6 +40,10 @@ use crate::tools::{
     BuildTool, DeployStatusTool, DeployTool, DriftTool, GroupsTool, HostEvalTool, MembersTool,
     PingTool, RebootTool, ReloadTool, ResolveTool, RestartServiceTool, all_tools,
 };
+use crate::tools::{
+    CampaignCloseTool, CampaignCreateTool, CampaignExcludeTool, CampaignInspectTool,
+    CampaignRebootTool, CampaignRetryTool, CampaignVerifyTool,
+};
 
 /// The MCP server identity reported in the `initialize` handshake.
 #[must_use]
@@ -328,6 +332,69 @@ impl MandalaHandler {
                 let t: RebootTool = parse(value)?;
                 self.tool_reboot(t).await
             }
+            n if n == CampaignCreateTool::tool_name() => {
+                let t: CampaignCreateTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
+            n if n == CampaignInspectTool::tool_name() => {
+                let t: CampaignInspectTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
+            n if n == CampaignRetryTool::tool_name() => {
+                let t: CampaignRetryTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
+            n if n == CampaignExcludeTool::tool_name() => {
+                let t: CampaignExcludeTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
+            n if n == CampaignRebootTool::tool_name() => {
+                let t: CampaignRebootTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
+            n if n == CampaignVerifyTool::tool_name() => {
+                let t: CampaignVerifyTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
+            n if n == CampaignCloseTool::tool_name() => {
+                let t: CampaignCloseTool = parse(value)?;
+                let args = serde_json::to_value(t).map_err(CallToolError::new)?;
+                self.state
+                    .effects
+                    .campaign(&self.state.flake, n, args)
+                    .await
+                    .map_err(|error| tool_error(error.to_string()))
+            }
             other => Err(CallToolError::unknown_tool(other.to_string())),
         }
     }
@@ -490,6 +557,23 @@ impl MandalaHandler {
     }
 
     async fn tool_drift(&self, t: DriftTool) -> Result<Value, CallToolError> {
+        if let Some(id) = &t.campaign_id {
+            let mut result=self.state.effects.campaign(&self.state.flake,"campaign_drift",json!({"campaign_id":id,"do_eval":t.do_eval.unwrap_or(false),"refresh":t.refresh.unwrap_or(false)})).await.map_err(|error|tool_error(error.to_string()))?;
+            if let Some(wanted) = &t.statuses
+                && !wanted.is_empty()
+            {
+                for basis in ["campaign", "latest_source"] {
+                    if let Some(entries) = result[basis]["entries"].as_array_mut() {
+                        entries.retain(|entry| {
+                            entry["status"]
+                                .as_str()
+                                .is_some_and(|status| wanted.iter().any(|wanted| wanted == status))
+                        });
+                    }
+                }
+            }
+            return Ok(result);
+        }
         let inv = self.inventory().await?;
         let nodes = inv.deploy_nodes();
 

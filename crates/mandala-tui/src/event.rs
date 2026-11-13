@@ -37,6 +37,17 @@ impl From<Event> for LoopEvent {
 /// settle half of every explorer job (the `call_from_thread` analog).
 #[derive(Debug)]
 pub enum AppEvent {
+    CampaignCaptured {
+        request: u64,
+        result: Result<Box<mandala_core::campaign::source::Capture>, String>,
+    },
+    CampaignResult {
+        request: u64,
+        tool: String,
+        args: serde_json::Value,
+        result: Result<serde_json::Value, String>,
+    },
+
     /// The aggregate load task settled. `generation` is the inventory
     /// generation the task was started for — a stale one is dropped, not
     /// painted (the `_fill` identity guard).

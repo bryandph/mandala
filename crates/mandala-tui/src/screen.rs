@@ -70,6 +70,8 @@ pub enum ScreenState {
     /// for its registry lifetime (fleet-cli requirement "Runs are
     /// re-attachable"; the foreground verb for backgrounded runs).
     Runs(RunsState),
+    /// Explicit campaign lifecycle beside the legacy run interface.
+    Campaign(Box<crate::campaign::CampaignView>),
 }
 
 // ==== ConfirmScreen ==========================================================

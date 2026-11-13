@@ -896,12 +896,21 @@ impl AppState {
         // nothing but still settles ok — result carries refused, no attach);
         // without a summary (older events) fall back to the newest live run
         // of that kind.
-        if tool == "deploy" || tool == "reboot" {
+        let run_kind = match tool.as_str() {
+            "deploy" | "campaign_create" | "campaign_retry" => Some("deploy"),
+            "reboot" | "campaign_reboot" => Some("reboot"),
+            "campaign_verify" => Some("verify"),
+            _ => None,
+        };
+        if let Some(kind) = run_kind {
             return match event.get("result") {
-                None | Some(Value::Null) => Some(McpFollowUp::Attach {
-                    kind: tool,
-                    run_id: None,
-                }),
+                None | Some(Value::Null) if tool == "deploy" || tool == "reboot" => {
+                    Some(McpFollowUp::Attach {
+                        kind: kind.into(),
+                        run_id: None,
+                    })
+                }
+                None | Some(Value::Null) => None,
                 Some(res) => {
                     if res.get("ok").and_then(Value::as_bool) == Some(true)
                         && let Some(run_id) = res
@@ -910,7 +919,7 @@ impl AppState {
                             .filter(|id| !id.is_empty())
                     {
                         Some(McpFollowUp::Attach {
-                            kind: tool,
+                            kind: kind.into(),
                             run_id: Some(run_id.to_string()),
                         })
                     } else {

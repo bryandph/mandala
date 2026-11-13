@@ -104,9 +104,16 @@ target in that run. The equivalent CLI option is
 by `mandala tui deploy`. Cancellation and profile-resolution errors always stop
 the run before deployment.
 
+Deployment campaigns are an explicit opt-in lifecycle beside ordinary runs.
+Real creation binds a frozen source/target and starts the first attempt in one
+operation; an explicit preview binds without host effects. Failed/pending retry,
+persistent exclusions, reboot and final verification all use the bound target.
+See [deployment campaigns](docs/deployment-campaigns.md) for confirmation,
+source-movement refusal, the retention-writer upgrade gate and CLI/TUI/MCP usage.
+
 ### MCP operator note: harness allowlists
 
-The mutating MCP tools (`deploy`, `reboot`, `restart_service`) carry their
+The legacy mutating MCP tools (`deploy`, `reboot`, `restart_service`) carry their
 own confirm gate — the call must name the resolved `--limit` target or it
 refuses without running — so they are safe candidates for a harness
 allowlist (e.g. `mcp__mandala__restart_service` in Claude Code permission

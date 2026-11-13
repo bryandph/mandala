@@ -218,8 +218,10 @@ impl Cli {
                             .action(ArgAction::SetTrue)
                             .help("Run the read-only state survey (mandala.fleet.state) first"),
                     )
+                    .arg(Arg::new("campaign").long("campaign").help("Compare bound-campaign and latest-source expectations separately"))
                     .arg(json_flag()),
             )
+            .subcommand(crate::campaign::cli::command())
             .subcommand(Command::new("version").about("Print the CLI version"))
             .subcommand(Command::new("mcp").about("Run the fleet MCP server over stdio (headless)"))
             .subcommand(
@@ -328,7 +330,11 @@ impl Cli {
             Some(("members", m)) => with_inventory(&flake, |inv| run_members(inv, m)),
             Some(("groups", m)) => with_inventory(&flake, |inv| run_groups(inv, m)),
             Some(("resolve", m)) => with_inventory(&flake, |inv| run_resolve(inv, m)),
+            Some(("drift", m)) if m.get_one::<String>("campaign").is_some() => {
+                crate::campaign::cli::run_drift(&flake, m)
+            }
             Some(("drift", m)) => with_inventory(&flake, |inv| run_drift(inv, &flake, m)),
+            Some(("campaign", m)) => crate::campaign::cli::run(&flake, m),
             Some(("version", _)) => {
                 println!("{VERSION}");
                 ExitCode::SUCCESS
@@ -1108,7 +1114,7 @@ mod tests {
         // The fleet-cli spec: the public binary stands alone with zero engines.
         let _g = seam();
         let cli = Cli::new();
-        assert_eq!(cli.root_command().get_subcommands().count(), 7); // members/groups/resolve/drift/version/mcp/tui
+        assert_eq!(cli.root_command().get_subcommands().count(), 8); // members/groups/resolve/drift/campaign/version/mcp/tui
         assert_eq!(
             Cli::new().run_from(["mandala", "members", "--json"]),
             ExitCode::SUCCESS

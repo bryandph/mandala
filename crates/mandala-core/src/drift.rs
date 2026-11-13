@@ -157,11 +157,14 @@ pub enum DriftStatus {
     /// judged against it (other members still evaluated).
     #[serde(rename = "eval-failed")]
     EvalFailed,
+    /// No usable expectation exists; absence never proves equality.
+    #[serde(rename = "expectation-unknown")]
+    ExpectationUnknown,
 }
 
 impl DriftStatus {
     /// Every status, for exhaustive iteration (the parity of `set(DriftStatus)`).
-    pub const ALL: [DriftStatus; 9] = [
+    pub const ALL: [DriftStatus; 10] = [
         DriftStatus::InSync,
         DriftStatus::Drift,
         DriftStatus::RebootPending,
@@ -171,6 +174,7 @@ impl DriftStatus {
         DriftStatus::NoSnapshot,
         DriftStatus::Unreachable,
         DriftStatus::EvalFailed,
+        DriftStatus::ExpectationUnknown,
     ];
 
     /// The stable string value (what the MCP `drift` tool surfaces).
@@ -186,6 +190,7 @@ impl DriftStatus {
             DriftStatus::NoSnapshot => "no-snapshot",
             DriftStatus::Unreachable => "unreachable",
             DriftStatus::EvalFailed => "eval-failed",
+            DriftStatus::ExpectationUnknown => "expectation-unknown",
         }
     }
 
@@ -206,6 +211,7 @@ impl DriftStatus {
             DriftStatus::NoSnapshot => "dim",
             DriftStatus::Unreachable => "magenta",
             DriftStatus::EvalFailed => "red",
+            DriftStatus::ExpectationUnknown => "dim yellow",
         }
     }
 }
@@ -676,6 +682,8 @@ pub fn compare(
             DriftStatus::Stale
         } else if eval_error.is_some() {
             DriftStatus::EvalFailed
+        } else if exp.is_none() {
+            DriftStatus::ExpectationUnknown
         } else if exp.is_some() && current != exp && system_profile == exp {
             DriftStatus::RebootPending
         } else if exp.is_some() && current != exp {
@@ -1289,6 +1297,7 @@ mod tests {
             ("no-snapshot", "dim"),
             ("unreachable", "magenta"),
             ("eval-failed", "red"),
+            ("expectation-unknown", "dim yellow"),
         ]);
         for status in DriftStatus::ALL {
             assert_eq!(expected.get(status.as_str()), Some(&status.style()));

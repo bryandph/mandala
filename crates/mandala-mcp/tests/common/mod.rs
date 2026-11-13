@@ -63,6 +63,8 @@ pub enum CommandFake {
 
 #[derive(Default)]
 pub struct FakeEffects {
+    pub campaign_result: Option<Value>,
+    pub campaign_calls: Mutex<Vec<(String, Value)>>,
     /// `subprocess.run` stand-in for ping / restart_service.
     pub adhoc: Option<Result<AdhocOutput, AdhocError>>,
     /// `drift.eval_expected` stand-in.
@@ -90,6 +92,15 @@ pub fn epoch_f64() -> f64 {
 
 #[async_trait]
 impl Effects for FakeEffects {
+    async fn campaign(&self, _flake: &str, operation: &str, args: Value) -> io::Result<Value> {
+        self.campaign_calls
+            .lock()
+            .unwrap()
+            .push((operation.into(), args));
+        self.campaign_result
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "unexpected campaign effect"))
+    }
     async fn fresh_inventory(&self, _flake: &str) -> Result<Inventory, InventoryError> {
         let value = self
             .fresh
