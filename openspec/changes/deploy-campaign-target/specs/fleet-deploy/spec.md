@@ -1,7 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: Immutable campaign target before host effects
-An opt-in deployment campaign SHALL bind a frozen, content-identified source graph, exact selected membership, intended per-host profile and system-toplevel paths, captured execution settings, effective activation modes and explicit exclusions before any host effects. Source identity SHALL include revision when available, dirty content identity and resolved nested input/submodule identity; a revision or dirty boolean alone MUST NOT establish equality. Inconsistent capture or an unresolved intended output SHALL refuse binding and launch no deployment.
+An opt-in deployment campaign SHALL bind a frozen, content-identified source graph, exact selected membership, intended per-host profile and system-toplevel paths, captured execution settings, effective activation modes and explicit exclusions before any host effects. Source identity SHALL include revision when available, dirty content identity and resolved nested input/submodule identity; a revision or dirty boolean alone MUST NOT establish equality. Inconsistent capture or an unresolved intended output SHALL refuse binding and launch no deployment. Real campaign creation SHALL bind the target and start the first deployment attempt in one operation, subject to the same real-mutation confirmation gate as deploy runs and dispatch revalidation of source identity, target digest, exact eligible names and campaign generation. The target and prepared attempt/run link SHALL be durable before host effects. An explicit dry creation preview SHALL bind and display the target without an attempt or host effects, leaving real work pending for retry.
+
+#### Scenario: confirmed creation deploys in one step
+- **WHEN** a valid target is captured and real creation is confirmed for its exact eligible members
+- **THEN** creation binds that target and starts its first deployment attempt without requiring a separate retry operation
+
+#### Scenario: dry creation preview leaves work pending
+- **WHEN** creation is requested as a dry preview
+- **THEN** it binds and displays the target without an attempt or host effects and does not mark any member successfully deployed
 
 #### Scenario: source changes during capture
 - **WHEN** source content changes between snapshot capture and target binding

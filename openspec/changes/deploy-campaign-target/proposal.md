@@ -10,7 +10,7 @@ A deployment can outlive the checkout state that selected it. Today the native e
 - Persist a versioned campaign record separately from existing run directories, with additive attempt references in run metadata and durable, explicitly versioned exclusion updates.
 - Retry only failed or pending eligible members against the original target; retain successful outcomes without reactivation. Report source changes and require a new campaign rather than silently evaluating a replacement target.
 - Apply campaign exclusions consistently to deploy, retry, reboot and final verification, and distinguish successful deployment, reboot-pending, verification, and administrative closure.
-- Expose campaign creation, inspection, retry and close consistently in CLI, TUI and MCP without replacing existing run interfaces.
+- Expose campaign creation, inspection, retry and close consistently in CLI, TUI and MCP without replacing existing run interfaces. Real creation binds and starts the first deployment attempt in one step with normal real-mutation confirmation; an explicit dry creation preview binds and displays the target without host effects.
 - Present current-versus-campaign and current-versus-latest-source drift separately; absent expectations never mean clean.
 
 ## Capabilities

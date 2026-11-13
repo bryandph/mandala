@@ -1,6 +1,6 @@
 ## 1. Review and additive protocol
 
-- [ ] 1.1 Obtain explicit plan approval, including source-change refusal, open-campaign retention and bind-only creation; separately authorize implementation. This docs change does not satisfy that gate.
+- [x] 1.1 Record the settled decisions: refuse new mutating continuations on source change and require a new campaign; protect open campaigns' targets until close; create-and-deploy in one step with normal real-mutation confirmation and an explicit dry creation preview. These choices are approved; implementation remains separately gated and is not authorized by this docs change.
 - [ ] 1.2 Add version-1 campaign target/manifest types, confined identifiers and atomic sorted serialization without altering existing run/event versions. Add legacy/new/future/corrupt golden fixtures and reader judgments.
 - [ ] 1.3 Add interprocess locking, generation-checked exclusion/lifecycle transitions and prepared-attempt reconciliation. Test concurrent dispatch/update/close, unknown ownership and restart without duplicate effects.
 - [ ] 1.4 Extend retention additively to protect open campaigns, linked runs and GC roots; prune closed groups only when inactive. Test count/age limits, live supervisors, partial allocation and missing manifests; prohibit mixed old retention writers while campaigns are enabled.
@@ -9,7 +9,7 @@
 
 - [ ] 2.1 Capture effective Nix source content, root dirty state, recursive resolved inputs and submodule actual/gitlink/dirty identities into rooted snapshots. Refuse uncaptured impurity and inconsistent capture; test equal revisions with distinct dirty contents.
 - [ ] 2.2 Resolve frozen inventory membership, reasoned selector exclusions, settings, profile derivation/output and system-toplevel paths before binding. Test zero eligible members, non-deploy capability skips, unknown outputs and profile/system correspondence.
-- [ ] 2.3 Add initial pending/failed retry selection and exact-path realization using recorded identities. Preserve successful outcomes and historical run failures, best-effort recovery, per-host rollback, termination and existing publish order; dry previews leave real work pending.
+- [ ] 2.3 Add create-and-deploy first-attempt dispatch after durable binding/linkage, plus failed/pending retry selection and exact-path realization using recorded identities. Test first-attempt confirmation refusal and dry creation preview binding without an attempt or host effects. Preserve successful outcomes and historical run failures, best-effort recovery, per-host rollback, termination and existing publish order; dry previews leave real work pending.
 - [ ] 2.4 Barrier-test source movement during capture and after binding, nested local-input content changes and moved recursive submodule pointers without root revision movement. Assert no effects on failed capture, no live-source reevaluation on retry, and explicit new-campaign refusal on source mismatch/unavailability.
 - [ ] 2.5 Test partial build/activation failures and retry: only failed/pending eligible members execute; confirmed and reboot-pending siblings receive no copy or activation; missing rooted outputs never trigger a replacement target.
 
@@ -23,8 +23,8 @@
 
 - [ ] 4.1 Add shared expectation-unknown judgment and independent campaign/latest-source comparison projections. Test missing/corrupt/stale/dirty-ambiguous/identity-incomplete caches, partial evaluation, unsupported campaign schema and no expectation ever reported clean.
 - [ ] 4.2 Test staged profile versus current, boot-critical differences, missing boot facts, profile-wrapper/system-toplevel distinction and latest-source movement without campaign mutation.
-- [ ] 4.3 Add CLI lifecycle/JSON and TUI campaign list/detail/dialogs with run links. Keep existing deploy commands, runs/attach and unqualified tool fields compatible; test exact names, reasons, source movement and explicit action review.
-- [ ] 4.4 Add MCP lifecycle tools and optional campaign drift view with shared confirmation/generation checks, confined identifiers, paginated detail and audit. Test old tool-call replay, dry default, required_confirm refusals and bounded run status.
+- [ ] 4.3 Add CLI lifecycle/JSON and TUI campaign list/detail/dialogs with run links. Keep existing deploy commands, runs/attach and unqualified tool fields compatible; test create-and-deploy, creation preview, exact names, reasons, source movement and explicit action review.
+- [ ] 4.4 Add MCP lifecycle tools and optional campaign drift view with shared confirmation/generation checks, confined identifiers, paginated detail and audit. Test old tool-call replay, real create-and-deploy, dry creation preview without an attempt, unchanged retry dry default, creation/retry required_confirm refusals and bounded run status.
 - [ ] 4.5 Route context followers and standalone CLI through the same policy and durable locks. Test reload isolation, leadership loss, source-keyed evaluator behavior and no automatic mutation replay.
 
 ## 5. Verification and delivery gates
