@@ -29,7 +29,9 @@
 
 ## 5. Verification and delivery gates
 
+Evidence, platform coverage and named regression properties are recorded in [verification.md](verification.md).
+
 - [x] 5.1 Run effect-isolated Rust unit/integration tests with temporary Git repositories, fake source graphs and stub Nix/SSH/survey/reboot executables, never a live fleet. Gate serialization bytes and eligibility/projection judgments across CLI/TUI/MCP.
-- [ ] 5.2 Run `nix build .#checks.<system>.fake-fleet` and `nix build .#packages.<system>.mandala-rs` for supported systems from `flake.nix`; retain source-race and partial-failure traces proving no unnecessary reactivation.
-- [ ] 5.3 Run `nix fmt -- --check .` and `nix flake check`; check organization-neutral fixtures and review all OpenSpec deltas before any implementation merge.
+- [x] 5.2 Run `nix build .#checks.<system>.fake-fleet` and `nix build .#packages.<system>.mandala-rs` for supported systems from `flake.nix`; retain source-race and partial-failure traces proving no unnecessary reactivation.
+- [x] 5.3 Run `nix fmt -- --check .` and `nix flake check`; check organization-neutral fixtures and review all OpenSpec deltas before any implementation merge.
 - [ ] 5.4 Document rollout/upgrade ordering for retention writers and frontend compatibility; obtain separate approval before switching consumers. Upgrade ordering is documented in `docs/deployment-campaigns.md`; no consumer switch or canonical-spec synchronization is performed here. Synchronize canonical specs only at archive.
