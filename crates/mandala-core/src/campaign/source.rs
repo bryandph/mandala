@@ -7,6 +7,7 @@ use super::*;
 use crate::engines::deploy;
 use crate::inventory::Inventory;
 use std::process::Command;
+mod relative;
 
 fn output(program: &str, args: &[String]) -> io::Result<Vec<u8>> {
     let mut pinned_args;
@@ -42,6 +43,24 @@ fn nix(args: &[&str]) -> io::Result<Value> {
         &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
     )?;
     serde_json::from_slice(&bytes).map_err(invalid_json)
+}
+
+fn source_revision(value: &Value) -> Option<String> {
+    value["revision"]
+        .as_str()
+        .or_else(|| value["rev"].as_str())
+        .or_else(|| {
+            value["dirtyRevision"]
+                .as_str()
+                .and_then(|value| value.strip_suffix("-dirty"))
+        })
+        .or_else(|| {
+            value["dirtyRev"]
+                .as_str()
+                .and_then(|value| value.strip_suffix("-dirty"))
+        })
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn nar_identity(path: &str, revision: Option<String>) -> io::Result<SourceNode> {
@@ -137,6 +156,25 @@ fn resolve_input<'a>(
     Ok(id)
 }
 
+fn is_relative(node: &Value) -> bool {
+    node["locked"]["type"].as_str() == Some("path")
+        && node["locked"]["path"]
+            .as_str()
+            .is_some_and(|path| !path.starts_with('/'))
+}
+
+fn store_root(path: &str) -> io::Result<String> {
+    let name = path
+        .strip_prefix("/nix/store/")
+        .and_then(|path| path.split('/').next())
+        .ok_or_else(|| invalid("archive path outside the store"))?;
+    let path = format!("/nix/store/{name}");
+    if !store_path(&path) {
+        return Err(invalid("invalid archived store root"));
+    }
+    Ok(path)
+}
+
 fn archived_nodes(locks: &Value, archive: &Value) -> io::Result<BTreeMap<String, String>> {
     fn visit(
         locks: &Value,
@@ -144,10 +182,16 @@ fn archived_nodes(locks: &Value, archive: &Value) -> io::Result<BTreeMap<String,
         archive: &Value,
         found: &mut BTreeMap<String, String>,
     ) -> io::Result<()> {
-        let path = archive["path"]
-            .as_str()
-            .ok_or_else(|| invalid("archive path absent"))?;
-        if let Some(prior) = found.insert(id.into(), path.into()) {
+        let path = if is_relative(&locks["nodes"][id]) {
+            String::new()
+        } else {
+            store_root(
+                archive["path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("archive path absent"))?,
+            )?
+        };
+        if let Some(prior) = found.insert(id.into(), path.clone()) {
             if prior != path {
                 return Err(invalid(
                     "one input resolved to inconsistent archived content",
@@ -185,6 +229,7 @@ fn archived_nodes(locks: &Value, archive: &Value) -> io::Result<BTreeMap<String,
             return Err(invalid("locked input has no archived identity"));
         }
     }
+    found.retain(|id, _| !is_relative(&locks["nodes"][id]));
     Ok(found)
 }
 
@@ -240,32 +285,6 @@ fn input_identities(
     Ok(out)
 }
 
-fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    let mapped = tests::mapped_source(from);
-    #[cfg(test)]
-    let from = mapped.as_deref().unwrap_or(from);
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let destination = to.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_tree(&entry.path(), &destination)?;
-        } else if kind.is_file() {
-            std::fs::copy(entry.path(), destination)?;
-        } else if kind.is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, destination)?;
-            #[cfg(not(unix))]
-            return Err(invalid("campaign source symlinks require Unix"));
-        } else {
-            return Err(invalid("unsupported source entry"));
-        }
-    }
-    Ok(())
-}
-
 fn archive(flake: &str) -> io::Result<(Value, Value)> {
     let metadata = nix(&[
         "flake",
@@ -283,7 +302,15 @@ fn archive(flake: &str) -> io::Result<(Value, Value)> {
         "--no-write-lock-file",
         flake,
     ])?;
-    if metadata["path"] != archived["path"] {
+    if store_root(
+        metadata["path"]
+            .as_str()
+            .ok_or_else(|| invalid("source metadata path absent"))?,
+    )? != store_root(
+        archived["path"]
+            .as_str()
+            .ok_or_else(|| invalid("source archive path absent"))?,
+    )? {
         return Err(invalid(
             "source changed during capture; create a new campaign",
         ));
@@ -414,7 +441,7 @@ fn submodule_identities(
     if let Some(checkout) = &local {
         capture_submodules(
             checkout,
-            Path::new(&paths[root_id]),
+            Path::new(&store_root(&paths[root_id])?),
             "",
             roots,
             &mut submodules,
@@ -450,17 +477,46 @@ fn submodule_identities(
     Ok(submodules)
 }
 
+#[derive(Debug)]
 struct TempRoots(PathBuf);
 impl Drop for TempRoots {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+fn claim_capture_dir(base: &Path) -> io::Result<TempRoots> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    reject_symlink(base)?;
+    std::fs::create_dir_all(base)?;
+    loop {
+        let path = base.join(format!(
+            "{}-{}-{}",
+            Utc::now().format("%Y%m%dT%H%M%S_%9f"),
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(TempRoots(path));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct FrozenSource {
     source: SourceIdentity,
     roots: TempRoots,
     metadata: Value,
     archived: Value,
+    paths: BTreeMap<String, String>,
 }
 fn capture_state_dir() -> PathBuf {
     #[cfg(test)]
@@ -470,59 +526,309 @@ fn capture_state_dir() -> PathBuf {
     drift::state_dir()
 }
 
-fn freeze_source(flake: &str) -> io::Result<FrozenSource> {
-    // Refuse credentials rather than accidentally persisting them in
-    // provenance or diagnostics. Authentication belongs in fetcher config.
-    if flake.contains("token=")
-        || flake.contains("password=")
-        || flake.split_once("://").is_some_and(|(_, rest)| {
-            rest.split('/').next().is_some_and(|authority| {
-                authority
-                    .split_once('@')
-                    .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+fn safe_reference(reference: &str) -> bool {
+    if reference.split_once("://").is_some_and(|(_, rest)| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    }) {
+        return false;
+    }
+    // Keep only known Nix identity/selection query keys in durable provenance.
+    // Opaque download/auth queries can be credentials even without 'token'
+    // in their name; authentication belongs in the fetcher's configuration.
+    reference.split_once('?').is_none_or(|(_, query)| {
+        query
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split('&')
+            .all(|part| {
+                let key = part.split('=').next().unwrap_or("").to_ascii_lowercase();
+                matches!(
+                    key.as_str(),
+                    "rev"
+                        | "ref"
+                        | "narhash"
+                        | "dir"
+                        | "shallow"
+                        | "submodules"
+                        | "allrefs"
+                        | "lfs"
+                        | "lastmodified"
+                        | "revcount"
+                )
             })
-        })
+    })
+}
+
+fn supported_nix() -> io::Result<()> {
+    let version = String::from_utf8(output("nix", &["--version".into()])?)
+        .map_err(|error| invalid(error.to_string()))?;
+    if !version
+        .split_whitespace()
+        .any(|word| word.starts_with("2.34."))
     {
         return Err(invalid(
-            "campaign source references must not contain credentials",
+            "campaign capture requires supported Nix 2.34.x sourceInfo replay; refusing to degrade source semantics",
         ));
     }
-    let (metadata, archived) = archive(flake)?;
-    let temporary = TempRoots(capture_state_dir().join("campaign-captures").join(format!(
-        "{}-{}",
-        Utc::now().format("%Y%m%dT%H%M%S_%9f"),
-        std::process::id()
-    )));
-    std::fs::create_dir_all(&temporary.0)?;
+    Ok(())
+}
+
+fn fetched_info(parameters: &Value, archived: &str, parameter_file: &Path) -> io::Result<Value> {
+    std::fs::write(parameter_file, canonical(parameters)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parameter_file, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let quoted = serde_json::to_string(&parameter_file.display().to_string())
+        .map_err(invalid_json)?
+        .replace("${", "\\${");
+    let expression = format!(
+        "let locked = builtins.fromJSON (builtins.readFile {quoted}); tree = builtins.fetchTree (builtins.removeAttrs locked [ \"dir\" \"__final\" ]); in {{ path = toString tree.outPath; metadata = builtins.removeAttrs tree [ \"outPath\" ]; }}"
+    );
+    let info = nix(&["eval", "--impure", "--json", "--expr", &expression])?;
+    let path = info["path"]
+        .as_str()
+        .ok_or_else(|| invalid("fetched sourceInfo path absent"))?;
+    let identity = nar_identity(path, source_revision(&info["metadata"]))?;
+    let archived = nar_identity(archived, None)?;
+    if !info["metadata"].is_object()
+        || info["metadata"]["narHash"].as_str() != Some(identity.content_digest.as_str())
+        || identity.content_digest != archived.content_digest
+    {
+        return Err(invalid(
+            "source changed or incomplete fetcher metadata during capture",
+        ));
+    }
+    Ok(info)
+}
+
+struct CapturedGraph {
+    manifest: Value,
+    trees: BTreeMap<String, SourceNode>,
+    paths: BTreeMap<String, String>,
+}
+
+fn captured_graph(metadata: &Value, archived: &Value, roots: &Path) -> io::Result<CapturedGraph> {
     let locks = &metadata["locks"];
-    let paths = archived_nodes(locks, &archived)?;
     let root_id = locks["root"]
         .as_str()
         .ok_or_else(|| invalid("lock root absent"))?;
-    let mut nodes = BTreeMap::new();
-    for (index, (id, path)) in paths.iter().enumerate() {
-        root(
-            path,
-            &temporary.0.join("roots").join(format!("source-{index}")),
+    let archived_paths = archived_nodes(locks, archived)?;
+    let entries = locks["nodes"]
+        .as_object()
+        .ok_or_else(|| invalid("lock nodes absent"))?;
+    let mut sources = BTreeMap::new();
+    for (index, (id, node)) in entries.iter().enumerate() {
+        if is_relative(node) {
+            continue;
+        }
+        let parameters = if id == root_id {
+            metadata["locked"].clone()
+        } else {
+            let mut parameters = node["info"].as_object().cloned().unwrap_or_default();
+            parameters.extend(
+                node["locked"]
+                    .as_object()
+                    .ok_or_else(|| invalid("lock node fetcher absent"))?
+                    .clone(),
+            );
+            Value::Object(parameters)
+        };
+        if !parameters.is_object() {
+            return Err(invalid("root fetcher metadata absent"));
+        }
+        let archived = archived_paths
+            .get(id)
+            .ok_or_else(|| invalid("archived node identity absent"))?;
+        root(archived, &roots.join(format!("archive-{index}")))?;
+        let info = fetched_info(
+            &parameters,
+            archived,
+            &roots
+                .parent()
+                .unwrap()
+                .join(format!("fetcher-{index}.json")),
         )?;
-        let revision = metadata["locks"]["nodes"][id]["locked"]["rev"]
-            .as_str()
-            .map(str::to_string);
-        nodes.insert(id.clone(), nar_identity(path, revision)?);
+        let path = info["path"].as_str().unwrap();
+        root(path, &roots.join(format!("source-{index}")))?;
+        sources.insert(id.clone(), info);
     }
-    let mut frozen_lock = locks.clone();
-    for (id, node) in &nodes {
-        if id != root_id {
-            frozen_lock["nodes"][id]["locked"] = serde_json::json!({"type":"path", "path":node.store_path, "narHash":node.content_digest});
+    // Nix 2.34 suppresses root revision fields when --no-write-lock-file
+    // leaves an effective lock update unwritten (flake.forceDirty).
+    let root_info = sources
+        .get_mut(root_id)
+        .ok_or_else(|| invalid("root sourceInfo absent"))?;
+    root_info["fetcher_metadata"] = root_info["metadata"].clone();
+    let root_dir = metadata["locked"]["dir"].as_str().unwrap_or("");
+    let old_lock = Path::new(root_info["path"].as_str().unwrap())
+        .join(root_dir)
+        .join("flake.lock");
+    let force_dirty = match std::fs::read(&old_lock) {
+        Ok(bytes) => {
+            let mut old: Value = serde_json::from_slice(&bytes).map_err(invalid_json)?;
+            let mut new = locks.clone();
+            // Encoding-version changes alone do not change the parsed graph.
+            old.as_object_mut()
+                .ok_or_else(|| invalid("invalid original lock file"))?
+                .remove("version");
+            new.as_object_mut().unwrap().remove("version");
+            old != new
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            entries.len() != 1
+                || entries[root_id]["inputs"]
+                    .as_object()
+                    .is_some_and(|inputs| !inputs.is_empty())
+        }
+        Err(error) => return Err(error),
+    };
+    if force_dirty {
+        for key in ["rev", "shortRev", "revCount"] {
+            root_info["metadata"].as_object_mut().unwrap().remove(key);
         }
     }
-    let tree = temporary.0.join("source");
-    copy_tree(Path::new(&paths[root_id]), &tree)?;
-    let lock_file = tree.join("flake.lock");
-    if lock_file.exists() {
-        std::fs::remove_file(&lock_file)?;
+    let mut graph_nodes = serde_json::Map::new();
+    for (id, node) in entries {
+        let inputs = node["inputs"]
+            .as_object()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .map(|(name, edge)| {
+                        Ok((
+                            name.clone(),
+                            Value::from(resolve_input(locks, edge, &mut BTreeSet::new())?),
+                        ))
+                    })
+                    .collect::<io::Result<serde_json::Map<_, _>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let relative = is_relative(node);
+        let parent = if relative {
+            Some(resolve_input(locks, &node["parent"], &mut BTreeSet::new())?.to_string())
+        } else {
+            None
+        };
+        let dir = if id == root_id {
+            metadata["locked"]["dir"].as_str().unwrap_or("")
+        } else {
+            node["locked"]["dir"].as_str().unwrap_or("")
+        };
+        graph_nodes.insert(
+            id.clone(),
+            serde_json::json!({
+                "inputs":inputs,"flake":node["flake"].as_bool().unwrap_or(true),
+                "relative":if relative{node["locked"]["path"].clone()}else{Value::Null},
+                "parent":parent,"dir":dir,"source":sources.get(id),"relative_override":null,"relative_dir":"",
+            }),
+        );
     }
-    std::fs::write(lock_file, canonical(&frozen_lock)?)?;
+    let mut graph = serde_json::json!({"schema_version":1,"root":root_id,"nodes":graph_nodes});
+    fn source<'a>(
+        id: &str,
+        graph: &'a Value,
+        seen: &mut BTreeSet<String>,
+    ) -> io::Result<&'a Value> {
+        if !seen.insert(id.into()) {
+            return Err(invalid("cyclic relative source parent"));
+        }
+        let node = &graph["nodes"][id];
+        if node["relative"].is_null() {
+            Ok(&node["source"])
+        } else {
+            source(
+                node["parent"]
+                    .as_str()
+                    .ok_or_else(|| invalid("relative input parent absent"))?,
+                graph,
+                seen,
+            )
+        }
+    }
+    fn flake_path(id: &str, graph: &Value, seen: &mut BTreeSet<String>) -> io::Result<PathBuf> {
+        if !seen.insert(id.into()) {
+            return Err(invalid("cyclic relative input path"));
+        }
+        let node = &graph["nodes"][id];
+        let path = if let Some(relative) = node["relative"].as_str() {
+            flake_path(node["parent"].as_str().unwrap(), graph, seen)?.join(relative)
+        } else {
+            PathBuf::from(
+                node["source"]["path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("source path absent"))?,
+            )
+            .join(node["dir"].as_str().unwrap_or(""))
+        };
+        Ok(path)
+    }
+    let mut identities = BTreeMap::new();
+    let mut paths = BTreeMap::new();
+    for id in entries.keys() {
+        let info = source(id, &graph, &mut BTreeSet::new())?;
+        identities.insert(
+            id.clone(),
+            SourceNode {
+                store_path: info["path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("incomplete sourceInfo"))?
+                    .into(),
+                content_digest: info["metadata"]["narHash"]
+                    .as_str()
+                    .ok_or_else(|| invalid("incomplete source Nar identity"))?
+                    .into(),
+                revision: source_revision(&info["fetcher_metadata"])
+                    .or_else(|| source_revision(&info["metadata"])),
+            },
+        );
+        let path = relative::bounded_path(
+            &flake_path(id, &graph, &mut BTreeSet::new())?,
+            Path::new(info["path"].as_str().unwrap()),
+        )?;
+        paths.insert(id.clone(), path.display().to_string());
+    }
+    relative::annotate(&mut graph, locks, &identities, &paths)?;
+    Ok(CapturedGraph {
+        manifest: graph,
+        trees: identities,
+        paths,
+    })
+}
+
+fn freeze_source(flake: &str) -> io::Result<FrozenSource> {
+    if !safe_reference(flake) {
+        return Err(invalid(
+            "campaign source references require credential-free identity/selection parameters; configure authentication separately",
+        ));
+    }
+    supported_nix()?;
+    let (metadata, archived) = archive(flake)?;
+    let temporary = claim_capture_dir(&capture_state_dir().join("campaign-captures"))?;
+    let CapturedGraph {
+        manifest: graph,
+        trees: nodes,
+        paths,
+    } = captured_graph(&metadata, &archived, &temporary.0.join("roots"))?;
+    let root_id = metadata["locks"]["root"].as_str().unwrap();
+    let submodules = submodule_identities(
+        flake,
+        &metadata["locks"],
+        &paths,
+        &temporary.0.join("roots"),
+    )?;
+    let capsule = temporary.0.join("source");
+    std::fs::create_dir_all(&capsule)?;
+    std::fs::write(capsule.join("graph.json"), canonical(&graph)?)?;
+    std::fs::write(capsule.join("replay.nix"), include_str!("replay.nix"))?;
+    std::fs::write(
+        capsule.join("flake.nix"),
+        "{ outputs = _: import ./replay.nix (builtins.fromJSON (builtins.readFile ./graph.json)); }\n",
+    )?;
     let frozen_path = String::from_utf8(output(
         "nix",
         &[
@@ -530,36 +836,44 @@ fn freeze_source(flake: &str) -> io::Result<FrozenSource> {
             "add-path".into(),
             "--name".into(),
             "campaign-source".into(),
-            tree.display().to_string(),
+            capsule.display().to_string(),
         ],
     )?)
     .map_err(|error| invalid(error.to_string()))?
     .trim()
     .to_string();
     root(&frozen_path, &temporary.0.join("roots/frozen"))?;
-    let revision = metadata["revision"].as_str().map(str::to_string);
+    let revision = nodes[root_id].revision.clone();
     let local = local_checkout(flake);
-    let submodules = submodule_identities(flake, locks, &paths, &temporary.0.join("roots"))?;
     let source = SourceIdentity {
         checkout: if flake.contains('?') || flake.starts_with("git+") || flake.starts_with("path:")
         {
-            flake.to_string()
+            flake.into()
         } else {
-            local.map_or_else(|| flake.to_string(), |path| path.display().to_string())
+            local.map_or_else(|| flake.into(), |path| path.display().to_string())
         },
         revision: revision.clone(),
-        dirty: metadata.get("dirtyRevision").is_some(),
+        dirty: graph["nodes"][root_id]["source"]["metadata"]["dirtyRev"]
+            .as_str()
+            .is_some(),
+        root: nodes[root_id].clone(),
+        graph_digest: digest(&canonical(&graph)?),
         snapshot: nar_identity(&frozen_path, revision)?,
-        lock_digest: digest(&canonical(locks)?),
-        inputs: input_identities(locks, &nodes)?,
+        lock_digest: digest(&canonical(&metadata["locks"])?),
+        inputs: input_identities(&metadata["locks"], &nodes)?,
         submodules,
     };
-
     let (after_metadata, after_archive) = archive(flake)?;
-    if archived != after_archive
+    if metadata["locked"] != after_metadata["locked"]
         || metadata["locks"] != after_metadata["locks"]
+        || archived != after_archive
         || source.submodules
-            != submodule_identities(flake, locks, &paths, &temporary.0.join("checked-initial"))?
+            != submodule_identities(
+                flake,
+                &metadata["locks"],
+                &paths,
+                &temporary.0.join("checked-initial"),
+            )?
     {
         return Err(invalid("source changed during capture; no campaign bound"));
     }
@@ -568,6 +882,7 @@ fn freeze_source(flake: &str) -> io::Result<FrozenSource> {
         roots: temporary,
         metadata,
         archived,
+        paths,
     })
 }
 
@@ -576,9 +891,181 @@ pub fn observe(flake: &str) -> io::Result<SourceIdentity> {
     Ok(freeze_source(flake)?.source.clone())
 }
 
+pub fn available(target: &Target) -> io::Result<()> {
+    let mut paths = BTreeSet::from([
+        target.source.snapshot.store_path.clone(),
+        target.source.root.store_path.clone(),
+    ]);
+    paths.extend(
+        target
+            .source
+            .inputs
+            .values()
+            .map(|node| node.store_path.clone()),
+    );
+    paths.extend(
+        target
+            .source
+            .submodules
+            .values()
+            .map(|module| module.content.store_path.clone()),
+    );
+    paths.extend(
+        target
+            .hosts
+            .values()
+            .flat_map(|host| [host.derivation.clone(), host.system_derivation.clone()]),
+    );
+    let mut args = vec!["path-info".into(), "--json".into()];
+    args.extend(paths);
+    output("nix", &args).map(|_| ()).map_err(|error| {
+        invalid(format!(
+            "campaign target-unavailable; no replacement target evaluated: {error}"
+        ))
+    })
+}
+
+pub fn bound_inventory(source: &SourceIdentity) -> io::Result<Inventory> {
+    source.validate()?;
+    let reference = format!("path:{}#mandala", source.snapshot.store_path);
+    Inventory::from_value(nix(&[
+        "eval",
+        "--json",
+        "--no-write-lock-file",
+        &reference,
+    ])?)
+    .map_err(|error| invalid(error.to_string()))
+}
+
+/// A rooted read-only evaluation snapshot, independent of a warm context.
+pub struct ReadSource(FrozenSource);
+impl ReadSource {
+    pub fn capture(flake: &str) -> io::Result<Self> {
+        Ok(Self(freeze_source(flake)?))
+    }
+    pub fn identity(&self) -> &SourceIdentity {
+        &self.0.source
+    }
+    pub fn expected(&self, names: &[String]) -> crate::drift::Toplevels {
+        let mut out = crate::drift::Toplevels::default();
+        for name in names {
+            if !inventory::is_valid_member_name(name) {
+                out.errors
+                    .insert(name.clone(), "invalid member name".into());
+                continue;
+            }
+            let reference = format!(
+                "path:{}#nixosConfigurations.{name}.config.system.build.toplevel.outPath",
+                self.0.source.snapshot.store_path
+            );
+            match nix(&["eval", "--json", "--no-write-lock-file", &reference]) {
+                Ok(value) => match value.as_str().filter(|path| store_path(path)) {
+                    Some(path) => {
+                        out.paths.insert(name.clone(), path.into());
+                    }
+                    None => {
+                        out.errors
+                            .insert(name.clone(), "unknown system expectation".into());
+                    }
+                },
+                Err(error) => {
+                    out.errors.insert(name.clone(), error.to_string());
+                }
+            }
+        }
+        out
+    }
+}
+
+fn system_identities(
+    reference: &str,
+    names: &[String],
+) -> io::Result<BTreeMap<String, (String, String)>> {
+    if names.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let names = names
+        .iter()
+        .map(|name| serde_json::to_string(name).map_err(invalid_json))
+        .collect::<io::Result<Vec<_>>>()?
+        .join(" ");
+    let expression = format!(
+        "cfgs: builtins.listToAttrs (map (name: {{ inherit name; value = {{ path = cfgs.${{name}}.config.system.build.toplevel.outPath; drv = cfgs.${{name}}.config.system.build.toplevel.drvPath; }}; }}) [ {names} ])"
+    );
+    let value = nix(&[
+        "eval",
+        "--json",
+        "--no-write-lock-file",
+        &format!("{reference}#nixosConfigurations"),
+        "--apply",
+        &expression,
+    ])?;
+    value
+        .as_object()
+        .ok_or_else(|| invalid("system identity evaluation returned no map"))?
+        .iter()
+        .map(|(name, value)| {
+            let path = value["path"]
+                .as_str()
+                .filter(|path| store_path(path))
+                .ok_or_else(|| invalid(format!("unknown system expectation for {name}")))?;
+            let drv = value["drv"]
+                .as_str()
+                .filter(|path| store_path(path) && path.ends_with(".drv"))
+                .ok_or_else(|| invalid(format!("unknown system derivation for {name}")))?;
+            Ok((name.clone(), (path.into(), drv.into())))
+        })
+        .collect()
+}
+
+fn guard_live_derivations(flake: &str, hosts: &BTreeMap<String, HostTarget>) -> io::Result<()> {
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec![
+        "build".into(),
+        "--dry-run".into(),
+        "--json".into(),
+        "--no-write-lock-file".into(),
+    ];
+    args.extend(
+        hosts
+            .keys()
+            .map(|name| format!("{flake}#deploy.nodes.{name}.profiles.system.path")),
+    );
+    let profiles: Vec<Value> =
+        serde_json::from_slice(&output("nix", &args)?).map_err(invalid_json)?;
+    let systems = system_identities(flake, &hosts.keys().cloned().collect::<Vec<_>>())?;
+    let mut mismatches = Vec::new();
+    for (index, (name, host)) in hosts.iter().enumerate() {
+        if profiles
+            .get(index)
+            .and_then(|value| value["drvPath"].as_str())
+            != Some(host.derivation.as_str())
+            || systems.get(name).map(|(_, drv)| drv.as_str())
+                != Some(host.system_derivation.as_str())
+        {
+            mismatches.push(name.clone());
+        }
+    }
+    if profiles.len() != hosts.len() || !mismatches.is_empty() {
+        return Err(invalid(format!(
+            "campaign creation refused for {}: source evaluation depends on fetcher metadata the frozen graph can't reproduce (live/frozen profile or system drvPath mismatch)",
+            if mismatches.is_empty() {
+                hosts.keys().cloned().collect::<Vec<_>>().join(",")
+            } else {
+                mismatches.join(",")
+            }
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
 pub struct Capture {
     pub target: Target,
     pub plan: deploy::DeployPlan,
+    actor: String,
     frozen: FrozenSource,
 }
 
@@ -621,6 +1108,7 @@ impl Capture {
                 initial_exclusions: BTreeMap::new(),
             },
             plan: empty_plan,
+            actor: actor.into(),
             frozen,
         };
         let reference = format!("path:{frozen_path}");
@@ -649,20 +1137,7 @@ impl Capture {
                 },
                 Err(error) => return Err(invalid(error.to_string())),
             };
-        let mut systems = BTreeMap::new();
-        for name in &plan.targets {
-            let system_ref = format!(
-                "{reference}#nixosConfigurations.{name}.config.system.build.toplevel.outPath"
-            );
-            let system = nix(&["eval", "--json", "--no-write-lock-file", &system_ref])?;
-            systems.insert(
-                name.clone(),
-                system
-                    .as_str()
-                    .ok_or_else(|| invalid("unknown system expectation"))?
-                    .to_string(),
-            );
-        }
+        let systems = system_identities(&reference, &plan.targets)?;
         let installables: Vec<_> = plan
             .targets
             .iter()
@@ -698,29 +1173,17 @@ impl Capture {
             let profile = profile
                 .as_str()
                 .ok_or_else(|| invalid("unknown static profile output"))?;
-            let system = systems
+            let (system, system_drv) = systems
                 .get(name)
                 .ok_or_else(|| invalid("unknown system expectation"))?;
+            let system_drv = system_drv.clone();
             if profile != system {
-                let system_reference = format!(
-                    "{reference}#nixosConfigurations.{name}.config.system.build.toplevel.drvPath"
-                );
-                let system_drv = String::from_utf8(output(
-                    "nix",
-                    &[
-                        "eval".into(),
-                        "--raw".into(),
-                        "--no-write-lock-file".into(),
-                        system_reference,
-                    ],
-                )?)
-                .map_err(|error| invalid(error.to_string()))?;
                 let closure = String::from_utf8(output(
                     "nix-store",
                     &["--query".into(), "--requisites".into(), drv.into()],
                 )?)
                 .map_err(|error| invalid(error.to_string()))?;
-                if !closure.lines().any(|path| path == system_drv.trim()) {
+                if !closure.lines().any(|path| path == system_drv) {
                     return Err(invalid(
                         "profile wrapper does not reference the captured system derivation",
                     ));
@@ -735,6 +1198,15 @@ impl Capture {
                     .join("roots")
                     .join(format!("derivation-{index}")),
             )?;
+            root(
+                &system_drv,
+                &capture
+                    .frozen
+                    .roots
+                    .0
+                    .join("roots")
+                    .join(format!("system-derivation-{index}")),
+            )?;
             let activation = if boot || plan.settings[name]["activation"].as_str() == Some("boot") {
                 ActivationMode::Boot
             } else {
@@ -746,12 +1218,14 @@ impl Capture {
                     profile: profile.into(),
                     system_toplevel: system.clone(),
                     derivation: drv.into(),
+                    system_derivation: system_drv.clone(),
                     output: output_name.clone(),
                     settings: plan.settings[name].clone(),
                     activation,
                 },
             );
         }
+        guard_live_derivations(flake, &capture.target.hosts)?;
         capture.target.selection = Selection {
             selector: selector.into(),
             members,
@@ -789,12 +1263,13 @@ impl Capture {
         capture.plan = plan;
         let (after_metadata, after_archive) = archive(flake)?;
         if capture.frozen.archived != after_archive
+            || capture.frozen.metadata["locked"] != after_metadata["locked"]
             || capture.frozen.metadata["locks"] != after_metadata["locks"]
             || capture.target.source.submodules
                 != submodule_identities(
                     flake,
                     &capture.frozen.metadata["locks"],
-                    &archived_nodes(&capture.frozen.metadata["locks"], &capture.frozen.archived)?,
+                    &capture.frozen.paths,
                     &capture.frozen.roots.0.join("checked-final"),
                 )?
         {
@@ -807,7 +1282,7 @@ impl Capture {
     /// Publish a reviewed target and preserve all temporary source/derivation
     /// roots. Binding alone does not mark any host successful or start a run.
     pub fn bind(&self, store: &Store) -> io::Result<Campaign> {
-        store.create_with(self.target.clone(), Utc::now(), |path| {
+        store.create_with_actor(self.target.clone(), Utc::now(), &self.actor, |path| {
             let directory = path.join("roots");
             for entry in std::fs::read_dir(self.frozen.roots.0.join("roots"))? {
                 let entry = entry?;

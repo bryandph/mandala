@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Immutable campaign target before host effects
-An opt-in deployment campaign SHALL bind a frozen, content-identified source graph, exact selected membership, intended per-host profile and system-toplevel paths, captured execution settings, effective activation modes and explicit exclusions before any host effects. Source identity SHALL include revision when available, dirty content identity and resolved nested input/submodule identity; a revision or dirty boolean alone MUST NOT establish equality. Inconsistent capture or an unresolved intended output SHALL refuse binding and launch no deployment. Real campaign creation SHALL bind the target and start the first deployment attempt in one operation, subject to the same real-mutation confirmation gate as deploy runs and dispatch revalidation of source identity, target digest, exact eligible names and campaign generation. The target and prepared attempt/run link SHALL be durable before host effects. An explicit dry creation preview SHALL bind and display the target without an attempt or host effects, leaving real work pending for retry.
+An opt-in deployment campaign SHALL bind a frozen, content-identified source graph, exact selected membership, intended per-host profile and system-toplevel paths, captured execution settings, effective activation modes and explicit exclusions before any host effects. Source identity SHALL include revision when available, dirty content identity and resolved nested input/submodule identity; a revision or dirty boolean alone MUST NOT establish equality. Original sourceInfo metadata visible to flake code, including root/input revision, dirty revision, timestamps and revision counts, SHALL be preserved and covered by source graph identity. Capsule implementation bytes SHALL NOT define source equivalence. Capture SHALL always compare the selected members' live and frozen profile/system drvPaths; any mismatch SHALL refuse creation, name the affected members and explain the unreproduced fetcher-metadata dependency. Unsupported Nix capture semantics SHALL refuse rather than degrade. Inconsistent capture or an unresolved intended output SHALL refuse binding and launch no deployment. Real campaign creation SHALL bind the target and start the first deployment attempt in one operation, subject to the same real-mutation confirmation gate as deploy runs and dispatch revalidation of source identity, target digest, exact eligible names and campaign generation. The target and prepared attempt/run link SHALL be durable before host effects. An explicit dry creation preview SHALL bind and display the target without an attempt or host effects, leaving real work pending for retry.
 
 #### Scenario: confirmed creation deploys in one step
 - **WHEN** a valid target is captured and real creation is confirmed for its exact eligible members
@@ -10,6 +10,14 @@ An opt-in deployment campaign SHALL bind a frozen, content-identified source gra
 #### Scenario: dry creation preview leaves work pending
 - **WHEN** creation is requested as a dry preview
 - **THEN** it binds and displays the target without an attempt or host effects and does not mark any member successfully deployed
+
+#### Scenario: fetcher metadata affects a derivation
+- **WHEN** a selected member's profile or system output embeds self.dirtyRev, self.lastModified or input fetcher metadata
+- **THEN** the capsule preserves the original metadata and capture requires identical live/frozen profile and system drvPaths before binding
+
+#### Scenario: metadata is stripped or the Nix adapter is unsupported
+- **WHEN** frozen evaluation cannot reproduce a selected member's live drvPaths or the Nix version is unsupported
+- **THEN** capture refuses without a ready campaign or host work and reports the affected members or unsupported version instead of using path-only semantics
 
 #### Scenario: source changes during capture
 - **WHEN** source content changes between snapshot capture and target binding

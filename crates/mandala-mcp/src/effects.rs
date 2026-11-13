@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+mod campaign;
+
 use async_trait::async_trait;
 use mandala_core::drift;
 use mandala_core::eval::Evaluator;
@@ -80,6 +82,20 @@ pub struct CommandLaunch {
 /// Every effect the MCP tools perform, behind one injectable boundary.
 #[async_trait]
 pub trait Effects: Send + Sync {
+    /// The additive campaign facade, isolated from the warm latest inventory.
+    /// Implementations must preserve durable shared policy and never replay writes.
+    async fn campaign(
+        &self,
+        _flake: &str,
+        _operation: &str,
+        _args: serde_json::Value,
+    ) -> io::Result<serde_json::Value> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "campaign effects unavailable",
+        ))
+    }
+
     /// Evaluate a fresh inventory aggregate for `flake` — the lazy first read
     /// AND the `reload` tool's swap both come through here. The real
     /// implementation re-roots the eval worker first (warm state must never
@@ -183,6 +199,15 @@ fn status_code(status: std::process::ExitStatus) -> i64 {
 
 #[async_trait]
 impl Effects for RealEffects {
+    async fn campaign(
+        &self,
+        flake: &str,
+        operation: &str,
+        args: serde_json::Value,
+    ) -> io::Result<serde_json::Value> {
+        self.campaign_call(flake, operation, args).await
+    }
+
     async fn fresh_inventory(&self, flake: &str) -> Result<Inventory, InventoryError> {
         // The CLI's `MANDALA_AGGREGATE_FILE` test seam, honoured here too so
         // the stdio integration test injects a fixture aggregate without a

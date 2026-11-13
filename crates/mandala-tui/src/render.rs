@@ -151,6 +151,7 @@ pub fn render_with_theme(state: &AppState, frame: &mut Frame, theme: &Theme) -> 
                 &mut hit_map,
             );
         }
+        Some(ScreenState::Campaign(view)) => crate::campaign::render(frame, area, view),
         Some(ScreenState::Runs(runs)) => screen::render_runs(
             runs,
             frame,

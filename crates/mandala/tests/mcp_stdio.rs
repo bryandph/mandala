@@ -172,8 +172,8 @@ fn stdio_handshake_lists_and_calls_resolve() {
         &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // 3. tools/list — the full 12-tool surface, in the Python server's
-    // registration order (the fleet-mcp parity contract).
+    // 3. tools/list — the legacy registration prefix remains intact and
+    // the opt-in campaign tools are additive.
     send(
         &mut stdin,
         &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
@@ -199,6 +199,13 @@ fn stdio_handshake_lists_and_calls_resolve() {
             "deploy",
             "restart_service",
             "reboot",
+            "campaign_create",
+            "campaign_inspect",
+            "campaign_retry",
+            "campaign_exclude",
+            "campaign_reboot",
+            "campaign_verify",
+            "campaign_close",
         ],
         "tools/list: {tools}"
     );

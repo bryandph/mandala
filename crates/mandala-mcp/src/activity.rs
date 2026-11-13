@@ -30,7 +30,18 @@ pub type ActivitySink = Arc<dyn Fn(&Value) + Send + Sync>;
 
 /// Tools whose settled calls land in the audit trail: everything that can
 /// change fleet state (or swap what the server serves).
-const AUDITED: [&str; 4] = ["deploy", "reboot", "restart_service", "reload"];
+const AUDITED: [&str; 10] = [
+    "deploy",
+    "reboot",
+    "restart_service",
+    "reload",
+    "campaign_create",
+    "campaign_retry",
+    "campaign_exclude",
+    "campaign_reboot",
+    "campaign_verify",
+    "campaign_close",
+];
 
 /// Unix epoch seconds as a float — the audit `ts`, parity with Python
 /// `time.time()`.

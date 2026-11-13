@@ -1,4 +1,4 @@
-//! The 12 fleet tools: argument structs + agent-facing descriptions.
+//! Fleet tools: argument structs + agent-facing descriptions.
 //!
 //! Each struct is one tool's argument schema (`#[mcp_tool]` + `JsonSchema`
 //! derive). The `description` strings are agent-facing documentation and part
@@ -144,6 +144,8 @@ pub struct DriftTool {
     pub do_eval: Option<bool>,
     /// Filter `entries` to just these statuses (summary stays whole-fleet).
     pub statuses: Option<Vec<String>>,
+    /// Add independently labeled bound-campaign and latest-source comparisons.
+    pub campaign_id: Option<String>,
 }
 
 /// `reload` arguments (none).
@@ -350,7 +352,112 @@ pub struct RebootTool {
     pub confirm: Option<String>,
 }
 
-/// The full tool surface, in the Python server's registration order — what
+#[mcp_tool(
+    name = "campaign_create",
+    description = "Bind a content-identified campaign and start its first deployment in one call. Defaults to dry_activate=true: bind/show target only, without a run or host effects. Non-dry creation requires confirm equal to the exact eligible names. Never replay after an uncertain response."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignCreateTool {
+    pub selector: String,
+    pub actor: Option<String>,
+    #[json_schema(default = true)]
+    pub dry_activate: Option<bool>,
+    #[json_schema(default = false)]
+    pub boot: Option<bool>,
+    pub confirm: Option<String>,
+    pub throttle: Option<i64>,
+    pub cache_push: Option<bool>,
+}
+
+#[mcp_tool(
+    name = "campaign_inspect",
+    description = "Inspect a campaign or list campaigns when campaign_id is absent. Membership, target paths and attempts are paginated with explicit totals and continuation. check_source compares identities without retargeting; original-checkout failure does not hide bound data."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignInspectTool {
+    pub campaign_id: Option<String>,
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
+    #[json_schema(default = true)]
+    pub check_source: Option<bool>,
+}
+
+#[mcp_tool(
+    name = "campaign_retry",
+    description = "Dispatch only failed/pending eligible members from the immutable target. Defaults to dry activation (build/copy, no activation). Non-dry retry requires exact eligible confirm and the reviewed generation. reconcile_only performs explicit read-only ownership reconciliation without launching. Never automatically replay."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignRetryTool {
+    pub campaign_id: String,
+    pub generation: u64,
+    pub selector: Option<String>,
+    #[json_schema(default = true)]
+    pub dry_activate: Option<bool>,
+    pub confirm: Option<String>,
+    pub throttle: Option<i64>,
+    pub cache_push: Option<bool>,
+    #[json_schema(default = false)]
+    pub halt_on_build_failure: Option<bool>,
+    #[json_schema(default = false)]
+    pub reconcile_only: Option<bool>,
+}
+
+#[mcp_tool(
+    name = "campaign_exclude",
+    description = "Append explicit reasoned exclusion changes to bound deploy members. Requires exact campaign-id confirmation and reviewed generation; refuses live/uncertain mutation and never changes membership, targets or prior successes."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignExcludeTool {
+    pub campaign_id: String,
+    pub generation: u64,
+    pub actor: String,
+    pub reason: String,
+    pub add: Option<Vec<String>>,
+    pub remove: Option<Vec<String>>,
+    pub confirm: Option<String>,
+}
+
+#[mcp_tool(
+    name = "campaign_reboot",
+    description = "Reboot only freshly proven eligible reboot-pending members using the captured fleet wrapper and existing order/drain controls. Requires exact eligible confirm and generation. Reboot exit success never asserts final verification."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignRebootTool {
+    pub campaign_id: String,
+    pub generation: u64,
+    pub selector: Option<String>,
+    #[json_schema(default = "1")]
+    pub serial: Option<String>,
+    #[json_schema(default = true)]
+    pub drain: Option<bool>,
+    pub confirm: Option<String>,
+}
+
+#[mcp_tool(
+    name = "campaign_verify",
+    description = "Read-only bound-target verification with fresh survey evidence, independent of latest source and original checkout. Exclusions remain outside eligible denominators. No activation or reboot. Lifecycle evidence is not automatically replayed."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignVerifyTool {
+    pub campaign_id: String,
+    #[json_schema(default = true)]
+    pub refresh: Option<bool>,
+}
+
+#[mcp_tool(
+    name = "campaign_close",
+    description = "Administratively close an inactive campaign with actor and reason. Requires exact campaign-id confirmation and reviewed generation. Keeps incomplete outcomes; closing never asserts success and does not immediately prune records."
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CampaignCloseTool {
+    pub campaign_id: String,
+    pub generation: u64,
+    pub actor: String,
+    pub reason: String,
+    pub confirm: Option<String>,
+}
+
+/// The full tool surface, preserving the legacy registration prefix — what
 /// `tools/list` advertises.
 #[must_use]
 pub fn all_tools() -> Vec<Tool> {
@@ -367,6 +474,13 @@ pub fn all_tools() -> Vec<Tool> {
         DeployTool::tool(),
         RestartServiceTool::tool(),
         RebootTool::tool(),
+        CampaignCreateTool::tool(),
+        CampaignInspectTool::tool(),
+        CampaignRetryTool::tool(),
+        CampaignExcludeTool::tool(),
+        CampaignRebootTool::tool(),
+        CampaignVerifyTool::tool(),
+        CampaignCloseTool::tool(),
     ]
 }
 
@@ -375,7 +489,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn twelve_tools_in_registration_order() {
+    fn legacy_prefix_and_additive_campaign_tools_in_registration_order() {
         let names: Vec<String> = all_tools().into_iter().map(|t| t.name).collect();
         assert_eq!(
             names,
@@ -392,6 +506,13 @@ mod tests {
                 "deploy",
                 "restart_service",
                 "reboot",
+                "campaign_create",
+                "campaign_inspect",
+                "campaign_retry",
+                "campaign_exclude",
+                "campaign_reboot",
+                "campaign_verify",
+                "campaign_close",
             ]
         );
     }

@@ -42,6 +42,7 @@ pub(super) fn target() -> Target {
         profile: "/nix/store/profile-a".into(),
         system_toplevel: "/nix/store/system-a".into(),
         derivation: "/nix/store/profile-a.drv".into(),
+        system_derivation: "/nix/store/system-a.drv".into(),
         output: "out".into(),
         settings: serde_json::json!({"hostname":"node-a","activation":"switch"}),
         activation: ActivationMode::Switch,
@@ -51,7 +52,9 @@ pub(super) fn target() -> Target {
             checkout: "/fixtures/acme".into(),
             revision: Some("revision-a".into()),
             dirty: false,
-            snapshot: node("source-a"),
+            root: node("source-a"),
+            graph_digest: "sha256:graph-a".into(),
+            snapshot: node("capsule-a"),
             lock_digest: "sha256:lock-a".into(),
             inputs: BTreeMap::from([("toolchain/nixpkgs".into(), node("input-a"))]),
             submodules: BTreeMap::new(),
@@ -179,7 +182,7 @@ fn source_identity_uses_dirty_content_and_recursive_inputs_not_revision_labels()
     changed.dirty = true;
     changed.revision = None;
     assert!(source.same_content(&changed));
-    changed.snapshot.content_digest = "sha256:different-dirty-content".into();
+    changed.root.content_digest = "sha256:different-dirty-content".into();
     assert!(!source.same_content(&changed));
     changed = source.clone();
     changed
@@ -770,6 +773,45 @@ fn live_linked_supervisor_prevents_closed_unit_pruning() {
     );
     assert!(path.exists());
     assert!(store.path(&c.campaign_id).unwrap().exists());
+}
+
+#[test]
+fn interrupted_unlinked_allocations_share_closed_retention_and_live_protection() {
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let c = closed_campaign(&store);
+    let linked = retained_run(&tmp, &c);
+    let orphan = tmp.0.join("runs").join(RUN2);
+    std::fs::create_dir_all(&orphan).unwrap();
+    registry::write_meta(
+        &orphan,
+        serde_json::json!({"campaign_id":c.campaign_id,"pid":std::process::id(),"rc":127})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    store.retain(
+        &tmp.0.join("runs"),
+        0,
+        1,
+        now() + chrono::TimeDelta::days(90),
+    );
+    assert!(linked.exists());
+    assert!(orphan.exists());
+    registry::update_meta(
+        &orphan,
+        serde_json::json!({"pid":null}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    store.retain(
+        &tmp.0.join("runs"),
+        0,
+        1,
+        now() + chrono::TimeDelta::days(90),
+    );
+    assert!(!linked.exists());
+    assert!(!orphan.exists());
+    assert!(!store.path(&c.campaign_id).unwrap().exists());
 }
 
 #[test]

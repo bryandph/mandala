@@ -15,6 +15,8 @@
 //! DATA on the screen states (`ConfirmAction`, `after_mutation`) — the
 //! runtime reads them here, so there is no callback plumbing.
 
+mod campaign;
+
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -161,6 +163,8 @@ pub struct App {
     /// explorer read through the leader's warm evaluator; `None` is the
     /// local-eval fallback shape.
     context: Option<TuiContext>,
+    campaign_seq: u64,
+    campaign_capture: Option<Box<mandala_core::campaign::source::Capture>>,
 }
 
 impl App {
@@ -184,6 +188,8 @@ impl App {
             deploy: None,
             next_task_id: 0,
             context: None,
+            campaign_seq: 0,
+            campaign_capture: None,
         }
     }
 
@@ -449,6 +455,19 @@ impl App {
                 }
                 None
             }
+            AppEvent::CampaignCaptured { request, result } => {
+                self.campaign_captured(request, result);
+                None
+            }
+            AppEvent::CampaignResult {
+                request,
+                tool,
+                args,
+                result,
+            } => {
+                mcp_follow = self.campaign_result(request, tool, args, result);
+                None
+            }
             AppEvent::McpActivity { event } => {
                 mcp_follow = self.state.on_mcp_activity(&event);
                 None
@@ -595,6 +614,10 @@ impl App {
             _ => {}
         }
 
+        if matches!(self.state.screen, Some(ScreenState::Campaign(_))) {
+            let size = terminal.size().map_err(io::Error::other)?;
+            return self.on_campaign_key(key, (size.width, size.height)).await;
+        }
         let context = match self.state.screen.as_ref() {
             None => KeyContext::Explorer,
             Some(ScreenState::Confirm(_)) => KeyContext::Confirm,
@@ -604,6 +627,7 @@ impl App {
             Some(ScreenState::Deploy(view)) if view.kill_armed => KeyContext::DeployKillArmed,
             Some(ScreenState::Deploy(_)) => KeyContext::Deploy,
             Some(ScreenState::Runs(_)) => KeyContext::Runs,
+            Some(ScreenState::Campaign(_)) => unreachable!("campaign keys handled above"),
         };
         let action = keymap::resolve(context, key);
 
@@ -713,6 +737,7 @@ impl App {
             Some(KeyAction::Ping) => self.dispatch(FleetAction::Ping),
             Some(KeyAction::Reboot) => self.dispatch(FleetAction::Reboot),
             Some(KeyAction::Deploy) => self.dispatch(FleetAction::Deploy),
+            Some(KeyAction::OpenCampaigns) => self.open_campaigns(),
             Some(KeyAction::OpenRuns) => {
                 self.state.screen = Some(ScreenState::Runs(RunsState::load()));
                 self.dirty = true;
@@ -735,6 +760,7 @@ impl App {
         size: (u16, u16),
     ) -> io::Result<()> {
         match self.state.screen.as_mut().expect("screen present") {
+            ScreenState::Campaign(_) => {}
             // ConfirmScreen: y confirm, esc/n cancel.
             ScreenState::Confirm(confirm) => match action {
                 Some(KeyAction::CycleCachePush) => {

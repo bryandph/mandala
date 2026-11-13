@@ -244,7 +244,7 @@ pub fn list_runs() -> Vec<RunInfo> {
     list_runs_in(&runs_dir())
 }
 
-fn list_runs_in(base: &Path) -> Vec<RunInfo> {
+pub(crate) fn list_runs_in(base: &Path) -> Vec<RunInfo> {
     let Ok(rd) = std::fs::read_dir(base) else {
         return Vec::new();
     };
@@ -340,7 +340,7 @@ pub fn new_run_dir() -> io::Result<(String, PathBuf)> {
     new_run_dir_in(&runs_dir())
 }
 
-fn new_run_dir_in(base: &Path) -> io::Result<(String, PathBuf)> {
+pub(crate) fn new_run_dir_in(base: &Path) -> io::Result<(String, PathBuf)> {
     prune_in(base, None);
     std::fs::create_dir_all(base)?;
     // Timestamp run-ids can COLLIDE when two threads of one process allocate

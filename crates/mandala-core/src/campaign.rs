@@ -17,8 +17,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{drift, inventory, registry};
 
+pub mod api;
+pub mod cli;
 pub mod execution;
 pub mod source;
+pub mod views;
 
 pub const SCHEMA_VERSION: u64 = 1;
 const MANIFEST: &str = "campaign.json";
@@ -77,6 +80,10 @@ pub struct SourceIdentity {
     pub checkout: String,
     pub revision: Option<String>,
     pub dirty: bool,
+    /// Original fetched root tree, before the evaluation capsule.
+    pub root: SourceNode,
+    /// Digest of the captured graph and influencing fetcher metadata.
+    pub graph_digest: String,
     pub snapshot: SourceNode,
     pub lock_digest: String,
     pub inputs: BTreeMap<String, SourceNode>,
@@ -87,7 +94,8 @@ impl SourceIdentity {
     /// Equality is about captured content, not mutable revision/dirty labels.
     #[must_use]
     pub fn same_content(&self, other: &Self) -> bool {
-        self.snapshot.content_digest == other.snapshot.content_digest
+        self.graph_digest == other.graph_digest
+            && self.root == other.root
             && self.lock_digest == other.lock_digest
             && self.inputs.len() == other.inputs.len()
             && self.inputs.iter().all(|(name, node)| {
@@ -107,10 +115,11 @@ impl SourceIdentity {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.checkout.is_empty() || self.lock_digest.is_empty() {
+        if self.checkout.is_empty() || self.lock_digest.is_empty() || self.graph_digest.is_empty() {
             return Err(invalid("incomplete campaign source identity"));
         }
         for node in std::iter::once(&self.snapshot)
+            .chain(std::iter::once(&self.root))
             .chain(self.inputs.values())
             .chain(self.submodules.values().map(|module| &module.content))
         {
@@ -134,6 +143,7 @@ pub struct HostTarget {
     pub profile: String,
     pub system_toplevel: String,
     pub derivation: String,
+    pub system_derivation: String,
     pub output: String,
     pub settings: Value,
     pub activation: ActivationMode,
@@ -196,6 +206,8 @@ impl Target {
                 || !store_path(&host.system_toplevel)
                 || !store_path(&host.derivation)
                 || !host.derivation.ends_with(".drv")
+                || !store_path(&host.system_derivation)
+                || !host.system_derivation.ends_with(".drv")
                 || host.output.is_empty()
                 || !host
                     .output
@@ -308,6 +320,9 @@ pub struct Closure {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verification {
+    pub run_id: String,
+    pub attempt: u64,
+    pub generation: u64,
     pub observed_at: DateTime<Utc>,
     pub results: BTreeMap<String, Value>,
     pub complete: bool,
@@ -318,6 +333,7 @@ pub struct Campaign {
     pub campaign_id: String,
     pub schema_version: u64,
     pub created_at: DateTime<Utc>,
+    pub created_by: String,
     pub target: Target,
     pub target_digest: String,
     pub generation: u64,
@@ -340,6 +356,7 @@ impl Campaign {
             campaign_id: id,
             schema_version: SCHEMA_VERSION,
             created_at: now,
+            created_by: "library".into(),
             target,
             target_digest,
             generation: 0,
@@ -359,7 +376,10 @@ impl Campaign {
                 self.schema_version
             )));
         }
-        if !is_valid_id(&self.campaign_id) || self.target.digest()? != self.target_digest {
+        if !is_valid_id(&self.campaign_id)
+            || self.created_by.trim().is_empty()
+            || self.target.digest()? != self.target_digest
+        {
             return Err(invalid("corrupt campaign target identity"));
         }
         self.target.validate()?;
@@ -434,6 +454,21 @@ impl Campaign {
                 return Err(invalid("invalid campaign outcome provenance"));
             }
         }
+        for verification in &self.verification {
+            let attempt = verification
+                .attempt
+                .checked_sub(1)
+                .and_then(|index| self.attempts.get(index as usize))
+                .ok_or_else(|| invalid("verification lacks attempt provenance"))?;
+            if attempt.kind != AttemptKind::Verify
+                || attempt.state != AttemptState::Settled
+                || attempt.run_id.as_deref() != Some(verification.run_id.as_str())
+                || attempt.generation != verification.generation
+                || verification.results.keys().cloned().collect::<Vec<_>>() != attempt.targets
+            {
+                return Err(invalid("invalid verification provenance or membership"));
+            }
+        }
         Ok(())
     }
 
@@ -492,11 +527,14 @@ impl Campaign {
         if !observed.is_some_and(|source| self.target.source.same_content(source)) {
             return Err(invalid(format!(
                 "campaign source changed or unavailable; create a new campaign; recorded={}; observed={}",
-                self.target.source.snapshot.content_digest,
-                observed.map_or("unavailable", |source| source
-                    .snapshot
-                    .content_digest
-                    .as_str()),
+                views::source_summary(&self.target.source)?["content_identity"],
+                match observed {
+                    Some(source) => views::source_summary(source)?["content_identity"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    None => "unavailable".into(),
+                },
             )));
         }
         Ok(())
@@ -734,6 +772,11 @@ impl Store {
         Self { root }
     }
 
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.parent().unwrap_or(Path::new(".")).to_path_buf()
+    }
+
     pub fn path(&self, id: &str) -> io::Result<PathBuf> {
         if !is_valid_id(id) {
             return Err(invalid("invalid campaign id"));
@@ -808,7 +851,20 @@ impl Store {
         now: DateTime<Utc>,
         initialize: impl FnOnce(&Path) -> io::Result<()>,
     ) -> io::Result<Campaign> {
+        self.create_with_actor(target, now, "library", initialize)
+    }
+
+    fn create_with_actor(
+        &self,
+        target: Target,
+        now: DateTime<Utc>,
+        actor: &str,
+        initialize: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<Campaign> {
         target.validate()?;
+        if actor.trim().is_empty() {
+            return Err(invalid("campaign creation requires actor"));
+        }
         reject_symlink(&self.root)?;
         // Directory claim, not timestamp uniqueness, is the authority.
         std::fs::create_dir_all(&self.root)?;
@@ -823,7 +879,8 @@ impl Store {
             let path = self.path(&id)?;
             match std::fs::create_dir(&path) {
                 Ok(()) => {
-                    let campaign = Campaign::new(id, target, now)?;
+                    let mut campaign = Campaign::new(id, target, now)?;
+                    campaign.created_by = actor.into();
                     initialize
                         .take()
                         .expect("only called for a claimed directory")(&path)?;
@@ -896,16 +953,28 @@ impl Store {
             let Some(closure) = &campaign.closure else {
                 continue;
             };
-            let paths: Vec<_> = campaign
+            let mut paths: BTreeSet<_> = campaign
                 .attempts
                 .iter()
                 .filter_map(|a| a.run_id.as_ref())
                 .map(|id| runs.join(id))
                 .collect();
+            // Interrupted allocation can publish additive run metadata before
+            // its manifest link. Keep/prune those allocations with the same
+            // unit instead of leaking an independently protected orphan.
+            paths.extend(
+                registry::list_runs_in(runs)
+                    .into_iter()
+                    .filter(|run| {
+                        run.meta.get("campaign_id").and_then(Value::as_str) == Some(id.as_str())
+                    })
+                    .map(|run| run.path),
+            );
             if paths.iter().any(|path| {
                 let meta = registry::read_meta(path);
                 // An absent/corrupt run cannot prove inactive ownership.
                 meta.is_empty()
+                    || meta.get("campaign_id").and_then(Value::as_str) != Some(id.as_str())
                     || registry::pid_alive(meta.get("pid").and_then(Value::as_i64))
                     || registry::pid_alive(meta.get("supervisor_pid").and_then(Value::as_i64))
             }) {
@@ -943,6 +1012,7 @@ impl Store {
             || campaign.target_digest != original.target_digest
             || campaign.campaign_id != original.campaign_id
             || campaign.created_at != original.created_at
+            || campaign.created_by != original.created_by
             || campaign.schema_version != original.schema_version
             || campaign.generation < original.generation
             || !campaign

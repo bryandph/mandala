@@ -188,7 +188,6 @@ fn persist(run: &RegisteredDeployRun, record: &Value) -> io::Result<()> {
 fn emit(writer: &EventWriter, record: &Value) -> io::Result<()> {
     let mut fields = record.as_object().expect("record object").clone();
     fields.insert("milestone".into(), json!("publish"));
-    fields.insert("actor".into(), json!("controller"));
     writer.emit("milestone", fields)
 }
 
@@ -209,7 +208,7 @@ pub fn build_aborted(run: &RegisteredDeployRun) -> io::Result<()> {
     );
     persist(run, &record)?;
     emit(
-        &EventWriter::new(&run.path, "publish", "", "publish")?,
+        &EventWriter::controller(&run.path, "publish", "publish")?,
         &record,
     )
 }
@@ -226,7 +225,7 @@ pub fn publish(
 ) -> io::Result<()> {
     let config = &run.plan.publish;
     let paths: BTreeSet<_> = built.paths.values().cloned().collect();
-    let writer = EventWriter::new(&run.path, "publish", "", "publish")?;
+    let writer = EventWriter::controller(&run.path, "publish", "publish")?;
     let record = if config.url.is_none() || paths.is_empty() {
         config.record(
             "skipped",
@@ -285,7 +284,10 @@ pub fn publish(
     // status/rc and without inventing a controller fleet member.
     if config.url.is_some() {
         for host in built.paths.keys() {
-            emit(&EventWriter::new(&run.path, host, host, "deploy")?, &record)?;
+            emit(
+                &EventWriter::controller(&run.path, host, "deploy")?.for_member(host)?,
+                &record,
+            )?;
         }
     }
     Ok(())

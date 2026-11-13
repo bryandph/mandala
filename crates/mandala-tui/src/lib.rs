@@ -39,6 +39,7 @@
 
 pub mod ansi;
 pub mod app;
+pub mod campaign;
 pub mod context;
 pub mod deploy;
 pub mod event;

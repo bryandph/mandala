@@ -1093,7 +1093,7 @@ fn build_profiles_pinned(
     } else {
         map_profile_links(&run.plan.targets, &out_link).and_then(|paths| {
             for (host, (_, expected)) in run.plan.targets.iter().zip(&resolved) {
-                if paths[host] != Path::new(expected) {
+                if pinned.is_some() && paths[host] != Path::new(expected) {
                     return Err(BuildError::InvalidProfilePath {
                         host: host.clone(),
                         path: paths[host].clone(),
@@ -1515,7 +1515,7 @@ fn settle_fan_out(
     })
 }
 
-fn record_controller_failure(run: &RegisteredDeployRun, error: &str) {
+pub(crate) fn record_controller_failure(run: &RegisteredDeployRun, error: &str) {
     let mut fields = Meta::new();
     fields.insert("process_rc".into(), Value::from(1));
     fields.insert("rc".into(), Value::from(1));
@@ -2547,6 +2547,28 @@ exit 0
             assert_eq!(event["actor"], "controller");
             assert_eq!(event["v"], 2);
         }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_build_keeps_its_existing_out_link_mapping_semantics() {
+        let base = tmp_base("legacy-output-mapping");
+        let _guard = registry::test_hooks::install_runs_base(base.clone());
+        let run = prepare_run(&inv(), "cache", 4, false).unwrap();
+        let (stub, _, _) = build_stub(&base, 0);
+        let prefix = r#"#!/bin/sh
+case " $* " in *' --dry-run '*)
+printf '%s\n' '[{"drvPath":"/nix/store/00000000000000000000000000000000-cache-profile.drv","outputs":{"out":"/nix/store/different-resolver-output"}}]'
+exit 0 ;; esac"#;
+        let script = std::fs::read_to_string(&stub)
+            .unwrap()
+            .replacen("#!/bin/sh", prefix, 1);
+        std::fs::write(&stub, script).unwrap();
+        let built = build_profiles_with(&run, "/legacy", stub.as_os_str()).unwrap();
+        assert_eq!(
+            built.paths["cache"],
+            Path::new("/nix/store/00000000000000000000000000000000-cache-profile")
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 

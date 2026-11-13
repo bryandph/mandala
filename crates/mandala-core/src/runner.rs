@@ -130,10 +130,23 @@ impl EventWriter {
         Self::open(directory, stream, host, plugin, false)
     }
 
-    /// A campaign controller is not a fleet member. Its supported-v2 stream
-    /// uses an empty host and explicit actor attribution on every record.
+    /// A controller is not a fleet member: use an empty host and explicit
+    /// actor attribution. Historical publish diagnostic lines retain their
+    /// existing envelope; publish milestones carry the controller actor.
     pub fn controller(directory: &Path, stream: &str, plugin: &str) -> std::io::Result<Self> {
         Self::open(directory, stream, "", plugin, true)
+    }
+
+    /// Attribute a controller's mirrored milestone to a real member stream.
+    pub fn for_member(mut self, member: &str) -> std::io::Result<Self> {
+        if !self.controller || !crate::inventory::is_valid_member_name(member) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "controller mirror requires a real member",
+            ));
+        }
+        self.host = member.into();
+        Ok(self)
     }
 
     fn open(
@@ -204,7 +217,7 @@ impl EventWriter {
             return Ok(());
         }
         let mut fields = fields;
-        if self.controller {
+        if self.controller && (self.plugin != "publish" || event == "milestone") {
             fields.insert("actor".into(), Value::from("controller"));
         }
         if file.build_filter.is_some() && event != "nixlog" {
@@ -1745,6 +1758,47 @@ mod tests {
     /// compact bytes: envelope and per-event field order, escaping, and one
     /// flushed newline per record. The supplied clock means this is a byte
     /// golden, not a parsed-JSON comparison with timestamps stripped.
+    #[test]
+    fn controller_publish_and_member_mirror_preserve_legacy_bytes() {
+        let directory = tmp();
+        let fields = serde_json::json!({"milestone":"publish","outcome":"skipped"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let writer = EventWriter::controller(&directory, "publish", "publish").unwrap();
+        writer.emit_at("milestone", fields.clone(), 1.0).unwrap();
+        writer
+            .emit_at(
+                "line",
+                serde_json::json!({"line":"diagnostic"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                2.0,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("publish.jsonl")).unwrap(),
+            concat!(
+                r#"{"v":2,"ts":1.0,"host":"","plugin":"publish","event":"milestone","actor":"controller","milestone":"publish","outcome":"skipped"}"#,
+                "\n",
+                r#"{"v":2,"ts":2.0,"host":"","plugin":"publish","event":"line","line":"diagnostic"}"#,
+                "\n"
+            )
+        );
+        let mirror = EventWriter::controller(&directory, "node-a", "deploy")
+            .unwrap()
+            .for_member("node-a")
+            .unwrap();
+        mirror.emit_at("milestone", fields, 1.0).unwrap();
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(directory.join("node-a.jsonl")).unwrap())
+                .unwrap();
+        assert_eq!(value["host"], "node-a");
+        assert_eq!(value["actor"], "controller");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn native_event_writer_protocol_v2_bytes_are_golden() {
         let dir = tmp();
