@@ -1,0 +1,41 @@
+{
+ "attempts": [],
+ "campaign_id": "c-20260102T030405_000001-123",
+ "closure": null,
+ "created_at": "2026-01-02T03:04:05Z",
+ "exclusion_updates": [],
+ "generation": 0,
+ "lifecycle": "open",
+ "outcomes": {},
+ "schema_version": 1,
+ "target": {
+  "hosts": {},
+  "initial_exclusions": {},
+  "selection": {
+   "deploy_members": [],
+   "members": [],
+   "selector": "@all"
+  },
+  "source": {
+   "checkout": "/fixtures/acme",
+   "dirty": false,
+   "inputs": {
+    "toolchain/nixpkgs": {
+     "content_digest": "sha256:input-a",
+     "revision": "revision-a",
+     "store_path": "/nix/store/input-a"
+    }
+   },
+   "lock_digest": "sha256:lock-a",
+   "revision": "revision-a",
+   "snapshot": {
+    "content_digest": "sha256:source-a",
+    "revision": "revision-a",
+    "store_path": "/nix/store/source-a"
+   },
+   "submodules": {}
+  }
+ },
+ "target_digest": "sha256:acfa19d430b8729a30a17890164b9771019ce188a5e3ffe70b45c817e139455a",
+ "verification": []
+}

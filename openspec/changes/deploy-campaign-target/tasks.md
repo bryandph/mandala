@@ -1,7 +1,7 @@
 ## 1. Review and additive protocol
 
 - [x] 1.1 Record the settled decisions: refuse new mutating continuations on source change and require a new campaign; protect open campaigns' targets until close; create-and-deploy in one step with normal real-mutation confirmation and an explicit dry creation preview. These choices are approved; implementation remains separately gated and is not authorized by this docs change.
-- [ ] 1.2 Add version-1 campaign target/manifest types, confined identifiers and atomic sorted serialization without altering existing run/event versions. Add legacy/new/future/corrupt golden fixtures and reader judgments.
+- [x] 1.2 Add version-1 campaign target/manifest types, confined identifiers and atomic sorted serialization without altering existing run/event versions. Add legacy/new/future/corrupt golden fixtures and reader judgments.
 - [ ] 1.3 Add interprocess locking, generation-checked exclusion/lifecycle transitions and prepared-attempt reconciliation. Test concurrent dispatch/update/close, unknown ownership and restart without duplicate effects.
 - [ ] 1.4 Extend retention additively to protect open campaigns, linked runs and GC roots; prune closed groups only when inactive. Test count/age limits, live supervisors, partial allocation and missing manifests; prohibit mixed old retention writers while campaigns are enabled.
 

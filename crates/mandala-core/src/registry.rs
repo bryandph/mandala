@@ -295,8 +295,16 @@ fn prune_in(base: &Path, keep: Option<usize>) {
 }
 
 fn prune_policy(base: &Path, keep: usize, max_age_days: u64, now: chrono::NaiveDateTime) {
+    let campaign_root = base.parent().unwrap_or(base).join("campaigns");
+    let protected =
+        crate::campaign::Store::new(campaign_root).retain(base, keep, max_age_days, now.and_utc());
     let mut survivors = 0usize;
     for info in list_runs_in(base) {
+        // Campaign-linked runs belong to a separate retention unit. Even a
+        // missing/corrupt manifest must not turn one into a legacy run.
+        if info.meta.contains_key("campaign_id") || protected.contains(&info.run_id) {
+            continue;
+        }
         // most-recent first
         let supervisor = info.meta.get("supervisor_pid").and_then(Value::as_i64);
         let allocating_pid = info
@@ -522,6 +530,60 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn campaign_links_fail_closed_without_changing_legacy_retention() {
+        let root = tmp();
+        let base = root.join("runs");
+        let linked_id = "20200101T000000_000001-123";
+        let legacy_id = "20200101T000000_000002-123";
+        for id in [linked_id, legacy_id] {
+            let path = base.join(id);
+            std::fs::create_dir_all(&path).unwrap();
+            let mut fields = meta(&[("pid", Value::Null), ("rc", Value::from(0))]);
+            if id == linked_id {
+                // Missing, corrupt, and unsupported manifests must all be
+                // protected rather than reclassified as independent runs.
+                fields.insert(
+                    "campaign_id".into(),
+                    Value::from("c-20200101T000000_000001-123"),
+                );
+            }
+            write_meta(&path, &fields).unwrap();
+        }
+        let _guard = test_hooks::install(|_| false);
+        prune_policy(&base, 0, 1, chrono::Utc::now().naive_utc());
+        assert!(base.join(linked_id).exists());
+        assert!(!base.join(legacy_id).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_link_protects_a_run_before_additive_metadata_is_published() {
+        let root = tmp();
+        let base = root.join("runs");
+        let run_id = "20200101T000000_000001-123";
+        let path = base.join(run_id);
+        std::fs::create_dir_all(&path).unwrap();
+        write_meta(
+            &path,
+            &meta(&[("pid", Value::Null), ("rc", Value::from(0))]),
+        )
+        .unwrap();
+        let campaign = root.join("campaigns/c-20200101T000000_000001-123");
+        std::fs::create_dir_all(&campaign).unwrap();
+        // Even a future schema can identify a linked run without pretending
+        // to understand its target, outcomes or lifecycle.
+        std::fs::write(
+            campaign.join("campaign.json"),
+            format!("{{\"schema_version\":99,\"attempts\":[{{\"run_id\":\"{run_id}\"}}]}}"),
+        )
+        .unwrap();
+        let _guard = test_hooks::install(|_| false);
+        prune_policy(&base, 0, 1, chrono::Utc::now().naive_utc());
+        assert!(path.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn meta(pairs: &[(&str, Value)]) -> Meta {
