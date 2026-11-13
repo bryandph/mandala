@@ -27,7 +27,7 @@ impl Drop for Temp {
     }
 }
 
-fn now() -> DateTime<Utc> {
+pub(super) fn now() -> DateTime<Utc> {
     "2026-01-02T03:04:05Z".parse().unwrap()
 }
 fn node(name: &str) -> SourceNode {
@@ -37,7 +37,7 @@ fn node(name: &str) -> SourceNode {
         revision: Some("revision-a".into()),
     }
 }
-fn target() -> Target {
+pub(super) fn target() -> Target {
     let host = HostTarget {
         profile: "/nix/store/profile-a".into(),
         system_toplevel: "/nix/store/system-a".into(),

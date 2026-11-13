@@ -57,6 +57,7 @@ fn version_supported(v: Option<i64>) -> bool {
 pub struct EventWriter {
     host: String,
     plugin: String,
+    controller: bool,
     file: Mutex<EventFile>,
 }
 
@@ -126,9 +127,26 @@ impl EventWriter {
     /// # Errors
     /// Invalid stream/host labels or any file-open failure.
     pub fn new(directory: &Path, stream: &str, host: &str, plugin: &str) -> std::io::Result<Self> {
+        Self::open(directory, stream, host, plugin, false)
+    }
+
+    /// A campaign controller is not a fleet member. Its supported-v2 stream
+    /// uses an empty host and explicit actor attribution on every record.
+    pub fn controller(directory: &Path, stream: &str, plugin: &str) -> std::io::Result<Self> {
+        Self::open(directory, stream, "", plugin, true)
+    }
+
+    fn open(
+        directory: &Path,
+        stream: &str,
+        host: &str,
+        plugin: &str,
+        controller: bool,
+    ) -> std::io::Result<Self> {
         if !crate::inventory::is_valid_member_name(stream)
             || !(crate::inventory::is_valid_member_name(host)
-                || (host.is_empty() && stream == "publish" && plugin == "publish"))
+                || (host.is_empty()
+                    && ((stream == "publish" && plugin == "publish") || controller)))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -142,6 +160,7 @@ impl EventWriter {
         Ok(Self {
             host: host.to_string(),
             plugin: plugin.to_string(),
+            controller,
             file: Mutex::new(EventFile {
                 bytes: file.metadata()?.len(),
                 file,
@@ -185,6 +204,9 @@ impl EventWriter {
             return Ok(());
         }
         let mut fields = fields;
+        if self.controller {
+            fields.insert("actor".into(), Value::from("controller"));
+        }
         if file.build_filter.is_some() && event != "nixlog" {
             fields
                 .values_mut()

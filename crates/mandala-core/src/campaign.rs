@@ -17,6 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{drift, inventory, registry};
 
+pub mod execution;
+pub mod source;
+
 pub const SCHEMA_VERSION: u64 = 1;
 const MANIFEST: &str = "campaign.json";
 
@@ -261,6 +264,8 @@ pub enum AttemptState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
     pub number: u64,
+    pub owner_pid: u32,
+    pub owner_supervisor_pid: Option<i64>,
     pub kind: AttemptKind,
     pub state: AttemptState,
     pub generation: u64,
@@ -392,6 +397,7 @@ impl Campaign {
         let mut active = 0;
         for (index, attempt) in self.attempts.iter().enumerate() {
             if attempt.number != index as u64 + 1
+                || attempt.owner_pid == 0
                 || attempt.target_digest != self.target_digest
                 || attempt.generation > self.generation
                 || attempt.targets.windows(2).any(|pair| pair[0] >= pair[1])
@@ -484,9 +490,14 @@ impl Campaign {
 
     pub fn ensure_source(&self, observed: Option<&SourceIdentity>) -> io::Result<()> {
         if !observed.is_some_and(|source| self.target.source.same_content(source)) {
-            return Err(invalid(
-                "campaign source changed or unavailable; create a new campaign",
-            ));
+            return Err(invalid(format!(
+                "campaign source changed or unavailable; create a new campaign; recorded={}; observed={}",
+                self.target.source.snapshot.content_digest,
+                observed.map_or("unavailable", |source| source
+                    .snapshot
+                    .content_digest
+                    .as_str()),
+            )));
         }
         Ok(())
     }
@@ -564,6 +575,8 @@ impl Campaign {
         let number = self.attempts.len() as u64 + 1;
         self.attempts.push(Attempt {
             number,
+            owner_pid: std::process::id(),
+            owner_supervisor_pid: crate::supervisor::captured_pid().map(i64::from),
             kind: request.kind,
             state: AttemptState::Prepared,
             generation: self.generation,
@@ -786,10 +799,20 @@ impl Store {
     }
 
     pub fn create(&self, target: Target, now: DateTime<Utc>) -> io::Result<Campaign> {
+        self.create_with(target, now, |_| Ok(()))
+    }
+
+    fn create_with(
+        &self,
+        target: Target,
+        now: DateTime<Utc>,
+        initialize: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<Campaign> {
         target.validate()?;
         reject_symlink(&self.root)?;
         // Directory claim, not timestamp uniqueness, is the authority.
         std::fs::create_dir_all(&self.root)?;
+        let mut initialize = Some(initialize);
         loop {
             let id = format!(
                 "c-{}-{}",
@@ -801,6 +824,9 @@ impl Store {
             match std::fs::create_dir(&path) {
                 Ok(()) => {
                     let campaign = Campaign::new(id, target, now)?;
+                    initialize
+                        .take()
+                        .expect("only called for a claimed directory")(&path)?;
                     self.write(&guard, &campaign)?;
                     return Ok(campaign);
                 }
@@ -931,6 +957,8 @@ impl Store {
                 .zip(&campaign.attempts)
                 .any(|(old, new)| {
                     old.number != new.number
+                        || old.owner_pid != new.owner_pid
+                        || old.owner_supervisor_pid != new.owner_supervisor_pid
                         || old.kind != new.kind
                         || old.generation != new.generation
                         || old.target_digest != new.target_digest
@@ -958,7 +986,8 @@ impl Store {
         file.write_all(&canonical(campaign)?)?;
         file.sync_all()?;
         std::fs::rename(tmp, path.join(MANIFEST))?;
-        File::open(path)?.sync_all()
+        File::open(path)?.sync_all()?;
+        File::open(&self.root)?.sync_all()
     }
 }
 
