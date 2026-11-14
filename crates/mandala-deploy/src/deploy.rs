@@ -231,6 +231,21 @@ fn ssh_command(deploy_data: &DeployData<'_>, ssh_addr: &str) -> Command {
     command
 }
 
+/// Start the opt-in VM owner helper through precisely the existing owner
+/// transport and flattened privilege settings. The caller owns its process
+/// group and bounded stdio protocol; no guest address is involved.
+#[must_use]
+pub fn owner_session_command(deploy_data: &DeployData<'_>, deploy_defs: &DeployDefs) -> Command {
+    let address = remote_address(deploy_data, deploy_defs);
+    let mut command = ssh_command(deploy_data, &address);
+    let helper = match &deploy_defs.sudo {
+        Some(sudo) => format!("{sudo} /run/current-system/sw/bin/mandala-vm-owner"),
+        None => "/run/current-system/sw/bin/mandala-vm-owner".into(),
+    };
+    command.arg(helper).stdin(Stdio::piped());
+    command
+}
+
 fn checked_output(
     output: std::process::Output,
     deploy_data: &DeployData<'_>,
@@ -733,6 +748,60 @@ mod tests {
 
     use super::*;
     use crate::data::{GenericSettings, Node, NodeSettings, Profile, ProfileSettings};
+
+    #[test]
+    fn vm_owner_backend_helper_uses_owner_transport_and_flattened_privilege() {
+        let profile = Profile {
+            profile_settings: ProfileSettings {
+                path: "/nix/store/profile".into(),
+                profile_path: None,
+            },
+            generic_settings: GenericSettings::default(),
+        };
+        let node = Node {
+            generic_settings: GenericSettings {
+                ssh_user: Some("operator-alice".into()),
+                user: Some("root".into()),
+                ssh_port: Some(2222),
+                identity_file: Some("/tmp/owner-key".into()),
+                ssh_opts: vec!["-oStrictHostKeyChecking=yes".into()],
+                sudo: Some("sudo -u".into()),
+                ..GenericSettings::default()
+            },
+            node_settings: NodeSettings {
+                hostname: "owner.example.test".into(),
+                profiles: HashMap::from([("system".into(), profile.clone())]),
+                profiles_order: Vec::new(),
+            },
+        };
+        let sink = RecordingSink::default();
+        let overrides = crate::CmdOverrides::default();
+        let data = crate::make_deploy_data(
+            &GenericSettings::default(),
+            &node,
+            "host-a",
+            &profile,
+            "system",
+            &overrides,
+            &sink,
+        );
+        let defs = data.defs().unwrap();
+        let command = owner_session_command(&data, &defs);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "operator-alice@owner.example.test");
+        assert!(args.contains(&"2222".into()));
+        assert!(args.contains(&"/tmp/owner-key".into()));
+        assert!(args.contains(&"-oStrictHostKeyChecking=yes".into()));
+        assert_eq!(
+            args.last().unwrap(),
+            "sudo -u root /run/current-system/sw/bin/mandala-vm-owner"
+        );
+        assert!(args.iter().all(|a| !a.contains("guest")));
+    }
 
     #[derive(Default)]
     struct RecordingSink(Mutex<Vec<String>>);

@@ -31,6 +31,7 @@
 
     # Both platforms consume the same precomputed model and pure renderer.
     nixosModules.builders = ./modules/builders.nix;
+    nixosModules.vm-owner = ./modules/vm-owner.nix;
     darwinModules.builders = ./modules/builders.nix;
 
     templates.fleet = {
@@ -212,6 +213,14 @@
         installPhase = "mkdir -p $out";
         postFixup = "";
       });
+      vm-owner-backend = self.packages.${pkgs.stdenv.hostPlatform.system}.mandala-rs.overrideAttrs (_: {
+        pname = "mandala-vm-owner-backend";
+        cargoBuildFlags = ["-p" "mandala-core" "-p" "mandala-deploy"];
+        cargoTestFlags = ["-p" "mandala-core" "-p" "mandala-deploy" "vm_owner_backend"];
+        installPhase = "mkdir -p $out";
+        postFixup = "";
+      });
+      vm-owner-module = assert import ./tests/vm-owner-module.nix {inherit lib pkgs;}; pkgs.runCommand "vm-owner-module" {} "touch $out";
       vm-member-schema = assert import ./tests/vm-member-schema.nix {inherit lib;}; pkgs.runCommand "vm-member-schema" {} "touch $out";
       vm-projections = assert import ./tests/vm-projections.nix {inherit lib;}; pkgs.runCommand "vm-projections" {} "touch $out";
       builder-renderer = assert import ./tests/builder-renderer.nix {inherit lib;}; pkgs.runCommand "builder-renderer" {} "touch $out";

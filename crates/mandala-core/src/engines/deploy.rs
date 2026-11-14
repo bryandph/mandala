@@ -32,6 +32,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::cache_publish;
+mod vm;
 use crate::cli::Engine;
 use crate::inventory::{Inventory, InventoryError};
 use crate::registry::{self, Meta};
@@ -1361,11 +1362,33 @@ async fn deploy_host_with(
         Err(error) => return failed_host(&writer, host, error.to_string()),
     };
 
+    let mut owner = if run.plan.vm.units.contains_key(host) {
+        match vm::Transaction::connect(run, host, profile_path, &deploy, &defs, Arc::clone(&writer))
+            .await
+        {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                return failed_host(&writer, host, format!("owner runtime session: {error}"));
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(error) = emit_milestone(&writer, "copy") {
         return failed_host(&writer, host, format!("writing copy milestone: {error}"));
     }
     if let Err(error) = push_profile(&deploy, &defs, false).await {
+        if let Some(owner) = owner.as_mut() {
+            owner.abort_unapplied(&error.to_string()).await;
+        }
         return failed_host(&writer, host, error.to_string());
+    }
+    if let Some(owner) = owner.as_mut()
+        && let Err(error) = owner.prepare().await
+    {
+        owner.abort_unapplied(&error.to_string()).await;
+        return failed_host(&writer, host, format!("preparing owner runtime: {error}"));
     }
     if let Some(error) = sink.error() {
         return failed_host(&writer, host, format!("writing copied output: {error}"));
@@ -1375,13 +1398,27 @@ async fn deploy_host_with(
     let disposition =
         match resolve_activation_disposition(&deploy, &defs, run.plan.dry_activate, boot).await {
             Ok(disposition) => disposition,
-            Err(error) => return failed_host(&writer, host, error.to_string()),
+            Err(error) => {
+                if let Some(owner) = owner.as_mut() {
+                    owner.abort_unapplied(&error.to_string()).await;
+                }
+                return failed_host(&writer, host, error.to_string());
+            }
         };
     if let Some(error) = sink.error() {
         return failed_host(&writer, host, format!("writing preflight output: {error}"));
     }
 
     if disposition.reboot_pending() && run.plan.dry_activate {
+        if let Some(owner) = owner.as_mut()
+            && let Err(error) = owner.finish().await
+        {
+            return failed_host(
+                &writer,
+                host,
+                format!("settling owner dry preview: {error}"),
+            );
+        }
         let _ = writer.emit(
             "line",
             event_fields([
@@ -1419,6 +1456,16 @@ async fn deploy_host_with(
             format!("writing activation-wait milestone: {error}"),
         );
     }
+    if !run.plan.dry_activate
+        && let Some(owner) = owner.as_mut()
+        && let Err(error) = owner.start().await
+    {
+        return failed_host(
+            &writer,
+            host,
+            format!("persisting owner mutation intent: {error}"),
+        );
+    }
     let deployment = match disposition {
         ActivationDisposition::BootStaging => stage_profile_for_boot(&deploy, &defs).await,
         ActivationDisposition::LiveSwitch
@@ -1429,6 +1476,59 @@ async fn deploy_host_with(
             reboot_pending: true,
         } => unreachable!("reboot-pending dry previews return before activation"),
     };
+    if let Some(mut owner) = owner {
+        let mut primary = deployment
+            .err()
+            .map(|error| error.to_string())
+            .or_else(|| sink.error());
+        if !run.plan.dry_activate
+            && primary.is_none()
+            && let Err(error) = owner
+                .apply(matches!(disposition, ActivationDisposition::BootStaging))
+                .await
+        {
+            primary = Some(error.to_string());
+        }
+        if !run.plan.dry_activate
+            && let Some(error) = &primary
+            && let Err(recovery) = owner.recover(settings.auto_rollback, error).await
+        {
+            let _ = writer.emit(
+                "line",
+                event_fields([
+                    ("line", Value::from(format!("owner recovery: {recovery}"))),
+                    ("stream", Value::from("deploy")),
+                ]),
+            );
+        }
+        if let Err(error) = owner.finish().await {
+            primary = Some(format!(
+                "{}; owner settlement: {error}",
+                primary.unwrap_or_default()
+            ));
+        }
+        let state = if run.plan.dry_activate && primary.is_none() {
+            HostState::Confirmed
+        } else {
+            let state = owner.state();
+            if primary.is_some() && matches!(state, HostState::Confirmed | HostState::RebootPending)
+            {
+                HostState::Failed
+            } else {
+                state
+            }
+        };
+        let milestone = match state {
+            HostState::Confirmed => "confirm",
+            HostState::RebootPending => "reboot-pending",
+            HostState::RolledBack => "rollback",
+            _ => "failed",
+        };
+        if let Err(error) = emit_milestone(&writer, milestone) {
+            return failed_host(&writer, host, error.to_string());
+        }
+        return host_result(&writer, host, state, primary);
+    }
     match deployment {
         Ok(()) => {
             if let Some(error) = sink.error() {

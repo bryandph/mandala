@@ -40,4 +40,4 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 # task; `rt`+`macros` = the runtime + `#[tokio::test]`; `time` = the tests'
 # meta-poll sleeps. The design mandates one async runtime across the cores
 # (the MCP server + phase-2 TUI drive these under tokio).
-tokio = { version = "1", features = ["process", "io-util", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "io-std", "rt", "macros", "time"] }

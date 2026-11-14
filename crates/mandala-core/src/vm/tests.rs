@@ -154,11 +154,11 @@ fn vm_owner_resolution_native_build_targets_only_deduplicated_owner() {
     ));
 }
 
-fn path(name: &str) -> String {
+pub(crate) fn path(name: &str) -> String {
     format!("/nix/store/00000000000000000000000000000000-{name}")
 }
 
-fn manifest() -> (manifest::Manifest, OwnerUnit, BTreeSet<String>) {
+pub(crate) fn manifest() -> (manifest::Manifest, OwnerUnit, BTreeSet<String>) {
     let plan = resolve(&Inventory::from_value(fleet()).unwrap(), "guest-a").unwrap();
     let unit = plan.units["host-a"].clone();
     let guests = unit
@@ -169,7 +169,7 @@ fn manifest() -> (manifest::Manifest, OwnerUnit, BTreeSet<String>) {
                 name.clone(),
                 manifest::Guest {
                     system: "x86_64-linux".into(),
-                    desired_identity: format!("image:{name}:new"),
+                    desired_identity: path(name),
                     artifact: path(name),
                     runtime_instance: format!("runtime-{name}"),
                     readiness: manifest::Readiness {
@@ -186,14 +186,22 @@ fn manifest() -> (manifest::Manifest, OwnerUnit, BTreeSet<String>) {
         owner: "host-a".into(),
         backend: "nixos-module".into(),
         owner_system: "x86_64-linux".into(),
+        owner_generation: path("owner-new"),
         supported_systems: vec!["x86_64-linux".into()],
         adapter: format!("{}/bin/adapter", path("adapter")),
         guests,
     };
-    let closure = ["adapter", "guest-a", "guest-b", "probe", "restore"]
-        .into_iter()
-        .map(path)
-        .collect();
+    let closure = [
+        "adapter",
+        "owner-new",
+        "guest-a",
+        "guest-b",
+        "probe",
+        "restore",
+    ]
+    .into_iter()
+    .map(path)
+    .collect();
     (manifest, unit, closure)
 }
 
@@ -234,6 +242,8 @@ fn vm_owner_resolution_manifest_bounds_readiness_and_matches_preview() {
 fn vm_owner_resolution_prior_runtime_required_for_every_sibling() {
     let (m, _, _) = manifest();
     let mut previous = manifest::Observation {
+        manifest_version: 1,
+        adapter: m.adapter.clone(),
         owner_profile: path("owner-profile"),
         owner_running: path("owner-running"),
         boot_default: path("boot-default"),
@@ -244,9 +254,11 @@ fn vm_owner_resolution_prior_runtime_required_for_every_sibling() {
                 (
                     name.clone(),
                     manifest::Runtime {
-                        running_identity: format!("image:{name}:old"),
+                        running_identity: path(&format!("{name}-old")),
                         runtime_instance: guest.runtime_instance.clone(),
                         artifact: path(&format!("{name}-old")),
+                        readiness: guest.readiness.clone(),
+                        recovery_contract: guest.recovery_contract.clone(),
                         ready: true,
                         diagnostic: String::new(),
                     },

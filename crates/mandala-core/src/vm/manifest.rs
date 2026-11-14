@@ -17,6 +17,8 @@ pub struct Manifest {
     pub owner: String,
     pub backend: String,
     pub owner_system: String,
+    /// The prebuilt owner toplevel (deploy-rs may wrap it in a profile).
+    pub owner_generation: String,
     pub supported_systems: Vec<String>,
     /// Consumer-supplied typed runtime protocol executable, not a shell hook.
     pub adapter: String,
@@ -48,6 +50,8 @@ pub struct Readiness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Observation {
+    pub manifest_version: u64,
+    pub adapter: String,
     pub owner_profile: String,
     pub owner_running: String,
     pub boot_default: String,
@@ -60,11 +64,13 @@ pub struct Runtime {
     pub running_identity: String,
     pub runtime_instance: String,
     pub artifact: String,
+    pub readiness: Readiness,
+    pub recovery_contract: String,
     pub ready: bool,
     pub diagnostic: String,
 }
 
-fn store_reference(path: &str) -> bool {
+pub(crate) fn store_reference(path: &str) -> bool {
     let Some(tail) = path.strip_prefix("/nix/store/") else {
         return false;
     };
@@ -90,6 +96,16 @@ fn store_reference(path: &str) -> bool {
                 && part
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"+-._".contains(&b))
+        })
+}
+
+pub(crate) fn immutable_identity(identity: &str) -> bool {
+    (store_reference(identity) && !identity.ends_with(".drv"))
+        || identity.strip_prefix("sha256:").is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         })
 }
 
@@ -120,13 +136,13 @@ impl Manifest {
             let root = path.split('/').take(4).collect::<Vec<_>>().join("/");
             closure.contains(&root)
         };
-        if !dependency(&self.adapter) {
+        if !dependency(&self.owner_generation) || !dependency(&self.adapter) {
             return Err("owner adapter is not an immutable application dependency".into());
         }
         for (name, guest) in &self.guests {
             if guest.system != unit.application.guests[name].system
                 || !self.supported_systems.contains(&guest.system)
-                || guest.desired_identity.trim().is_empty()
+                || !immutable_identity(&guest.desired_identity)
                 || guest.runtime_instance.trim().is_empty()
                 || !(1..=3600).contains(&guest.readiness.deadline_seconds)
                 || !dependency(&guest.artifact)
@@ -147,7 +163,9 @@ impl Manifest {
     /// # Errors
     /// Missing/ambiguous runtime, instance mismatch, unreadiness or no artifact.
     pub fn validate_previous(&self, previous: &Observation) -> Result<(), String> {
-        if !store_reference(&previous.owner_profile)
+        if previous.manifest_version != VERSION
+            || !store_reference(&previous.adapter)
+            || !store_reference(&previous.owner_profile)
             || !store_reference(&previous.owner_running)
             || !store_reference(&previous.boot_default)
             || previous.guests.keys().ne(self.guests.keys())
@@ -155,10 +173,13 @@ impl Manifest {
             return Err("previous owner/guest state is not recoverable".into());
         }
         for (name, runtime) in &previous.guests {
-            if runtime.running_identity.trim().is_empty()
+            if !immutable_identity(&runtime.running_identity)
                 || !runtime.ready
                 || runtime.runtime_instance != self.guests[name].runtime_instance
                 || !store_reference(&runtime.artifact)
+                || !store_reference(&runtime.readiness.contract)
+                || !(1..=3600).contains(&runtime.readiness.deadline_seconds)
+                || !store_reference(&runtime.recovery_contract)
             {
                 return Err(format!(
                     "{name}: no verified recoverable prior runtime; first-time creation refused"

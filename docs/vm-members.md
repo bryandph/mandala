@@ -126,9 +126,10 @@ conflict, including when the owner is selected directly. Unknown IDs are refused
 This function performs no approval or effects. Future frontends must bind impact
 and revision to approval, display readiness/recovery and disk/data limitations,
 and require renewed approval when the immutable plan changes. Owner host
-confirmation alone cannot prove guest runtime success. Runtime restoration,
-owner-enforced cross-controller serialization and first-time guest creation
-refusal remain backend qualification requirements, not claims of this Nix phase.
+confirmation alone cannot prove guest runtime success. The optional
+[owner runtime helper](vm-owner-backend.md) implements the owner-side
+serialization/recovery seam; shared frontend settlement and approval still gate
+registration before real VM deployment can be authorized.
 
 ## Rust manifest and selection contract
 

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::inventory::{Inventory, InventoryError};
 
 pub mod manifest;
+pub mod owner;
 
 /// Campaign mutation stays closed until frozen owner units and retry evidence
 /// have been integrated. Non-VM campaigns retain their existing behavior.
@@ -28,7 +29,7 @@ pub fn ensure_campaign_supported(inv: &Inventory, selector: &str) -> Result<(), 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// The first backend deliberately does not promise writable-data recovery.
 pub const RECOVERY_LIMIT: &str = "Runtime/image restoration only; writable disks, application data and external services are not reverted.";

@@ -76,6 +76,21 @@ If the target's live-switch preflight refuses, preserve transactional boot-only 
 
 **Alternatives:** start with a generic multi-backend abstraction or guest-exec. Rejected to keep the first conformance/recovery boundary finite. The owner does not execute a foreign guest's switch binary as if it were a host binary.
 
+#### Approved owner-side runtime boundary
+
+The optional `mandala-vm-owner` helper is shipped through
+`nixosModules.vm-owner`, behind explicit `mandala.vmOwner.enable` (off by
+default). The consumer supplies the package and immutable runtime adapter.
+The helper has no listener, daemon or activation service: the controller starts
+one bounded SSH stdio session through the owner's existing transport and
+privilege settings. A version handshake precedes locking or runtime effects and
+fails closed on either-direction mismatch. An OS file lock below
+`/var/lib/mandala/vm/<owner>` spans copy, host deployment, runtime verification
+and recovery. Owner-side atomic records and store roots precede mutation.
+Session loss leaves unknown/reconciliation-required state; a later session may
+reconcile under the lock but cannot infer completion or steal a held lock.
+This boundary does not enable the helper on any consumer or real owner.
+
 ### 6. Recovery is runtime restoration, not profile reversal
 
 Before mutation, atomically persist and root the previous owner profile/boot default and affected guests' runtime generation/image pointers, manifest version, readiness contract and data-rollback limitations. The first backend requires recoverable prior runtimes; first-time creation without one is refused rather than claiming fictitious rollback support.

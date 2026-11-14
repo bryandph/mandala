@@ -19,17 +19,17 @@ Implementation is approved. Phase A implements the pure Nix contract only; unche
 
 ## 3. One build graph and one qualified backend
 
-- [ ] 3.1 Define a versioned typed `nixos-module` manifest and injected consumer adapter with supported systems, inspect/prepare/apply/verify/restore evidence and bounded readiness. Require observable running guest identity and recoverable prior runtime; do not pin a runtime toolchain.
+- [x] 3.1 Define a versioned typed `nixos-module` manifest and injected consumer adapter with supported systems, inspect/prepare/apply/verify/restore evidence and bounded readiness. Require observable running guest identity and recoverable prior runtime; do not pin a runtime toolchain.
 - [ ] 3.2 Wire owner application artifacts to immutable guest closure/image dependencies in the consumer fleet graph without recursive configurations. Validate relation/manifest agreement and retain desired/previous paths through settlement/recovery.
 - [ ] 3.3 Extend single-batch native resolution/build to owner units; failed guest dependencies block that owner while independent verified artifacts retain best-effort behavior. Test one build invocation, required sibling dependencies and no activation-time evaluation/rebuild.
-- [ ] 3.4 Apply only through owner transport/settings and the module adapter, selecting prebuilt images or restarting guests without guest SSH/guest-exec. Test exact target/privilege arguments, matching running identity plus readiness, mismatched identities, deadlines and unavailable observations.
+- [x] 3.4 Apply only through owner transport/settings and the module adapter, selecting prebuilt images or restarting guests without guest SSH/guest-exec. Test exact target/privilege arguments, matching running identity plus readiness, mismatched identities, deadlines and unavailable observations.
 - [ ] 3.5 Preserve target-owned preflight, boot-only staging and dry activation: inhibitor refusal never restarts guests; staged images are pending; dry activation changes no profile/runtime/image pointer. Test successful staging separately from failed live restart.
 
 ## 4. Owner serialization and recoverable runtime state
 
-- [ ] 4.1 Add an owner-enforced lock around copy/apply/verify/recover shared across runs/controllers with bounded busy reporting. Barrier-controlled tests must cover sibling requests, separate controllers, owner-plus-guest selection, independent owners and reconciliation after stale/crashed runs.
-- [ ] 4.2 Persist and retain previous owner profile/boot state and every affected guest generation/image/readiness contract before mutation. Refuse missing prior runtime or persistence/rooting failure; explicitly test first-time creation refusal.
-- [ ] 4.3 Extend recovery beyond deploy-rs host rollback: restore and verify previous affected owner and guest runtimes/readiness. Test host-only rollback insufficiency, all-restored success, one-sibling failure, disabled auto-rollback and primary plus recovery diagnostics.
+- [x] 4.1 Add an owner-enforced lock around copy/apply/verify/recover shared across runs/controllers with bounded busy reporting. Barrier-controlled tests must cover sibling requests, separate controllers, owner-plus-guest selection, independent owners and reconciliation after stale/crashed runs.
+- [x] 4.2 Persist and retain previous owner profile/boot state and every affected guest generation/image/readiness contract before mutation. Refuse missing prior runtime or persistence/rooting failure; explicitly test first-time creation refusal.
+- [x] 4.3 Extend recovery beyond deploy-rs host rollback: restore and verify previous affected owner and guest runtimes/readiness. Test host-only rollback insufficiency, all-restored success, one-sibling failure, disabled auto-rollback and primary plus recovery diagnostics.
 - [ ] 4.4 Test interruption/timeouts and unknown observations: no detached recovery, prohibited new effects or false rolled-back outcome; block subsequent owner mutation until reconciled. Preserve independent successful owners. State disk/data rollback exclusions in preview and records.
 
 ## 5. Durable observations and frontend parity
