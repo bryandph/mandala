@@ -202,9 +202,25 @@ The implementation checkpoint was qualified on `x86_64-linux`:
 - Host `nix develop -c cargo test --workspace --no-fail-fast` ran all suites:
   **567 passed, 30 failed, 19 ignored**. Failures are transport/`LeaderBusy`
   limitations across the existing stdio/context/proxy/TUI-context targets;
-  all corresponding tests pass in the authoritative sandboxed package. The
-  untouched baseline also reproduces the context limitation. This is not a
-  claim that the unsandboxed command was green.
+  all corresponding tests pass in the authoritative sandboxed package. This
+  is not a claim that the unsandboxed command was green. A fresh untouched
+  `git archive` of baseline `63373b1d8ad0b2437df035665cc81d3a48bdad98`, using
+  the exact same command/environment, reproduces all 30 failed test names and
+  panic/error diagnostics (ignoring PIDs, source line shifts and once-per-process
+  backtrace-hint placement). All 312 archived tracked blobs still match Git
+  after execution. None of these branch failures passes on the baseline:
+
+  | Package / integration target | Baseline failures | Branch failures |
+  | --- | ---: | ---: |
+  | `mandala / mcp_stdio` | 3 | 3 |
+  | `mandala-context / context` | 3 | 3 |
+  | `mandala-context / failover` | 7 | 7 |
+  | `mandala-context / lifecycle` | 7 | 7 |
+  | `mandala-mcp / context_proxy` | 1 | 1 |
+  | `mandala-mcp / mcp_failover` | 1 | 1 |
+  | `mandala-mcp / parity_proxy` | 1 | 1 |
+  | `mandala-tui / context_flow` | 7 | 7 |
+  | **Total** | **30** | **30** |
 - OpenSpec CLI was unavailable, so strict CLI validation was **not run**.
   Local delta/scenario structure and coverage review covered four delta files,
   25 requirements and 72 scenarios; this does not substitute for the CLI.

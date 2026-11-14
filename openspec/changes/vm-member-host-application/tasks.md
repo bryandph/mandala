@@ -54,7 +54,9 @@ Qualification evidence and limits are recorded in `docs/vm-owner-backend.md`:
 `sandboxed mandala-rs` has 597 passing tests, 0 failures and 19 ignored doctests;
 all executable CI steps and all targeted checks passed on x86_64-linux. The host
 workspace replay ran but has 30 transport/LeaderBusy failures (567 passed), not a
-green unsandboxed result. OpenSpec CLI is unavailable; strict CLI validation was
+green unsandboxed result. All 30 failed names/diagnostics reproduce on an
+untouched git archive of baseline 63373b1 with the same command/environment;
+the eight-target counts are recorded in the qualification notes. OpenSpec CLI is unavailable; strict CLI validation was
 not run, and the local four-file/25-requirement/72-scenario structure/coverage
 review is recorded separately. No ARM/Darwin execution or consumer adoption is
 claimed. Final code review and merge remain with the repository coordinator.
