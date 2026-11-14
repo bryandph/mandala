@@ -12,6 +12,8 @@ The `vm-member-host-application` change establishes VM identities applied throug
 
 ## Dependencies and Impact
 
+`vm-member-host-application` is now archived and applied to the canonical specs; this change's deltas therefore apply against those canonical requirements.
+
 This change follows and modifies the proposed requirements in `../vm-member-host-application/`; it does not replace that change or implement either plan. Its deltas are applied after that change's deltas. In particular it extends backend validation and consumer-injected artifacts, replaces the single-backend restriction, and scopes NixOS boot/preflight guarantees rather than pretending they are Darwin operations.
 
 Implementation would touch the entry points named in `design.md`, the native deploy adapter and state readers. All files in this change are planning artifacts; existing code and consumer outputs are unchanged.

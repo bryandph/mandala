@@ -105,9 +105,10 @@ tools lack), never bypassing those guards.
   playbook's own guards (--limit, drain handling) remain in force
 
 #### Scenario: the selection becomes the limit
-- **WHEN** multiple members (or groups) are selected and an action runs
-- **THEN** the action targets exactly the selected names, comma-joined
-  into the ansible limit
+- **WHEN** multiple members (or groups) are selected and an SSH playbook action runs
+- **THEN** the action targets exactly the selected transport-eligible names, comma-joined
+  into the ansible limit; native VM deployment instead resolves and previews
+  complete owner application units before approval
 
 #### Scenario: reboot gathers batch order and drain safety
 - **WHEN** the operator triggers reboot on a selection

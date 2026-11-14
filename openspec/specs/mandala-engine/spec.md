@@ -41,6 +41,8 @@ tiers. Backend lowering of an authored identity SHALL include both
 `IdentitiesOnly=yes` and `IdentityAgent=none` wherever the consumer supports
 OpenSSH options.
 
+VM transport eligibility SHALL be an invariant before and after consumer hooks: no Ansible SSH inventory, deploy-rs node, independent batch entry or builder route may target a VM. Direct library calls, flake outputs and controller-platform variants SHALL obey the same guard; hook overrides SHALL NOT bypass it. Owner application artifacts MAY reference guest closures transitively without emitting guest nodes.
+
 #### Scenario: a hook injects repo-specific hostvars
 - **WHEN** a consumer passes `extraHostvars = name: {...}` to the ansible
   inventory projection
@@ -72,10 +74,24 @@ and projection results, as the one eval surface for porcelain (CLI/TUI and
 plugged engines). Per-tool outputs (ansible inventory, sops config, deploy
 nodes/batch) SHALL remain available for direct tool consumption.
 
+A VM-bearing fleet SHALL use aggregate schemaVersion 2, carrying typed ownership, a sorted derived guestsByOwner index and owner application installable-reference strings as pure data. No derivation or realization SHALL enter JSON evaluation. VM-aware readers SHALL accept supported versions 1 and 2; unsupported versions SHALL be refused before mutation. Non-VM fleets MAY preserve the version-1 shape and bytes. Raw tool outputs SHALL remain filtered transport views, not implicit owner-selection expansion.
+
 #### Scenario: porcelain reads the fleet in one eval
 - **WHEN** the CLI needs members, groups, and inventory
 - **THEN** one `nix eval --json .#mandala` returns a shape gated by
   `schemaVersion`, and no porcelain code scrapes per-tool outputs
+
+#### Scenario: pure VM aggregate
+- **WHEN** a VM-bearing fleet is evaluated as JSON
+- **THEN** ownership and owner application references are available in version 2 without realizing guest or owner derivations
+
+#### Scenario: old deployment reader encounters ownership
+- **WHEN** a reader supporting only version 1 encounters a VM-bearing version-2 aggregate
+- **THEN** it rejects the contract before selecting or mutating a target
+
+#### Scenario: existing fleet remains unchanged
+- **WHEN** a fleet has no typed VM relations and retains version 1
+- **THEN** its inventory/settings/tool projection bytes and direct standalone deployment behavior remain unchanged
 
 ### Requirement: Secret-grade secrets declarations
 `schema/secrets.nix` SHALL declare named secrets with a file path, readers
@@ -132,3 +148,14 @@ The PKI schema SHALL require roots to have no signer, intermediates to name an e
 #### Scenario: a signer cycle fails evaluation
 - **WHEN** following `signedBy` relationships returns to an already visited CA
 - **THEN** schema evaluation fails and identifies the cycle
+
+### Requirement: Host-application backend dependencies are consumer-injected
+The engine SHALL define the initial `nixos-module` backend contract without pinning a virtualization toolchain or generating guest systems. Consumer configurations SHALL supply the module/runtime adapter and owner artifacts referencing guest outputs in one fleet graph. Pure projection validation SHALL reject manifest/ownership mismatches and unsupported owner/backend/system combinations before effects.
+
+#### Scenario: manifest names an unrelated guest
+- **WHEN** an owner artifact manifest lists a guest owned by a different member
+- **THEN** validation rejects the artifact instead of allowing cross-owner application
+
+#### Scenario: toolchain ownership stays with the consumer
+- **WHEN** the consumer supplies its NixOS runtime module and guest configurations
+- **THEN** Mandala projects their validated references without adding a virtualization flake input or creating a second configuration authority

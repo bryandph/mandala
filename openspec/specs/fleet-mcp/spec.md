@@ -171,11 +171,12 @@ tool SHALL bypass the engine guards — the resolved `--limit`, throttle, and
 per-host deploy-rs magic rollback remain in force exactly as for the CLI and
 TUI.
 
-#### Scenario: build and dry-activate need no confirmation
+#### Scenario: build and dry-activate need no activation confirmation
 - **WHEN** a client invokes the build tool, or the deploy tool without the
-  confirmation argument
+  activation confirmation argument
 - **THEN** the build runs (local store only) or the deploy runs dry-activate,
-  and no real activation or reboot occurs
+  and no real activation or reboot occurs; VM deployment, including dry
+  build/copy, still requires approval of the resolved owner application plan
 
 #### Scenario: a real deploy or reboot requires a matching confirmation
 - **WHEN** a client invokes the deploy tool for a real activation, or the
