@@ -105,9 +105,10 @@ tools lack), never bypassing those guards.
   playbook's own guards (--limit, drain handling) remain in force
 
 #### Scenario: the selection becomes the limit
-- **WHEN** multiple members (or groups) are selected and an action runs
-- **THEN** the action targets exactly the selected names, comma-joined
-  into the ansible limit
+- **WHEN** multiple members (or groups) are selected and an SSH playbook action runs
+- **THEN** the action targets exactly the selected transport-eligible names, comma-joined
+  into the ansible limit; native VM deployment instead resolves and previews
+  complete owner application units before approval
 
 #### Scenario: reboot gathers batch order and drain safety
 - **WHEN** the operator triggers reboot on a selection
@@ -441,3 +442,86 @@ per-host state colors.
 - **THEN** the deploy view renders a progress gauge reflecting completed
   versus total hosts
 
+### Requirement: Cache publish selection is consistent across native launch surfaces
+Headless `mandala deploy run` and standalone `mandala tui deploy` SHALL accept mutually exclusive `--cache-push` and `--no-cache-push` options. The explorer deploy confirmation SHALL expose auto/on/off selection, defaulting to auto each time it opens. MCP `deploy` SHALL accept optional `cache_push` boolean intent: true enables, false disables, and absence preserves auto detection. Every launcher SHALL preserve this tri-state through to the engine without reading credentials or bypassing existing confirmation and wrapper gates. The engine SHALL resolve the environment before run registration and build effects under the `fleet-deploy` cache publish selection contract.
+
+#### Scenario: omission does not silently disable configured publishing
+- **WHEN** CLI, TUI or MCP launches a native deploy without an explicit publish override
+- **THEN** the engine applies its environment-based auto detection rather than receiving false
+
+#### Scenario: explicit disable overrides configuration
+- **WHEN** any native launch surface requests cache publishing off
+- **THEN** the engine skips publication regardless of its configured upload environment
+
+#### Scenario: explicit enable needs a destination
+- **WHEN** a launch surface requests cache publishing on without a nonempty cache URL
+- **THEN** the engine reports a preflight error before run registration or build effects
+
+#### Scenario: contradictory CLI options are a usage error
+- **WHEN** either deploy command receives both publish override flags in either order
+- **THEN** it rejects the invocation instead of selecting the last flag
+
+#### Scenario: explorer choice resets
+- **WHEN** the operator changes the publish choice, dismisses confirmation, and opens a new deploy confirmation
+- **THEN** the new dialog starts in auto mode and still requires explicit confirmation to launch
+
+### Requirement: Cache publish observation is shared and advisory
+Headless output, the TUI runs list, owned and attached deploy views, and MCP `deploy_status` SHALL expose the shared publish phase and its safe outcome. Active publication SHALL appear as `cache-publish`, independently of host concurrency. Observers SHALL show only the redacted cache destination, classified failure reason and process result when available; raw upload output and netrc paths SHALL NOT be exposed. The settled TUI summary and default curated MCP metadata SHALL retain advisory publish warnings without requiring raw diagnostics. Publish failure SHALL NOT add a fleet host, change host totals, convert a successful deployment into failure, or claim host activation has completed. Build and sticky host failures SHALL retain their existing result precedence.
+
+#### Scenario: attaching during publication
+- **WHEN** a frontend attaches to a run after build completion while the shared upload is active
+- **THEN** it reconstructs cache-publish from the registry and shows the safe destination without claiming fan-out has started
+
+#### Scenario: observing warning and successful fallback
+- **WHEN** publication fails ordinarily but the existing per-host copy and deployment succeed
+- **THEN** the TUI summary and MCP status show the publish warning alongside the successful effective run result
+
+#### Scenario: publish is not another fleet member
+- **WHEN** an observer reads shared controller publish records and eligible-host publish milestones
+- **THEN** it keeps the original host count and treats publish milestones as non-terminal attribution of one upload
+
+#### Scenario: legacy record remains readable
+- **WHEN** an observer attaches to a run written before publish metadata existed
+- **THEN** it renders the supported run and host state without inventing a publish phase or requiring migration
+
+### Requirement: Additive CLI and TUI campaign lifecycle
+CLI and TUI SHALL expose campaign create, inspect, retry, explicit exclusion updates, reboot, verify and close alongside existing deploy/run interfaces. Real creation SHALL bind the target and start the first deployment attempt in one operation after the same real-mutation confirmation gate as deploy runs. An explicit creation preview SHALL bind and display the target without launching an attempt or performing host effects, leaving real work pending. Retry SHALL execute eligible pending or failed work, including work left pending by a creation preview. Inspection SHALL show source and target identity, source-moved state, membership/exclusions/reasons, outcome provenance, attempts and verification separately from lifecycle. CLI SHALL offer structured reads; TUI SHALL link attempts to existing run attachment. Real mutations SHALL retain explicit confirmation and dispatch revalidation of exact names and campaign generation.
+
+#### Scenario: creation starts the first deployment
+- **WHEN** an operator confirms real campaign creation after reviewing the captured target and exact eligible names
+- **THEN** the target and first attempt/run link are persisted before host effects and the first deployment starts without a separate retry command
+
+#### Scenario: creation preview preserves target review
+- **WHEN** an operator requests a campaign creation preview
+- **THEN** the target is bound and displayed without an attempt or host effects and real deployment remains pending
+
+#### Scenario: real creation is not confirmed
+- **WHEN** an operator declines or omits the required real-mutation confirmation
+- **THEN** no first deployment attempt starts
+
+#### Scenario: legacy run attachment still works
+- **WHEN** an operator attaches to an older unlinked run
+- **THEN** the existing run interface operates without inventing campaign expectations
+
+#### Scenario: confirmation becomes stale
+- **WHEN** campaign policy changes after review but before dispatch
+- **THEN** dispatch refuses the stale generation and requires fresh review instead of broadening the confirmed action
+
+### Requirement: Campaign and latest-source drift are separate
+Campaign-aware drift views SHALL label current-versus-bound-campaign separately from current-versus-latest-evaluated-source, each with its own expectation provenance and source identity. A global expectation cache refresh SHALL NOT change a campaign target. Snapshot freshness, reachability, completeness, per-host evaluation failures and conservative boot-critical judgments SHALL remain distinct. Missing or unusable expectations SHALL report expectation-unknown, never in-sync/clean, including when expected_source is none. Boot-pending SHALL distinguish installed target from running target and SHALL NOT count as completed live verification.
+
+#### Scenario: latest source diverges after successful deployment
+- **WHEN** a fresh snapshot matches the campaign target but not the separately evaluated latest source
+- **THEN** the campaign comparison shows its actual completion state and the latest-source comparison reports drift without redefining campaign success
+
+#### Scenario: expectation cache is missing or stale
+- **WHEN** no usable per-host latest-source expectation is available
+- **THEN** the latest-source comparison is expectation-unknown rather than clean while any valid campaign comparison remains independently available
+
+#### Scenario: staged target is not running
+- **WHEN** the installed system profile matches the campaign target but current does not
+- **THEN** the campaign view reports reboot-pending and incomplete live verification
+
+#### Scenario: nested identity is unproven by a legacy cache
+- **WHEN** only a root-revision cache is available for a content-identified campaign-aware latest-source comparison
+- **THEN** it cannot establish source equality and the view reports unknown unless explicit complete evaluation supplies the missing expectation
