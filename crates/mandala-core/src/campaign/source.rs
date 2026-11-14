@@ -1090,6 +1090,7 @@ impl Capture {
             targets: Vec::new(),
             skipped: Vec::new(),
             settings: BTreeMap::new(),
+            vm: Default::default(),
             dry_activate: false,
             boot,
             halt_on_build_failure: false,
@@ -1120,6 +1121,7 @@ impl Capture {
             &aggregate_ref,
         ])?)
         .map_err(|error| invalid(error.to_string()))?;
+        crate::vm::ensure_campaign_supported(&inv, selector).map_err(|e| invalid(e.to_string()))?;
         let (members, operator_exclusions) = bound_selection(&inv, selector)?;
         let mut plan =
             match deploy::plan_run_with_boot(&inv, &members.join(","), throttle, false, boot) {
@@ -1129,6 +1131,7 @@ impl Capture {
                     targets: Vec::new(),
                     skipped: members.clone(),
                     settings: BTreeMap::new(),
+                    vm: Default::default(),
                     dry_activate: false,
                     boot,
                     halt_on_build_failure: false,

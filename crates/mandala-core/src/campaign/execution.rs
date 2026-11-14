@@ -91,6 +91,7 @@ fn plan(
         targets: targets.to_vec(),
         skipped: Vec::new(),
         settings,
+        vm: Default::default(),
         dry_activate: request.dry_activate,
         boot: false,
         throttle: request.throttle,

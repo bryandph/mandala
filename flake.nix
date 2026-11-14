@@ -205,6 +205,13 @@
             names}
           touch $out
         '';
+      vm-owner-resolution = self.packages.${pkgs.stdenv.hostPlatform.system}.mandala-rs.overrideAttrs (_: {
+        pname = "mandala-vm-owner-resolution";
+        cargoBuildFlags = ["-p" "mandala-core"];
+        cargoTestFlags = ["-p" "mandala-core" "vm_owner_resolution"];
+        installPhase = "mkdir -p $out";
+        postFixup = "";
+      });
       vm-member-schema = assert import ./tests/vm-member-schema.nix {inherit lib;}; pkgs.runCommand "vm-member-schema" {} "touch $out";
       vm-projections = assert import ./tests/vm-projections.nix {inherit lib;}; pkgs.runCommand "vm-projections" {} "touch $out";
       builder-renderer = assert import ./tests/builder-renderer.nix {inherit lib;}; pkgs.runCommand "builder-renderer" {} "touch $out";

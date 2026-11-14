@@ -29,10 +29,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The aggregate schema version this build understands (the retired Python
-/// package's `SUPPORTED_SCHEMA_VERSION`, carried forward). Anything
-/// else is rejected at [`Inventory`] construction rather than misread.
-pub const SUPPORTED_SCHEMA_VERSION: u64 = 1;
+/// The highest aggregate schema version this build understands. Versions 1
+/// (legacy fleets) and 2 (typed VM ownership) are supported. Anything else is
+/// rejected at [`Inventory`] construction rather than misread.
+pub const SUPPORTED_SCHEMA_VERSION: u64 = 2;
 
 /// Validate a member selector as one bare RFC 1123 host label. Mandala keeps
 /// network plane/domain data separate and constructs FQDNs in projections, so
@@ -237,9 +237,9 @@ pub struct Inventory {
 
 impl Inventory {
     /// Build an inventory from an already-evaluated aggregate value, gating on
-    /// `schemaVersion` exactly as the Python core does: the version must equal
-    /// [`SUPPORTED_SCHEMA_VERSION`] or construction fails with a message naming
-    /// the found vs supported version.
+    /// `schemaVersion` before deserialization. Versions 1 and 2 are accepted;
+    /// other versions fail with a message naming the found and latest supported
+    /// version. Version-2 ownership is independently validated before effects.
     ///
     /// # Errors
     /// [`InventoryError::UnsupportedSchema`] if the version does not match;
@@ -260,7 +260,7 @@ impl Inventory {
         // Gate the schema BEFORE typed deserialization, so a version mismatch
         // yields the "found vs supported" message rather than a serde error.
         let found = value.get("schemaVersion");
-        if found.and_then(Value::as_u64) != Some(SUPPORTED_SCHEMA_VERSION) {
+        if !matches!(found.and_then(Value::as_u64), Some(1 | 2)) {
             return Err(InventoryError::UnsupportedSchema {
                 found: schema_display(found),
                 supported: SUPPORTED_SCHEMA_VERSION,
@@ -355,10 +355,12 @@ impl Inventory {
                 Ok(platform.to_string())
             })
             .transpose()?;
-        Ok(Self {
+        let inventory = Self {
             aggregate,
             controller_platform,
-        })
+        };
+        crate::vm::validate(&inventory)?;
+        Ok(inventory)
     }
 
     /// Evaluate `<flake>#mandala` through the supplied evaluator and build a
@@ -797,19 +799,19 @@ mod tests {
     #[test]
     fn schema_gate_rejects_a_newer_version_naming_both() {
         let err = Inventory::from_value(json!({
-            "schemaVersion": 2, "members": {}, "groups": {}
+            "schemaVersion": 3, "members": {}, "groups": {}
         }))
         .unwrap_err();
         assert_eq!(
             err,
             InventoryError::UnsupportedSchema {
-                found: "2".to_string(),
-                supported: 1
+                found: "3".to_string(),
+                supported: 2
             }
         );
         assert_eq!(
             err.to_string(),
-            "aggregate schemaVersion 2 unsupported (this CLI understands 1)"
+            "aggregate schemaVersion 3 unsupported (this CLI understands 2)"
         );
     }
 
@@ -818,7 +820,7 @@ mod tests {
         let err = Inventory::from_value(json!({"members": {}, "groups": {}})).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "aggregate schemaVersion None unsupported (this CLI understands 1)"
+            "aggregate schemaVersion None unsupported (this CLI understands 2)"
         );
     }
 

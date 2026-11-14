@@ -15,7 +15,7 @@ Implementation is approved. Phase A implements the pure Nix contract only; unche
 - [x] 2.4a Add pure guest-to-owner resolution with deduplication, retained requested identities and all potentially affected siblings; reject conflicting explicit exclusions.
 - [ ] 2.4b Preview the same immutable plan through CLI/TUI/MCP approval paths, and require renewed approval on impact/revision changes.
 - [x] 2.5a Add pure aggregate version-2 ownership/application-reference output. Prove version-1 non-VM parity and no forced derivations in JSON.
-- [ ] 2.5b Add frontend negotiation and unsupported-version rejection before effects for VM-aware readers.
+- [x] 2.5b Add frontend negotiation and unsupported-version rejection before effects for VM-aware readers.
 
 ## 3. One build graph and one qualified backend
 

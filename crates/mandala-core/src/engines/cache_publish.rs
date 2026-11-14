@@ -343,6 +343,7 @@ mod tests {
                     targets: vec!["a".into(), "b".into(), "c".into()],
                     skipped: vec![],
                     settings: BTreeMap::new(),
+                    vm: Default::default(),
                     dry_activate: false,
                     boot: false,
                     halt_on_build_failure: false,

@@ -11,6 +11,7 @@ pub mod inventory;
 pub mod registry;
 pub mod runner;
 pub mod supervisor;
+pub mod vm;
 
 pub use cli::{Cli, Engine, TuiRequest};
 pub use drift::{DriftEntry, DriftError, DriftStatus, Snapshot};

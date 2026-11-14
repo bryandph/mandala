@@ -1,10 +1,11 @@
 # VM member contract
 
-This is the **pure Nix contract**, not a deploy-ready runtime backend. Existing
-frontends only accepting aggregate version 1 reject VM-bearing version 2 fleets.
-Owner locking, runtime application/verification/recovery, version negotiation and
-CLI/TUI/MCP approval previews must be implemented and qualified before adoption.
-No consumer or live VM is enrolled by these declarations.
+This is an additive contract, **not yet a deploy-ready runtime backend**. Rust
+readers accept aggregate versions 1 and 2 and validate ownership independently.
+`mandala deploy run --limit guest-a --preview` displays the resolved owner and
+all affected siblings without registering a run, building or contacting a host.
+Owner-unit registration and VM-bearing campaigns fail closed until runtime and
+campaign qualification are complete. No consumer or live VM is enrolled.
 
 ## One identity, one lifecycle owner
 
@@ -129,7 +130,32 @@ confirmation alone cannot prove guest runtime success. Runtime restoration,
 owner-enforced cross-controller serialization and first-time guest creation
 refusal remain backend qualification requirements, not claims of this Nix phase.
 
+## Rust manifest and selection contract
+
+`mandala_core::vm` retains selected members and requested guests separately from
+owner units. Owner-plus-guest selections deduplicate the existing owner profile
+installable in the native batch build. Excluding an affected sibling or required
+owner is an error, including when selecting the owner directly. Ordinary
+nondeployable standalone members are still skipped.
+
+The version-1 typed runtime manifest lives at
+`mandala/vm-application.json` inside the owner profile. Its owner/system/backend
+and exact guest set must match the preview. Each guest declares its runtime
+instance, desired identity, immutable artifact, bounded readiness contract and
+recovery contract. The adapter and every artifact/contract must be store
+references in the independently queried owner closure, not arbitrary shell hooks
+or an additional guest build. Readiness deadlines are between 1 and 3600 seconds.
+Previous owner profile, running generation, boot default and every affected
+ready guest runtime/artifact are required; missing prior runtime refuses creation.
+These are validation contracts, not a claim that runtime effects are enabled.
+Writable disks, application data and external services are not reverted.
+
 ## Tests
+
+`vm-owner-resolution` runs the isolated Rust owner-plan and manifest validation
+suite: no owner/guest/network is contacted. It covers version negotiation,
+forged aggregates, immutable dependencies, sibling exclusions, deduplication,
+approval fingerprint changes and the temporary campaign/runtime fail-closed gates.
 
 `vm-member-schema` tests local/module and fleet validation, including a negative
 macOS owner and missing configurations/artifacts. `vm-projections` tests direct

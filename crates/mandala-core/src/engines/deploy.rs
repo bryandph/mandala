@@ -56,6 +56,12 @@ pub fn engine() -> Engine {
                         .help("Selector: @group (expanded to the projected members), member, or comma-list"),
                 )
                 .arg(
+                    Arg::new("preview")
+                        .long("preview")
+                        .action(ArgAction::SetTrue)
+                        .help("Print resolved owner/sibling impact without registering or building"),
+                )
+                .arg(
                     Arg::new("dry-activate")
                         .long("dry-activate")
                         .action(ArgAction::SetTrue)
@@ -108,6 +114,8 @@ pub struct DeployPlan {
     pub skipped: Vec<String>,
     /// Flattened settings for exactly [`Self::targets`].
     pub settings: BTreeMap<String, Value>,
+    /// Conservative owner/guest impact shared by every frontend.
+    pub vm: crate::vm::OwnerPlan,
     /// Whether activation is suppressed after copy.
     pub dry_activate: bool,
     /// Whether every selected member uses boot activation for this run.
@@ -118,6 +126,18 @@ pub struct DeployPlan {
     pub publish: cache_publish::Config,
     /// Maximum per-host concurrency for the later fan-out stage.
     pub throttle: i64,
+}
+
+impl DeployPlan {
+    /// Pure shared frontend preview; does not allocate a run or authorize effects.
+    #[must_use]
+    pub fn preview(&self) -> Value {
+        serde_json::json!({
+            "limit": self.limit, "targets": self.targets, "skipped": self.skipped,
+            "ownerPlan": self.vm, "settings": self.settings,
+            "dryActivate": self.dry_activate, "boot": self.boot,
+        })
+    }
 }
 
 /// A prepared native deploy after its discoverable registry files exist.
@@ -360,6 +380,8 @@ pub enum DeployRunError {
         host: String,
         error: serde_json::Error,
     },
+    /// Owner runtime qualification has not yet enabled mutation.
+    OwnerBackendUnavailable,
     /// Creating the run registry failed.
     Registry(io::Error),
 }
@@ -383,6 +405,10 @@ impl fmt::Display for DeployRunError {
             Self::InvalidMemberSettings { host, error } => {
                 write!(f, "invalid flattened deploy settings for {host}: {error}")
             }
+            Self::OwnerBackendUnavailable => write!(
+                f,
+                "VM owner backend unavailable; owner application cannot be registered"
+            ),
             Self::Registry(err) => write!(f, "creating deploy registry run: {err}"),
         }
     }
@@ -449,9 +475,14 @@ pub fn plan_run_with_boot(
     }
     let canonical_limit = inv.to_limit(limit)?;
     let selected: Vec<String> = canonical_limit.split(',').map(str::to_string).collect();
-    let (targets, skipped): (Vec<_>, Vec<_>) = selected
+    let vm = crate::vm::resolve(inv, limit)?;
+    let (mut targets, skipped): (Vec<_>, Vec<_>) = selected
         .into_iter()
+        .filter(|host| inv.members()[host].get("kind").and_then(Value::as_str) != Some("vm"))
         .partition(|host| deploy_rs_enabled(inv, host));
+    targets.extend(vm.units.keys().cloned());
+    targets.sort();
+    targets.dedup();
 
     if targets.is_empty() {
         return Err(DeployRunError::NoDeployableMembers(canonical_limit));
@@ -482,6 +513,7 @@ pub fn plan_run_with_boot(
         targets,
         skipped,
         settings,
+        vm,
         dry_activate,
         boot,
         halt_on_build_failure: false,
@@ -504,6 +536,11 @@ fn now_epoch_f64() -> f64 {
 /// # Errors
 /// Any registry directory, stream, or metadata write failure.
 pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunError> {
+    // Safe additive checkpoint: resolution/build contracts may be inspected,
+    // but ordinary host activation must never bypass guest verification.
+    if !plan.vm.units.is_empty() {
+        return Err(DeployRunError::OwnerBackendUnavailable);
+    }
     let (run_id, path) = registry::new_run_dir()?;
     for host in &plan.targets {
         std::fs::File::create(path.join(format!("{host}.jsonl")))?;
@@ -1678,6 +1715,24 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
     let flake = m.get_one::<String>("flake").map_or(".", String::as_str);
     match m.subcommand() {
         Some(("run", sm)) => {
+            if sm.get_flag("preview") {
+                return match plan_run_with_boot(
+                    inv,
+                    sm.get_one::<String>("limit").map_or("", String::as_str),
+                    *sm.get_one::<i64>("throttle").unwrap_or(&4),
+                    sm.get_flag("dry-activate"),
+                    sm.get_flag("boot"),
+                ) {
+                    Ok(plan) => {
+                        println!("{}", plan.preview());
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("mandala: {error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             let _signals = match mandala_deploy::process::SignalForwarder::install(true) {
                 Ok(signals) => signals,
                 Err(error) => {
