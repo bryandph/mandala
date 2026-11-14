@@ -678,7 +678,11 @@ mod tests {
         let line = std::fs::read_to_string(path.join("alpha.jsonl")).unwrap();
         let timestamp = serde_json::from_str::<Value>(&line).unwrap()["ts"].clone();
         assert!(timestamp.is_number());
-        let line = line.replace(&format!("\"ts\":{timestamp}"), "\"ts\":42.0");
+        // Normalize the whole serialized `ts` token: re-formatting the parsed
+        // float can differ from the writer's digits and match only a prefix.
+        let start = line.find("\"ts\":").unwrap() + "\"ts\":".len();
+        let end = start + line[start..].find(',').unwrap();
+        let line = format!("{}42.0{}", &line[..start], &line[end..]);
         assert_eq!(
             line.trim(),
             r#"{"v":2,"ts":42.0,"host":"alpha","plugin":"deploy","event":"copy","controller_nar_bytes":4096,"duration_ms":125,"paths_copied":2,"substitute_on_destination":true,"success":true}"#
