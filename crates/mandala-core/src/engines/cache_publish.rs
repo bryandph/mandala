@@ -344,6 +344,7 @@ mod tests {
                     skipped: vec![],
                     settings: BTreeMap::new(),
                     vm: Default::default(),
+                    vm_revision: None,
                     dry_activate: false,
                     boot: false,
                     halt_on_build_failure: false,

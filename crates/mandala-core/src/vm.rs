@@ -15,20 +15,8 @@ pub mod manifest;
 pub mod observations;
 pub mod owner;
 
-/// Campaign mutation stays closed until frozen owner units and retry evidence
-/// have been integrated. Non-VM campaigns retain their existing behavior.
-///
-/// # Errors
-/// VM-bearing selection or an invalid/conflicting selection.
-pub fn ensure_campaign_supported(inv: &Inventory, selector: &str) -> Result<(), InventoryError> {
-    if !resolve(inv, selector)?.units.is_empty() {
-        return Err(invalid(
-            "VM owner units are not yet supported by frozen campaign targets",
-        ));
-    }
-    Ok(())
-}
-
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -76,6 +64,99 @@ pub struct OwnerPlan {
 }
 
 impl OwnerPlan {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// Preserve complete owner boundaries when a frozen retry narrows work.
+    #[must_use]
+    pub fn for_targets(&self, targets: &[String]) -> Self {
+        let mut plan = self.clone();
+        plan.units.retain(|owner, _| targets.contains(owner));
+        if plan.units.is_empty() {
+            return Self::default();
+        }
+        let guests: BTreeSet<_> = plan
+            .units
+            .values()
+            .flat_map(|u| u.affected_guests.iter())
+            .collect();
+        plan.selected_members
+            .retain(|name| targets.contains(name) || guests.contains(name));
+        plan.requested_guests.retain(|name| guests.contains(name));
+        plan
+    }
+
+    /// Validate immutable impact descriptions without a live inventory.
+    ///
+    /// # Errors
+    /// Inconsistent ownership, requested identities, compatibility or impact.
+    pub fn validate_bound(&self) -> Result<(), InventoryError> {
+        let selected: BTreeSet<_> = self.selected_members.iter().collect();
+        let requested: BTreeSet<_> = self.requested_guests.iter().collect();
+        if selected.len() != self.selected_members.len()
+            || requested.len() != self.requested_guests.len()
+            || !requested.is_subset(&selected)
+            || selected
+                .iter()
+                .any(|n| !crate::inventory::is_valid_member_name(n))
+            || (self.units.is_empty() && (!selected.is_empty() || !requested.is_empty()))
+        {
+            return Err(invalid("invalid frozen VM selection"));
+        }
+        let mut all_guests = BTreeSet::new();
+        let mut all_requested = BTreeSet::new();
+        for (owner, unit) in &self.units {
+            let app = &unit.application;
+            let affected: Vec<_> = app.guests.keys().cloned().collect();
+            let expected_requested: Vec<_> = affected
+                .iter()
+                .filter(|n| selected.contains(n))
+                .cloned()
+                .collect();
+            let expected_siblings: Vec<_> = affected
+                .iter()
+                .filter(|n| !selected.contains(n))
+                .cloned()
+                .collect();
+            if !crate::inventory::is_valid_member_name(owner)
+                || owner != &unit.owner
+                || owner != &app.owner
+                || app.backend != "nixos-module"
+                || app.manifest_version != 1
+                || app.application != format!(".#deploy.nodes.{owner}.profiles.system.path")
+                || app.guests.is_empty()
+                || unit.affected_guests != affected
+                || unit.requested_guests != expected_requested
+                || unit.potentially_affected_guests != expected_siblings
+                || unit.recovery_limit != RECOVERY_LIMIT
+                || !app.supported_systems.contains(&unit.owner_system)
+                || !matches!(unit.owner_system.as_str(), "x86_64-linux" | "aarch64-linux")
+                || (!selected.contains(owner) && expected_requested.is_empty())
+            {
+                return Err(invalid(format!("invalid frozen VM owner unit {owner}")));
+            }
+            for (name, guest) in &app.guests {
+                if !crate::inventory::is_valid_member_name(name)
+                    || self.units.contains_key(name)
+                    || !all_guests.insert(name)
+                    || !app.supported_systems.contains(&guest.system)
+                    || !matches!(guest.system.as_str(), "x86_64-linux" | "aarch64-linux")
+                {
+                    return Err(invalid(format!("invalid frozen VM guest {name}")));
+                }
+            }
+            all_requested.extend(unit.requested_guests.iter());
+        }
+        if all_requested != requested {
+            return Err(invalid(
+                "frozen VM requested guests disagree with owner units",
+            ));
+        }
+        Ok(())
+    }
+
     /// Deterministic approval identity; no transport or evaluation is performed.
     ///
     /// # Errors

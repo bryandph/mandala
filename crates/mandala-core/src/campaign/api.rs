@@ -42,7 +42,18 @@ pub fn narrow(
     Ok(Some(
         names
             .into_iter()
-            .filter(|name| c.target.hosts.contains_key(name))
+            .filter_map(|name| {
+                if c.target.hosts.contains_key(&name) {
+                    Some(name)
+                } else {
+                    c.target
+                        .vm_owner_plan
+                        .units
+                        .iter()
+                        .find(|(_, unit)| unit.affected_guests.contains(&name))
+                        .map(|(owner, _)| owner.clone())
+                }
+            })
             .collect(),
     ))
 }
@@ -64,10 +75,15 @@ pub fn create(store: &Store, flake: &str, request: CreateRequest<'_>) -> io::Res
         request.boot,
     )?;
     let names = capture.plan.targets.clone();
-    let required = names.join(",");
+    let required = capture
+        .target
+        .required_confirm(AttemptKind::Deploy, &names, false)?;
     if !request.preview && request.confirm != Some(required.as_str()) {
-        return Ok(
+        return owner_preview(
             json!({"ok":false,"refused":true,"confirmation_required":true,"reason":"real creation requires exact eligible confirmation","required_confirm":required,"names":names,"generation":0,"target_digest":capture.target.digest()?,"source":views::source_summary(&capture.target.source)?}),
+            &capture.target,
+            &names,
+            false,
         );
     }
     let c = capture.bind(store)?;
@@ -75,7 +91,20 @@ pub fn create(store: &Store, flake: &str, request: CreateRequest<'_>) -> io::Res
     result["preview"] = Value::Bool(request.preview);
     result["ready_to_deploy"] = Value::Bool(!request.preview && !names.is_empty());
     result["required_confirm"] = Value::from(required);
-    result["names"] = Value::from(names);
+    result["names"] = Value::from(names.clone());
+    owner_preview(result, &capture.target, &names, false)
+}
+
+fn owner_preview(
+    mut result: Value,
+    target: &Target,
+    names: &[String],
+    dry: bool,
+) -> io::Result<Value> {
+    let plan = execution::target_plan(target, names, dry, 1)?;
+    if !plan.vm.is_empty() {
+        result["owner_preview"] = plan.preview();
+    }
     Ok(result)
 }
 
@@ -122,8 +151,13 @@ pub fn review(
     let c = store.load(id)?;
     c.ensure_idle(generation)?;
     let names = c.eligible(kind, narrow)?;
-    let required = names.join(",");
-    let mut result = json!({"ok":true,"campaign_id":id,"target_digest":c.target_digest,"generation":c.generation,"names":names,"required_confirm":required,"dry_activate":dry});
+    let required = c.required_confirm(kind, &names, dry)?;
+    let mut result = owner_preview(
+        json!({"ok":true,"campaign_id":id,"target_digest":c.target_digest,"generation":c.generation,"names":names,"required_confirm":required,"dry_activate":dry}),
+        &c.target,
+        &names,
+        dry,
+    )?;
     if names.is_empty() {
         result["no_op"] = Value::Bool(true);
         return Ok(result);
@@ -147,7 +181,9 @@ pub fn review(
         }
     }
     if result["ok"] == true
-        && (kind == AttemptKind::Reboot || !dry)
+        && (kind == AttemptKind::Reboot
+            || !dry
+            || !c.target.vm_owner_plan.for_targets(&names).is_empty())
         && confirm != Some(required.as_str())
         && !names.is_empty()
     {
@@ -353,14 +389,17 @@ fn verify_registered(
             &drift::read_snapshots(&store.state_dir()),
             Utc::now(),
         )?;
-        return Ok(json!({
-            "ok":true,"campaign_id":id,"closed_read_only":initial.closure.is_some(),
-            "no_op":names.is_empty(),"recorded":false,"complete":false,
-            "comparison_complete":views::complete(&initial,&entries),
-            "entries":entries,"exclusions":initial.effective_exclusions(),
-            "original_count":initial.target.selection.members.len(),"eligible_count":names.len(),
-            "survey_performed":false,
-        }));
+        return views::with_vm_evidence(
+            json!({
+                "ok":true,"campaign_id":id,"closed_read_only":initial.closure.is_some(),
+                "no_op":names.is_empty(),"recorded":false,"complete":false,
+                "comparison_complete":views::complete(&initial,&entries),
+                "entries":entries,"exclusions":initial.effective_exclusions(),
+                "original_count":initial.target.selection.members.len(),"eligible_count":names.len(),
+                "survey_performed":false,
+            }),
+            &initial,
+        );
     }
     let number = store
         .transaction(id, |c| {
@@ -427,15 +466,18 @@ fn verify_registered(
     let recorded = latest.closure.is_none();
     let stale = latest.generation != generation;
     let complete = captured_complete && recorded && !stale;
-    let report = json!({
-        "ok":survey_ok,"campaign_id":id,"run_id":run_id,"attempt":number,
-        "generation":generation,"current_generation":latest.generation,
-        "generation_stale":stale,"target_digest":dispatch.target_digest,
-        "recorded":recorded,"complete":complete,"captured_complete":captured_complete,
-        "entries":entries,"exclusions":dispatch.effective_exclusions(),
-        "original_count":dispatch.target.selection.members.len(),"eligible_count":names.len(),
-        "survey_performed":refresh,"survey":survey_result,"survey_error":survey_error,
-    });
+    let report = views::with_vm_evidence(
+        json!({
+            "ok":survey_ok,"campaign_id":id,"run_id":run_id,"attempt":number,
+            "generation":generation,"current_generation":latest.generation,
+            "generation_stale":stale,"target_digest":dispatch.target_digest,
+            "recorded":recorded,"complete":complete,"captured_complete":captured_complete,
+            "entries":entries,"exclusions":dispatch.effective_exclusions(),
+            "original_count":dispatch.target.selection.members.len(),"eligible_count":names.len(),
+            "survey_performed":refresh,"survey":survey_result,"survey_error":survey_error,
+        }),
+        &dispatch,
+    )?;
     let temporary = path.join("verification.json.tmp");
     let mut file = File::create(&temporary)?;
     file.write_all(&canonical(&report)?)?;

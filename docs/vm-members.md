@@ -1,11 +1,12 @@
 # VM member contract
 
-This is an additive contract, **not yet a deploy-ready runtime backend**. Rust
-readers accept aggregate versions 1 and 2 and validate ownership independently.
-`mandala deploy run --limit guest-a --preview` displays the resolved owner and
-all affected siblings without registering a run, building or contacting a host.
-Owner-unit registration and VM-bearing campaigns fail closed until runtime and
-campaign qualification are complete. No consumer or live VM is enrolled.
+This additive contract has an effect-isolated, opt-in `nixos-module` owner
+backend. Rust readers accept aggregate versions 1 and 2 and validate ownership
+independently. `mandala deploy run --limit guest-a --preview` displays the owner,
+all affected siblings and `requiredOwnerApproval` without registering a run,
+building or contacting a host. VM work requires this exact approval fingerprint,
+also for dry activation, and a separately qualified consumer adapter. No consumer
+or live VM is enrolled by this change.
 
 ## One identity, one lifecycle owner
 
@@ -212,13 +213,16 @@ enables do not skip ownership resolution; ordinary nondeployable standalone
 members are skipped. Explicitly excluding an owner or any affected sibling is a
 conflict, including when the owner is selected directly. Unknown IDs are refused.
 
-This function performs no approval or effects. Future frontends must bind impact
-and revision to approval, display readiness/recovery and disk/data limitations,
-and require renewed approval when the immutable plan changes. Owner host
-confirmation alone cannot prove guest runtime success. The optional
-[owner runtime helper](vm-owner-backend.md) implements the owner-side
-serialization/recovery seam; shared frontend settlement and approval still gate
-registration before real VM deployment can be authorized.
+This pure function performs no approval or effects. Native CLI/TUI/MCP use the
+same resolved owner plan, settings, mode and inventory-content identity for
+approval. CLI passes `--approve-owner-plan <requiredOwnerApproval>`; MCP passes
+`owner_approval`. A missing/stale approval refuses before registration/build,
+including when VM impact disappears. TUI captures the displayed plan instead of
+silently refreshing approval; the native child independently revalidates it.
+If the full native TUI modal cannot fit, confirmation is refused: enlarge the
+terminal or inspect/approve through CLI/MCP. Owner host confirmation alone cannot
+prove guest success. The optional [owner helper](vm-owner-backend.md) supplies the
+serialized runtime seam, not a runtime or permission for consumer adoption.
 
 ## Rust manifest and selection contract
 
@@ -237,15 +241,24 @@ references in the independently queried owner closure, not arbitrary shell hooks
 or an additional guest build. Readiness deadlines are between 1 and 3600 seconds.
 Previous owner profile, running generation, boot default and every affected
 ready guest runtime/artifact are required; missing prior runtime refuses creation.
-These are validation contracts, not a claim that runtime effects are enabled.
-Writable disks, application data and external services are not reverted.
+Missing helper, manifest, prior runtime or consumer capability refuses rather
+than falling back to a guest endpoint. Writable disks, application data and
+external services are not reverted.
 
 ## Tests
 
 `vm-owner-resolution` runs the isolated Rust owner-plan and manifest validation
 suite: no owner/guest/network is contacted. It covers version negotiation,
 forged aggregates, immutable dependencies, sibling exclusions, deduplication,
-approval fingerprint changes and the temporary campaign/runtime fail-closed gates.
+approval fingerprint changes, source/settings/mode/impact changes and refusal
+before run allocation. The backend check also gates shared approval reconstruction,
+frontend settlement, frozen VM campaigns and partial-failure owner-unit retries.
+VM campaigns write schema version 2; non-VM campaigns retain version-1 bytes.
+Guest identities narrow retries to their complete bound owner unit, never a
+partial guest application. Campaign `required_confirm` includes the owner-plan
+fingerprint; exact owner names alone are insufficient. Missing bound guest runtime
+evidence is explicitly `guest evidence missing`, never inferred from an owner
+survey or a successful reboot command.
 
 `vm-member-schema` tests local/module and fleet validation, including a negative
 macOS owner and missing configurations/artifacts. `vm-projections` tests direct

@@ -104,20 +104,27 @@ fn vm_owner_resolution_rejects_forged_aggregate_before_effects() {
 }
 
 #[test]
-fn vm_owner_resolution_campaign_gate_is_closed_only_for_vm_units() {
+fn vm_owner_resolution_frozen_impact_validates_without_live_inventory() {
     let inv = Inventory::from_value(fleet()).unwrap();
-    assert!(
-        ensure_campaign_supported(&inv, "guest-a")
-            .unwrap_err()
-            .to_string()
-            .contains("frozen campaign")
-    );
-    assert!(ensure_campaign_supported(&inv, "host-a").is_err());
+    let plan = resolve(&inv, "guest-a").unwrap();
+    plan.validate_bound().unwrap();
+    let mut corrupt = plan.clone();
+    corrupt
+        .units
+        .get_mut("host-a")
+        .unwrap()
+        .requested_guests
+        .clear();
+    assert!(corrupt.validate_bound().is_err());
+    assert_eq!(plan.for_targets(&[]), OwnerPlan::default());
     let legacy = Inventory::from_value(
         json!({"schemaVersion":1,"members":{"node-a":{"name":"node-a"}},"groups":{}}),
     )
     .unwrap();
-    assert!(ensure_campaign_supported(&legacy, "node-a").is_ok());
+    resolve(&legacy, "node-a")
+        .unwrap()
+        .validate_bound()
+        .unwrap();
     assert_eq!(resolve(&legacy, "node-a").unwrap(), OwnerPlan::default());
 }
 
@@ -150,7 +157,7 @@ fn vm_owner_resolution_native_build_targets_only_deduplicated_owner() {
     );
     assert!(matches!(
         crate::engines::deploy::register_run(plan),
-        Err(crate::engines::deploy::DeployRunError::OwnerBackendUnavailable)
+        Err(crate::engines::deploy::DeployRunError::OwnerApprovalRequired(_))
     ));
 }
 

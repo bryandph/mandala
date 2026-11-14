@@ -845,6 +845,28 @@ impl MandalaHandler {
             .map_err(|e| tool_error(e.to_string()))?;
         let dry_activate = t.dry_activate.unwrap_or(true);
         let boot = t.boot.unwrap_or(false);
+        let owner_plan =
+            mandala_core::vm::resolve(&inv, &t.selector).map_err(|e| tool_error(e.to_string()))?;
+        if owner_plan.is_empty() && t.owner_approval.is_some() {
+            return Ok(
+                json!({"ok":false,"refused":true,"reason":"VM owner impact disappeared; request a new preview"}),
+            );
+        }
+        if !owner_plan.is_empty() {
+            let plan = mandala_core::engines::deploy::plan_run_with_boot(
+                &inv,
+                &t.selector,
+                DEPLOY_THROTTLE,
+                dry_activate,
+                boot,
+            )
+            .map_err(|e| tool_error(e.to_string()))?;
+            if t.owner_approval != plan.required_owner_approval() {
+                return Ok(
+                    json!({"ok":false,"refused":true,"confirmation_required":true,"reason":"VM owner application requires exact current preview approval","preview":plan.preview(),"required_owner_approval":plan.required_owner_approval()}),
+                );
+            }
+        }
         if !dry_activate && t.confirm.as_deref() != Some(target.as_str()) {
             return Ok(json!({
                 "ok": false,
@@ -861,10 +883,13 @@ impl MandalaHandler {
             .launch_deploy(
                 &self.state.flake,
                 &target,
-                dry_activate,
-                boot,
-                t.cache_push,
-                DEPLOY_THROTTLE,
+                crate::effects::DeployLaunchOptions {
+                    dry_activate,
+                    boot,
+                    cache_push: t.cache_push,
+                    owner_approval: t.owner_approval.as_deref(),
+                    throttle: DEPLOY_THROTTLE,
+                },
             )
             .await
             .map_err(|e| tool_error(e.to_string()))?;
@@ -1374,7 +1399,9 @@ mod tests {
                 journal.unit.clone().unwrap(),
             )]),
         };
-        let meta = json!({"kind":"deploy","rc":0,"vm_owner_plan":plan});
+        let context = json!({"settings":{},"boot":false,"dryActivate":false,"targets":["host-a"]});
+        let token = plan.fingerprint("fixture-revision", &context).unwrap();
+        let meta = json!({"kind":"deploy","rc":0,"vm_owner_plan":plan,"vm_owner_context":context,"vm_inventory_identity":"fixture-revision","vm_owner_approval":token,"targets":["host-a"]});
         registry::write_meta(&path, meta.as_object().unwrap()).unwrap();
         std::fs::write(
             path.join("vm/host-a.json"),

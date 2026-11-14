@@ -52,6 +52,7 @@ impl Summary {
 #[serde(rename_all = "camelCase")]
 pub struct VmRun {
     pub plan: Option<OwnerPlan>,
+    pub approval: Option<serde_json::Value>,
     pub owners: BTreeMap<String, OwnerView>,
     pub summary: Summary,
     pub error: Option<String>,
@@ -80,12 +81,67 @@ impl VmRun {
                 };
             }
         };
+        let context = meta.get("vm_owner_context");
+        let revision = meta
+            .get("vm_inventory_identity")
+            .and_then(serde_json::Value::as_str);
+        let fingerprint = meta
+            .get("vm_owner_approval")
+            .and_then(serde_json::Value::as_str);
+        let valid_approval = plan.validate_bound().is_ok()
+            && context.is_some_and(|c| {
+                c["settings"].is_object()
+                    && c["targets"].as_array().is_some_and(|targets| {
+                        plan.units
+                            .keys()
+                            .all(|owner| targets.contains(&serde_json::Value::from(owner.clone())))
+                            && plan
+                                .units
+                                .values()
+                                .flat_map(|unit| unit.affected_guests.iter())
+                                .all(|guest| {
+                                    !targets.contains(&serde_json::Value::from(guest.clone()))
+                                })
+                    })
+                    && c.get("targets") == meta.get("targets")
+                    && c["boot"].as_bool()
+                        == Some(
+                            meta.get("boot")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                        )
+                    && c["dryActivate"].as_bool()
+                        == Some(
+                            meta.get("dry_activate")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                        )
+            })
+            && revision.is_some_and(|r| {
+                !r.is_empty()
+                    && context
+                        .is_some_and(|c| plan.fingerprint(r, c).ok().as_deref() == fingerprint)
+            });
+        if !valid_approval {
+            return Self {
+                summary: Summary {
+                    unknown: plan.units.values().map(|u| u.affected_guests.len()).sum(),
+                    ..Summary::default()
+                },
+                plan: Some(plan),
+                error: Some("missing, stale or inconsistent approved VM owner context".into()),
+                ..Self::default()
+            };
+        }
         let dry = meta
             .get("dry_activate")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let mut run = Self {
             plan: Some(plan.clone()),
+            approval: Some(
+                serde_json::json!({"fingerprint":fingerprint,"revision":revision,"context":context}),
+            ),
             ..Self::default()
         };
         for (owner, unit) in &plan.units {
@@ -144,6 +200,14 @@ impl VmRun {
         self.owners
             .values()
             .any(|o| o.verdict == Verdict::RolledBack)
+    }
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        self.error
+            .iter()
+            .map(|error| format!("VM evidence unavailable: {error}"))
+            .chain(self.owners.keys().flat_map(|owner| self.owner_lines(owner)))
+            .collect()
     }
     #[must_use]
     pub fn owner_lines(&self, owner: &str) -> Vec<String> {

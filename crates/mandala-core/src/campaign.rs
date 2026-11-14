@@ -177,15 +177,79 @@ pub struct Target {
     pub selection: Selection,
     pub hosts: BTreeMap<String, HostTarget>,
     pub initial_exclusions: BTreeMap<String, Exclusion>,
+    #[serde(default, skip_serializing_if = "crate::vm::OwnerPlan::is_empty")]
+    pub vm_owner_plan: crate::vm::OwnerPlan,
 }
 
 impl Target {
+    /// Effect-free shared frontend view of the selected frozen owner units.
+    pub fn deploy_preview(&self, targets: &[String], dry: bool) -> io::Result<Value> {
+        Ok(execution::target_plan(self, targets, dry, 1)?.preview())
+    }
+    pub fn required_confirm(
+        &self,
+        kind: AttemptKind,
+        targets: &[String],
+        dry: bool,
+    ) -> io::Result<String> {
+        let plan = execution::target_plan(self, targets, dry, 1)?;
+        let names = targets.join(",");
+        Ok(match plan.required_owner_approval() {
+            None => names,
+            Some(token) => format!(
+                "{names}@{}",
+                if kind == AttemptKind::Deploy {
+                    token
+                } else {
+                    self.vm_owner_plan
+                        .for_targets(targets)
+                        .fingerprint(
+                            &self.digest()?,
+                            &serde_json::json!({"kind":kind,"targets":targets}),
+                        )
+                        .map_err(invalid_json)?
+                }
+            ),
+        })
+    }
     pub fn digest(&self) -> io::Result<String> {
         Ok(digest(&canonical(self)?))
     }
 
     pub fn validate(&self) -> io::Result<()> {
         self.source.validate()?;
+        self.vm_owner_plan
+            .validate_bound()
+            .map_err(|e| invalid(e.to_string()))?;
+        let vm_guests: BTreeSet<_> = self
+            .vm_owner_plan
+            .units
+            .values()
+            .flat_map(|u| u.affected_guests.iter())
+            .collect();
+        if self
+            .vm_owner_plan
+            .units
+            .keys()
+            .any(|owner| !self.hosts.contains_key(owner))
+            || vm_guests
+                .iter()
+                .any(|guest| self.hosts.contains_key(*guest))
+            || self
+                .vm_owner_plan
+                .selected_members
+                .iter()
+                .chain(vm_guests.iter().copied())
+                .any(|n| !self.selection.members.contains(n))
+            || self
+                .initial_exclusions
+                .keys()
+                .any(|n| self.vm_owner_plan.units.contains_key(n) || vm_guests.contains(n))
+        {
+            return Err(invalid(
+                "frozen VM units disagree with campaign membership or exclusions",
+            ));
+        }
         let members: BTreeSet<_> = self.selection.members.iter().cloned().collect();
         let deploy: BTreeSet<_> = self.selection.deploy_members.iter().cloned().collect();
         if self.selection.selector.trim().is_empty()
@@ -227,6 +291,9 @@ impl Target {
             }
         }
         for name in members.difference(&deploy) {
+            if vm_guests.contains(name) {
+                continue;
+            }
             if !self
                 .initial_exclusions
                 .get(name)
@@ -354,7 +421,11 @@ impl Campaign {
         let target_digest = target.digest()?;
         Ok(Self {
             campaign_id: id,
-            schema_version: SCHEMA_VERSION,
+            schema_version: if target.vm_owner_plan.is_empty() {
+                SCHEMA_VERSION
+            } else {
+                2
+            },
             created_at: now,
             created_by: "library".into(),
             target,
@@ -370,7 +441,9 @@ impl Campaign {
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !matches!(self.schema_version, 1 | 2)
+            || (self.schema_version == 1 && !self.target.vm_owner_plan.is_empty())
+        {
             return Err(invalid(format!(
                 "unsupported campaign schema {}",
                 self.schema_version
@@ -582,6 +655,15 @@ impl Campaign {
             .collect())
     }
 
+    pub fn required_confirm(
+        &self,
+        kind: AttemptKind,
+        targets: &[String],
+        dry: bool,
+    ) -> io::Result<String> {
+        self.target.required_confirm(kind, targets, dry)
+    }
+
     /// Prepare ownership before allocating/linking a run. `None` means an empty
     /// eligible set, not a new run. Real mutations use the exact-name gate.
     pub fn prepare(&mut self, request: Dispatch<'_>) -> io::Result<Option<u64>> {
@@ -593,9 +675,20 @@ impl Campaign {
         if targets.is_empty() {
             return Ok(None);
         }
-        let required = targets.join(",");
+        if request.kind == AttemptKind::Reboot
+            && targets
+                .iter()
+                .any(|owner| self.target.vm_owner_plan.units.contains_key(owner))
+        {
+            return Err(invalid(
+                "VM owner reboot requires a separately qualified serialized owner transaction",
+            ));
+        }
+        let required = self.required_confirm(request.kind, &targets, request.dry_activate)?;
         if (request.kind == AttemptKind::Reboot
-            || (request.kind == AttemptKind::Deploy && !request.dry_activate))
+            || (request.kind == AttemptKind::Deploy
+                && (!request.dry_activate
+                    || !self.target.vm_owner_plan.for_targets(&targets).is_empty())))
             && request.confirm != Some(required.as_str())
         {
             return Err(io::Error::new(
@@ -798,7 +891,7 @@ impl Store {
         if value["campaign_id"].as_str() != Some(id) {
             return Err(invalid("campaign id mismatch"));
         }
-        if version != SCHEMA_VERSION {
+        if !matches!(version, 1 | 2) {
             return Ok(Inspection::Unsupported {
                 campaign_id: id.into(),
                 schema_version: version,

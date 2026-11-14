@@ -130,6 +130,28 @@ Native deployment SHALL resolve canonical selectors once, retain selected member
 - **WHEN** a selected VM's owner has no supported host-application adapter
 - **THEN** deployment refuses before build or transport effects and never falls back to guest SSH
 
+#### Scenario: approval becomes stale before native child dispatch
+- **WHEN** source inventory content, owner impact, settings or mode changes after a frontend previews a VM unit, including disappearance of VM impact
+- **THEN** native dispatch refuses the captured approval before registration/build and requires a new shared preview
+
+### Requirement: Frozen campaigns retain complete owner units
+VM campaigns SHALL bind version-2 immutable owner-unit targets while preserving version-1 non-VM records. Requested guests and affected siblings SHALL remain distinct, but build/activation/retry/confirmation SHALL operate on complete owner units. Pure live preflight SHALL only reject invalid capture requests before archive/root effects; frozen inventory SHALL remain authoritative and repeated validation SHALL refuse races without a published campaign. Successful independent units SHALL remain untouched by retries, and unknown guest evidence SHALL block replay.
+
+#### Scenario: an owner dependency fails but an independent owner succeeds
+- **WHEN** a frozen VM owner build fails while an independent owner confirms
+- **THEN** retry builds/copies/activates only the failed owner with its original requested guest identities and captured paths/settings
+
+#### Scenario: frozen inventory rejects a live preflight result
+- **WHEN** the reject-only live preflight passes but frozen ownership/exclusions conflict after source movement
+- **THEN** temporary roots are cleaned and no campaign, profile build or host action is published
+
+### Requirement: Unserialized VM campaign reboot is refused
+Until a separately qualified serialized owner reboot/reconnect transaction exists, a campaign reboot request containing any eligible VM owner SHALL be wholly refused before survey/wrapper/run allocation. The refusal SHALL name VM owners and request explicit exclusion for ordinary-only dispatch. Ordinary-host reboots and read-only verification SHALL remain available. Owner surveys and reboot exit status SHALL NOT replace missing guest runtime evidence.
+
+#### Scenario: mixed reboot request includes a VM owner
+- **WHEN** eligible reboot targets mix a VM owner and ordinary hosts
+- **THEN** the whole request is refused without partial dispatch, VM owners remain pending/guest-evidence-missing and read-only verify remains permitted
+
 ### Requirement: Single module-managed backend applies prebuilt guests through their owner
 The initial `nixos-module` backend SHALL support only explicitly qualified NixOS owner/NixOS guest pairs with an injected owner module. It SHALL expose a versioned typed manifest and bounded inspect, prepare, apply, verify and restore operations. Evidence SHALL identify owner and guest, runtime instance, desired/previous/observed immutable generation or image, readiness contract/results, supported systems and per-guest dispositions. All transfer and runtime control SHALL use the owner's flattened transport and privilege settings, never guest SSH or guest-exec.
 

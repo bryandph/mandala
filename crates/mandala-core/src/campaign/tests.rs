@@ -70,6 +70,7 @@ pub(super) fn target() -> Target {
             ("node-c".into(), host),
         ]),
         initial_exclusions: BTreeMap::new(),
+        vm_owner_plan: Default::default(),
     }
 }
 fn campaign() -> Campaign {

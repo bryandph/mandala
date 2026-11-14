@@ -1,4 +1,4 @@
-Implementation is approved. Phase A implements the pure Nix contract only; unchecked backend, frontend and runtime qualification tasks remain future work. No consumer adoption or deployment is authorized.
+Implementation is approved. The pure contract, opt-in owner backend, durable frontends and frozen owner-unit campaign integration are implemented and effect-isolated. No consumer adoption or deployment is authorized. A serialized owner reboot/reconnect transaction is explicitly deferred; VM campaign reboot fails closed.
 
 ## 1. Review and schema foundation
 
@@ -13,7 +13,7 @@ Implementation is approved. Phase A implements the pure Nix contract only; unche
 - [x] 2.2 Preserve VM members and canonical taxonomy plus qualifying DNS/DHCP/docs records; test own addresses are not replaced by owner endpoints. Keep static guest-only groups from silently expanding to owners and explain the canonical-versus-transport group distinction.
 - [x] 2.3 Coordinate the VM guard with the builder facet without changing its separate capacity work: reject enabled VM builder declarations, require explicit owner systems/features/lanes and strict trust, preserve owner self-exclusion and no inferred emulation.
 - [x] 2.4a Add pure guest-to-owner resolution with deduplication, retained requested identities and all potentially affected siblings; reject conflicting explicit exclusions.
-- [ ] 2.4b Preview the same immutable plan through CLI/TUI/MCP approval paths, and require renewed approval on impact/revision changes.
+- [x] 2.4b Preview the same immutable plan through CLI/TUI/MCP approval paths, and require renewed approval on impact/revision changes.
 - [x] 2.5a Add pure aggregate version-2 ownership/application-reference output. Prove version-1 non-VM parity and no forced derivations in JSON.
 - [x] 2.5b Add frontend negotiation and unsupported-version rejection before effects for VM-aware readers.
 
@@ -44,8 +44,8 @@ Implementation is approved. Phase A implements the pure Nix contract only; unche
 - [x] 6.1a Add `vm-member-schema` and `vm-projections` checks in `flake.nix` for pure Nix contract suites, including pure owner resolution, without live VMs or network services.
 - [x] 6.1b Add `vm-owner-resolution` and `vm-owner-backend` Rust checks for the fake-effect suites. Gate backend apply/verify/restore, per-owner concurrent-run serialization, partial recovery and durable protocol behavior.
 - [x] 6.2a Run `nix build .#checks.x86_64-linux.vm-member-schema .#checks.x86_64-linux.vm-projections` for the pure Nix suites.
-- [x] 6.2b Run `nix build .#checks.<system>.vm-owner-resolution .#checks.<system>.vm-owner-backend` after the Rust targets exist; these remain proposed additions.
+- [x] 6.2b Run `nix build .#checks.<system>.vm-owner-resolution .#checks.<system>.vm-owner-backend` after the Rust targets exist; these are implemented additions.
 - [ ] 6.3 Run existing `nix build .#checks.<system>.fake-fleet`, `nix build .#packages.<system>.mandala-rs` and `nix develop -c cargo test --workspace` for non-VM parity and workspace/deploy/registry/termination regression coverage. Substitute the actual platform; `flake.nix` owns current target names.
 - [ ] 6.4 Run `nix fmt -- --check .` and `nix flake check`; record platform and environmental limits, not unrun-platform success. No effect-isolated check may require a real owner, guest, cache or fleet.
 - [ ] 6.5 Run `openspec validate vm-member-host-application --strict` when the CLI is available, validate delta/scenario coverage and scan new artifacts for organization-specific content. Report missing tooling explicitly.
-- [ ] 6.6 Return reviewed implementation evidence before any merge, deployment or consumer adoption. A macOS adapter remains a separate designed/approved change; completion of these artifacts does not approve implementation.
+- [ ] 6.6 Return reviewed implementation evidence before any merge, deployment or consumer adoption. A macOS adapter remains a separate designed/approved change; completion of these artifacts does not authorize deployment or consumer adoption.

@@ -73,12 +73,29 @@ fn plan(
     targets: &[String],
     request: &DeployRequest<'_>,
 ) -> io::Result<deploy::DeployPlan> {
-    if request.throttle <= 0 {
+    let mut plan = target_plan(
+        &campaign.target,
+        targets,
+        request.dry_activate,
+        request.throttle,
+    )?;
+    plan.halt_on_build_failure = request.halt_on_build_failure;
+    plan.publish = request.publish.clone();
+    Ok(plan)
+}
+
+pub(super) fn target_plan(
+    target: &Target,
+    targets: &[String],
+    dry: bool,
+    throttle: i64,
+) -> io::Result<deploy::DeployPlan> {
+    if throttle <= 0 {
         return Err(invalid("campaign throttle must be positive"));
     }
     let mut settings = BTreeMap::new();
     for name in targets {
-        let target = &campaign.target.hosts[name];
+        let target = &target.hosts[name];
         let mut value = target.settings.clone();
         value["activation"] = Value::from(match target.activation {
             ActivationMode::Boot => "boot",
@@ -91,12 +108,14 @@ fn plan(
         targets: targets.to_vec(),
         skipped: Vec::new(),
         settings,
-        vm: Default::default(),
-        dry_activate: request.dry_activate,
+        vm: target.vm_owner_plan.for_targets(targets),
+        vm_revision: (!target.vm_owner_plan.for_targets(targets).is_empty())
+            .then(|| target.source.snapshot.content_digest.clone()),
+        dry_activate: dry,
         boot: false,
-        throttle: request.throttle,
-        halt_on_build_failure: request.halt_on_build_failure,
-        publish: request.publish.clone(),
+        throttle,
+        halt_on_build_failure: false,
+        publish: Default::default(),
     })
 }
 
@@ -158,7 +177,11 @@ pub(super) async fn deploy_with_executor(
     let Some((number, plan)) = prepared else {
         return Ok(None);
     };
-    let run = deploy::register_run(plan).map_err(|error| io::Error::other(error.to_string()))?;
+    // The serialized campaign prepare gate already checked exact owner-unit
+    // confirmation against this frozen target and generation, including dry runs.
+    let approval = plan.required_owner_approval();
+    let run = deploy::register_approved_run(plan, approval.as_deref())
+        .map_err(|error| io::Error::other(error.to_string()))?;
     // A crash before linking leaves prepared ownership. Reconciliation may
     // release that ownership only after its recorded owner/supervisor is dead.
     store.transaction(id, |campaign| {
@@ -210,7 +233,7 @@ pub(super) async fn deploy_with_executor(
         store.transaction(id, |campaign| campaign.settle(number, evidence))?;
         return Err(error);
     }
-    let outcome = match executor.fan_out(&run, &built).await {
+    let mut outcome = match executor.fan_out(&run, &built).await {
         Ok(outcome) => outcome,
         Err(error) => {
             deploy::record_controller_failure(&run, &error.to_string());
@@ -221,6 +244,78 @@ pub(super) async fn deploy_with_executor(
             return Err(error);
         }
     };
+    let mut uncertain_vm = false;
+    if !run.plan.vm.is_empty() {
+        let vm = crate::vm::observations::VmRun::read(&run.path);
+        for owner in run.plan.vm.units.keys() {
+            if built.failures.contains_key(owner) {
+                continue;
+            }
+            let verdict = vm
+                .owners
+                .get(owner)
+                .map(|view| view.verdict)
+                .unwrap_or(crate::vm::observations::Verdict::Unknown);
+            use crate::vm::observations::Verdict;
+            let state = match verdict {
+                Verdict::Verified => HostState::Confirmed,
+                Verdict::Pending => HostState::RebootPending,
+                Verdict::Preview => outcome.results[owner].state,
+                Verdict::RolledBack => HostState::RolledBack,
+                Verdict::Failed | Verdict::PartialRecovery => HostState::Failed,
+                Verdict::Unknown => {
+                    uncertain_vm = true;
+                    HostState::Failed
+                }
+            };
+            if let Some(result) = outcome.results.get_mut(owner) {
+                result.state = state;
+            }
+        }
+        outcome.summary.confirmed = outcome
+            .results
+            .values()
+            .filter(|r| r.state == HostState::Confirmed)
+            .count();
+        outcome.summary.failed = outcome
+            .results
+            .values()
+            .filter(|r| r.state == HostState::Failed)
+            .count();
+        outcome.summary.rolled_back = outcome
+            .results
+            .values()
+            .filter(|r| r.state == HostState::RolledBack)
+            .count();
+        outcome.summary.reboot_pending = outcome
+            .results
+            .values()
+            .filter(|r| r.state == HostState::RebootPending)
+            .count();
+        if vm.unsuccessful() {
+            outcome.rc = 1;
+        }
+        outcome.vm_summary = Some(vm.summary.clone());
+        outcome.vm_rows = vm.lines();
+        registry::update_meta(
+            &run.path,
+            serde_json::json!({"rc":outcome.rc,"vm_summary":vm.summary})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )?;
+    }
+    if uncertain_vm {
+        store.transaction(id, |campaign| {
+            campaign.attempts[(number - 1) as usize].state = AttemptState::Unknown;
+            Ok(())
+        })?;
+        return Ok(Some(Deployment {
+            campaign_id: id.into(),
+            run_id: run.run_id,
+            outcome,
+        }));
+    }
     let evidence = outcome
         .results
         .iter()
@@ -314,6 +409,15 @@ fn review_reboot_with(
             serde_json::json!({"ok":true,"no_op":true,"campaign_id":id,"generation":c.generation,"names":[],"required_confirm":""}),
         );
     }
+    if names
+        .iter()
+        .any(|owner| c.target.vm_owner_plan.units.contains_key(owner))
+    {
+        return views::with_vm_evidence(
+            serde_json::json!({"ok":false,"refused":true,"campaign_id":id,"generation":c.generation,"names":names,"vm_owners":names.iter().filter(|owner|c.target.vm_owner_plan.units.contains_key(*owner)).collect::<Vec<_>>(),"complete":false,"reason":"VM owner reboot is not serialized through the owner helper yet; exclude VM owners explicitly to reboot ordinary hosts. No partial dispatch, wrapper or run started"}),
+            &c,
+        );
+    }
     source::available(&c.target)?;
     let observed = source::observe(&c.target.source.checkout).map_err(|error| {
         invalid(format!(
@@ -329,7 +433,11 @@ fn review_reboot_with(
     }
     let snapshots = drift::read_snapshots(&store.state_dir());
     let (names, blocked) = views::reboot_candidates(&c, &snapshots, request.narrow, Utc::now())?;
-    let required = names.iter().cloned().collect::<Vec<_>>().join(",");
+    let required = c.required_confirm(
+        AttemptKind::Reboot,
+        &names.iter().cloned().collect::<Vec<_>>(),
+        false,
+    )?;
     let confirmed = names.is_empty() || request.confirm == Some(required.as_str());
     Ok(
         serde_json::json!({"ok":confirmed,"refused":!confirmed,"confirmation_required":!confirmed,"campaign_id":id,"generation":c.generation,"target_digest":c.target_digest,"names":names,"blocked":blocked,"required_confirm":required,"reason":if confirmed{"reviewed"}else{"reboot requires exact eligible confirmation"},"no_op":names.is_empty()}),
@@ -546,6 +654,18 @@ fn reconcile_checked(store: &Store, id: &str, generation: Option<u64>) -> io::Re
             .targets
             .iter()
             .map(|name| {
+                if campaign.target.vm_owner_plan.units.contains_key(name) {
+                    use crate::vm::observations::Verdict;
+                    let state = match observed.tailer.vm.owners.get(name).map(|v|v.verdict) {
+                        Some(Verdict::Verified)=>HostOutcome::Confirmed,
+                        Some(Verdict::Pending)=>HostOutcome::RebootPending,
+                        Some(Verdict::RolledBack)=>HostOutcome::RolledBack,
+                        Some(Verdict::Failed|Verdict::PartialRecovery)=>HostOutcome::Failed,
+                        Some(Verdict::Preview) if attempt.dry_activate=>HostOutcome::Pending,
+                        _=>return Err(invalid("VM owner runtime uncertain; guest evidence missing; explicit reconciliation required")),
+                    };
+                    return Ok((name.clone(),state));
+                }
                 let host = observed
                     .tailer
                     .hosts

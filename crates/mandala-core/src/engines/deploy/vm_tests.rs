@@ -149,6 +149,7 @@ async fn native_case(inhibited: bool, dry: bool) {
                 requested_guests: vec!["guest-a".into()],
                 units: BTreeMap::from([("host-a".into(), unit)]),
             },
+            vm_revision: Some("fixture-revision".into()),
             dry_activate: dry,
             boot: false,
             halt_on_build_failure: false,

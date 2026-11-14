@@ -1,9 +1,10 @@
 # Owner runtime backend
 
-This describes the opt-in `nixos-module` backend contract. The native owner
-transaction seam and its effect-isolated fixtures exist, but owner registration
-and VM campaigns remain fail-closed until shared approval and frontend settlement
-qualification is complete. This is not permission to enroll or deploy a VM.
+This describes the opt-in `nixos-module` backend and its effect-isolated
+qualification. Native owner deployment and frozen owner-unit campaigns require
+exact current preview approval; unsupported/missing capabilities fail closed.
+The helper is disabled by default. This is not permission to enroll or deploy a
+VM, or qualification of a consumer's adapter.
 
 ## Optional host component
 
@@ -58,7 +59,10 @@ construct an image, or invoke `nixos-rebuild`.
 The immutable adapter is called with `--mandala-vm-protocol=1`, one JSON
 `AdapterRequest` on stdin, and one typed `AdapterReply` on stdout. Definitions in
 `crates/mandala-core/src/vm/owner.rs` are authoritative. A zero process exit or a
-generic success string is not evidence. The operations are:
+generic success string is not evidence. `AdapterRequest.profile` identifies the
+prepared deploy profile (which may wrap a NixOS toplevel); `ownerProfile` must
+match it, while `ownerRunning` must match `manifest.ownerGeneration`, not the
+wrapper. The operations are:
 
 - **inspect:** owner profile, running generation and boot default; every affected
   guest's actually running identity, runtime instance, immutable artifact,
@@ -121,9 +125,51 @@ Writable guest disks, application data and external services are **not** reverte
 by image/generation restoration. Desired and previous roots are conservatively
 retained; they must not be removed while recovery/reconciliation is outstanding.
 
+## Approval, attachment and campaigns
+
+CLI `--preview`, native TUI confirmation and MCP refusal previews share the same
+owner plan. The fingerprint binds evaluated inventory content, complete impact,
+flattened settings, targets and boot/dry mode. Native CLI requires
+`--approve-owner-plan`; MCP requires `owner_approval` even for dry activation.
+The supervised child re-evaluates and rechecks the captured fingerprint before
+registration/build. A changed or disappeared owner unit requires renewed review.
+Native TUI refuses confirmation if any part of its complete preview is clipped;
+resize or use CLI/MCP for a large plan. This content identity is an inventory
+approval binding, not native source freezing; use a campaign for frozen builds.
+
+VM-only registry fields retain the approved plan, revision, fingerprint and
+context. Shared read-only reconstruction validates that binding before judging
+`vm/<owner>.json` and owner-attributed VM events. Missing/corrupt evidence,
+unverified rollback or partial/unknown recovery cannot be hidden by rc 0 or host
+confirmation. Attaching never evaluates or contacts a host. CLI, TUI and MCP
+share guest counts, actual identity/readiness and primary/recovery diagnostics;
+guests do not become independent transport hosts.
+
+A VM campaign writes schema version 2 with additive `target.vm_owner_plan`.
+Existing non-VM campaigns retain version-1 target digests/bytes and remain
+readable. A pure live inventory preflight only rejects invalid selectors,
+ownership or exclusions before archive/roots; none of its data becomes a target.
+Authoritative frozen resolution repeats validation; a race/refusal drops all
+temporary roots without publishing a campaign. Complete affected owner units
+are bound, preserving requested guest identities and sibling impact. Guest
+retry selectors map to their bound owner, with exact owner-unit confirmation
+including the frozen plan fingerprint. Successful independent units are never
+built/copied/activated again. Unknown guest evidence blocks campaign replay.
+
+Owner-only surveys and reboot success cannot qualify guest runtime. Campaign
+views explicitly say `guest evidence missing` and stay incomplete until durable
+verified runtime evidence matches the bound unit, profile and system generation.
+A serialized owner reboot/reconnect transaction is deferred. Campaign reboot
+refuses the whole eligible request if any VM owner is included, naming those
+owners and asking for explicit exclusion to reboot ordinary hosts. No wrapper,
+survey or run is allocated by that refusal; no partial dispatch occurs. Existing
+ordinary-only reboot behavior and read-only verify remain available. VM owners
+stay reboot-pending/guest-evidence-missing, not implicitly verified.
+
 ## Qualification
 
-`vm-owner-resolution`, `vm-owner-backend` and `vm-owner-module` checks use fictional
+`vm-owner-resolution`, `vm-owner-backend`, `vm-owner-artifacts` and
+`vm-owner-module` checks use fictional
 fleets, injected runtime/store effects and local stub nix/SSH programs only.
 They do not require a real owner, guest or network service. Backend checks cover
 cross-session lock contention, independent owners, protocol mismatches, persistence

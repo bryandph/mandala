@@ -64,6 +64,16 @@ pub struct EvalFailure {
     pub output: String,
 }
 
+/// Typed native deployment intent, including current owner-impact approval.
+#[derive(Debug, Clone, Copy)]
+pub struct DeployLaunchOptions<'a> {
+    pub dry_activate: bool,
+    pub boot: bool,
+    pub cache_push: Option<bool>,
+    pub owner_approval: Option<&'a str>,
+    pub throttle: i64,
+}
+
 /// A launched (or launch-attempted) deploy run's registry identity.
 #[derive(Debug, Clone)]
 pub struct DeployLaunch {
@@ -129,10 +139,7 @@ pub trait Effects: Send + Sync {
         &self,
         flake: &str,
         limit: &str,
-        dry_activate: bool,
-        boot: bool,
-        cache_push: Option<bool>,
-        throttle: i64,
+        options: DeployLaunchOptions<'_>,
     ) -> io::Result<DeployLaunch>;
 
     /// Launch a registered background command run (build / reboot) into the
@@ -320,16 +327,21 @@ impl Effects for RealEffects {
         &self,
         flake: &str,
         limit: &str,
-        dry_activate: bool,
-        boot: bool,
-        cache_push: Option<bool>,
-        throttle: i64,
+        options: DeployLaunchOptions<'_>,
     ) -> io::Result<DeployLaunch> {
+        let DeployLaunchOptions {
+            dry_activate,
+            boot,
+            cache_push,
+            owner_approval,
+            throttle,
+        } = options;
         let mut run = DeployRun::new(limit);
         run.flake = flake.to_string();
         run.dry_activate = dry_activate;
         run.boot = boot;
         run.cache_push = cache_push;
+        run.owner_approval = owner_approval.map(str::to_owned);
         run.throttle = throttle;
         run.start().await?;
         loop {

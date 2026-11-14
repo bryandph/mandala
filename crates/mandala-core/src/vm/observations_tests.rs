@@ -29,6 +29,17 @@ impl Fixture {
         meta.insert("kind".into(), "deploy".into());
         meta.insert("rc".into(), 0.into());
         meta.insert("dry_activate".into(), dry.into());
+        let context =
+            serde_json::json!({"settings":{},"boot":false,"dryActivate":dry,"targets":["host-a"]});
+        meta.insert("targets".into(), context["targets"].clone());
+        meta.insert("vm_owner_context".into(), context.clone());
+        meta.insert("vm_inventory_identity".into(), "fixture-revision".into());
+        meta.insert(
+            "vm_owner_approval".into(),
+            plan.fingerprint("fixture-revision", &context)
+                .unwrap()
+                .into(),
+        );
         meta.insert("vm_owner_plan".into(), serde_json::to_value(plan).unwrap());
         crate::registry::write_meta(&self.0, &meta).unwrap();
         std::fs::write(
@@ -56,6 +67,36 @@ impl Drop for Fixture {
 }
 fn journal() -> Journal {
     serde_json::from_str(GOLDEN).unwrap()
+}
+
+#[test]
+fn vm_owner_backend_missing_or_changed_approval_context_is_unknown_not_confirmed() {
+    let fixture = Fixture::new();
+    fixture.write(&journal(), false);
+    let original = crate::registry::read_meta(&fixture.0);
+    assert_eq!(
+        VmRun::read(&fixture.0).owners["host-a"].verdict,
+        Verdict::Verified
+    );
+    for field in [
+        "vm_owner_approval",
+        "vm_inventory_identity",
+        "vm_owner_context",
+    ] {
+        let mut meta = original.clone();
+        meta.remove(field);
+        crate::registry::write_meta(&fixture.0, &meta).unwrap();
+        let vm = VmRun::read(&fixture.0);
+        assert!(vm.unsuccessful());
+        assert_eq!(vm.summary.unknown, 2);
+        assert_eq!(vm.summary.verified, 0);
+        assert!(vm.lines()[0].contains("unavailable"));
+    }
+    let mut meta = original;
+    meta.get_mut("vm_owner_context").unwrap()["settings"] =
+        serde_json::json!({"sshUser":"operator-bob"});
+    crate::registry::write_meta(&fixture.0, &meta).unwrap();
+    assert!(VmRun::read(&fixture.0).unsuccessful());
 }
 
 #[test]

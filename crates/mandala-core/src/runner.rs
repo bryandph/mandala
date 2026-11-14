@@ -1093,6 +1093,7 @@ pub struct DeployRun {
     pub flake: String,
     pub dry_activate: bool,
     pub boot: bool,
+    pub owner_approval: Option<String>,
     pub halt_on_build_failure: bool,
     pub cache_push: Option<bool>,
     pub throttle: i64,
@@ -1128,6 +1129,7 @@ impl DeployRun {
             flake: ".".to_string(),
             dry_activate: false,
             boot: false,
+            owner_approval: None,
             halt_on_build_failure: false,
             cache_push: None,
             throttle: 4,
@@ -1195,6 +1197,9 @@ impl DeployRun {
             "--throttle".to_string(),
             self.throttle.to_string(),
         ];
+        if let Some(approval) = &self.owner_approval {
+            argv.extend(["--approve-owner-plan".into(), approval.clone()]);
+        }
         if self.halt_on_build_failure {
             argv.push("--halt-on-build-failure".to_string());
         }
@@ -2477,6 +2482,18 @@ mod write_tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(run.run_id.as_deref(), Some(run_id.as_str()));
+    }
+
+    #[test]
+    fn vm_owner_backend_supervised_argv_preserves_captured_approval_for_child_revalidation() {
+        let mut run = DeployRun::new("guest-a");
+        assert!(!run.argv().contains(&"--approve-owner-plan".into()));
+        run.owner_approval = Some("captured-owner-preview".into());
+        assert!(
+            run.argv()
+                .windows(2)
+                .any(|pair| pair == ["--approve-owner-plan", "captured-owner-preview"])
+        );
     }
 
     #[test]

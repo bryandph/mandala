@@ -1,0 +1,64 @@
+{
+ "vm_inventory_identity": "2feca9a6fd9dd6c00e0b86040113b42f01ae53575240b4fea51386a4f972fc68",
+ "vm_owner_approval": "447170cee439832fb62cf4c4393ff6d076cdd425128cc1d8dc4cb09d40f83f13",
+ "vm_owner_context": {
+  "boot": false,
+  "dryActivate": false,
+  "settings": {
+   "host-a": {
+    "activation": "switch",
+    "autoRollback": true,
+    "fastConnection": false,
+    "hostname": "owner.example.test",
+    "magicRollback": false,
+    "sshPort": 2222,
+    "sshUser": "operator-alice"
+   }
+  },
+  "targets": [
+   "host-a"
+  ]
+ },
+ "vm_owner_plan": {
+  "requestedGuests": [
+   "guest-a"
+  ],
+  "selectedMembers": [
+   "guest-a"
+  ],
+  "units": {
+   "host-a": {
+    "affectedGuests": [
+     "guest-a",
+     "guest-b"
+    ],
+    "application": {
+     "application": ".#deploy.nodes.host-a.profiles.system.path",
+     "backend": "nixos-module",
+     "guests": {
+      "guest-a": {
+       "system": "x86_64-linux"
+      },
+      "guest-b": {
+       "system": "x86_64-linux"
+      }
+     },
+     "manifestVersion": 1,
+     "owner": "host-a",
+     "supportedSystems": [
+      "x86_64-linux"
+     ]
+    },
+    "owner": "host-a",
+    "ownerSystem": "x86_64-linux",
+    "potentiallyAffectedGuests": [
+     "guest-b"
+    ],
+    "recoveryLimit": "Runtime/image restoration only; writable disks, application data and external services are not reverted.",
+    "requestedGuests": [
+     "guest-a"
+    ]
+   }
+  }
+ }
+}

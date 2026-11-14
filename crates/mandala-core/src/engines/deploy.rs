@@ -57,6 +57,9 @@ pub fn engine() -> Engine {
                         .help("Selector: @group (expanded to the projected members), member, or comma-list"),
                 )
                 .arg(
+                    Arg::new("approve-owner-plan").long("approve-owner-plan").value_name("FINGERPRINT").help("Approve the exact VM owner impact returned by --preview"),
+                )
+                .arg(
                     Arg::new("preview")
                         .long("preview")
                         .action(ArgAction::SetTrue)
@@ -117,6 +120,8 @@ pub struct DeployPlan {
     pub settings: BTreeMap<String, Value>,
     /// Conservative owner/guest impact shared by every frontend.
     pub vm: crate::vm::OwnerPlan,
+    /// Immutable inventory/frozen-source identity, present only for VM work.
+    pub vm_revision: Option<String>,
     /// Whether activation is suppressed after copy.
     pub dry_activate: bool,
     /// Whether every selected member uses boot activation for this run.
@@ -130,6 +135,24 @@ pub struct DeployPlan {
 }
 
 impl DeployPlan {
+    /// Bind complete owner impact, source identity, flattened settings and mode.
+    #[must_use]
+    pub fn required_owner_approval(&self) -> Option<String> {
+        (!self.vm.is_empty()).then(|| {
+            self.vm
+                .fingerprint(
+                    self.vm_revision
+                        .as_deref()
+                        .unwrap_or("missing-inventory-identity"),
+                    &self.owner_approval_context(),
+                )
+                .expect("typed approval serializes")
+        })
+    }
+    #[must_use]
+    pub fn owner_approval_context(&self) -> Value {
+        serde_json::json!({"settings":self.settings,"boot":self.boot,"dryActivate":self.dry_activate,"targets":self.targets})
+    }
     /// Pure shared frontend preview; does not allocate a run or authorize effects.
     #[must_use]
     pub fn preview(&self) -> Value {
@@ -140,6 +163,7 @@ impl DeployPlan {
         });
         if !self.vm.units.is_empty() {
             preview["ownerPlan"] = serde_json::to_value(&self.vm).expect("owner plan serializes");
+            preview["requiredOwnerApproval"] = Value::from(self.required_owner_approval());
         }
         preview
     }
@@ -387,8 +411,8 @@ pub enum DeployRunError {
         host: String,
         error: serde_json::Error,
     },
-    /// Owner runtime qualification has not yet enabled mutation.
-    OwnerBackendUnavailable,
+    /// Missing/stale owner-impact approval; refused before registration/build.
+    OwnerApprovalRequired(String),
     /// Creating the run registry failed.
     Registry(io::Error),
 }
@@ -412,9 +436,9 @@ impl fmt::Display for DeployRunError {
             Self::InvalidMemberSettings { host, error } => {
                 write!(f, "invalid flattened deploy settings for {host}: {error}")
             }
-            Self::OwnerBackendUnavailable => write!(
+            Self::OwnerApprovalRequired(required) => write!(
                 f,
-                "VM owner backend unavailable; owner application cannot be registered"
+                "VM owner application requires current preview approval: --approve-owner-plan {required}"
             ),
             Self::Registry(err) => write!(f, "creating deploy registry run: {err}"),
         }
@@ -517,12 +541,21 @@ pub fn plan_run_with_boot(
         settings.insert(host.clone(), value.clone());
     }
 
+    let vm_revision = (!vm.is_empty()).then(|| {
+        crate::vm::OwnerPlan::default()
+            .fingerprint(
+                "inventory-content-v2",
+                &serde_json::to_value(inv.aggregate()).expect("aggregate serializes"),
+            )
+            .expect("inventory identity serializes")
+    });
     Ok(DeployPlan {
         limit: canonical_limit,
         targets,
         skipped,
         settings,
         vm,
+        vm_revision,
         dry_activate,
         boot,
         halt_on_build_failure: false,
@@ -545,10 +578,45 @@ fn now_epoch_f64() -> f64 {
 /// # Errors
 /// Any registry directory, stream, or metadata write failure.
 pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunError> {
-    // Safe additive checkpoint: resolution/build contracts may be inspected,
-    // but ordinary host activation must never bypass guest verification.
-    if !plan.vm.units.is_empty() {
-        return Err(DeployRunError::OwnerBackendUnavailable);
+    register_approved_run(plan, None)
+}
+
+/// Register only after matching current immutable VM impact approval.
+///
+/// # Errors
+/// Invalid/stale owner plans or approval, and registry I/O errors.
+pub fn register_approved_run(
+    plan: DeployPlan,
+    approval: Option<&str>,
+) -> Result<RegisteredDeployRun, DeployRunError> {
+    if plan.vm.is_empty() && approval.is_some() {
+        return Err(DeployRunError::OwnerApprovalRequired(
+            "owner impact disappeared; inspect a new preview".into(),
+        ));
+    }
+    if !plan.vm.is_empty() {
+        plan.vm.validate_bound()?;
+        if plan.vm_revision.as_ref().is_none_or(|v| v.is_empty())
+            || plan
+                .vm
+                .units
+                .keys()
+                .any(|owner| !plan.targets.contains(owner))
+            || plan
+                .vm
+                .units
+                .values()
+                .flat_map(|unit| unit.affected_guests.iter())
+                .any(|guest| plan.targets.contains(guest))
+        {
+            return Err(DeployRunError::Inventory(InventoryError::Malformed(
+                "VM run lacks immutable source identity or owner build target".into(),
+            )));
+        }
+        let required = plan.required_owner_approval().expect("VM approval");
+        if approval != Some(required.as_str()) {
+            return Err(DeployRunError::OwnerApprovalRequired(required));
+        }
     }
     let (run_id, path) = registry::new_run_dir()?;
     for host in &plan.targets {
@@ -565,6 +633,15 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
         meta.insert(
             "vm_owner_plan".into(),
             serde_json::to_value(&plan.vm).map_err(io::Error::other)?,
+        );
+        meta.insert(
+            "vm_owner_approval".into(),
+            Value::from(plan.required_owner_approval()),
+        );
+        meta.insert("vm_owner_context".into(), plan.owner_approval_context());
+        meta.insert(
+            "vm_inventory_identity".into(),
+            Value::from(plan.vm_revision.clone()),
         );
     }
     meta.insert("dry_activate".into(), Value::from(plan.dry_activate));
@@ -1656,12 +1733,19 @@ fn settle_fan_out(
             }
         }
     }
+    for owner in run.plan.vm.units.keys() {
+        if !vm.owners.contains_key(owner)
+            && let Some(result) = results.get_mut(owner)
+        {
+            result.state = HostState::Failed;
+            result.error = vm
+                .error
+                .clone()
+                .or_else(|| Some("missing VM owner evidence".into()));
+        }
+    }
     let vm_summary = vm.present().then(|| vm.summary.clone());
-    let vm_rows = vm
-        .owners
-        .keys()
-        .flat_map(|owner| vm.owner_lines(owner))
-        .collect();
+    let vm_rows = vm.lines();
     let summary = summarize(&results);
     // Every host-level error is contained and represented durably. Reaching
     // settlement means the native controller itself completed successfully;
@@ -1908,7 +1992,11 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
                         std::env::var_os("MANDALA_CACHE_URL"),
                         std::env::var_os("MANDALA_CACHE_NETRC_FILE"),
                     )?;
-                    register_run(plan)
+                    register_approved_run(
+                        plan,
+                        sm.get_one::<String>("approve-owner-plan")
+                            .map(String::as_str),
+                    )
                 },
             );
             match prepared {

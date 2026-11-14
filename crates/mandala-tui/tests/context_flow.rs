@@ -528,10 +528,7 @@ impl Effects for StubEffects {
         &self,
         _flake: &str,
         _limit: &str,
-        _dry_activate: bool,
-        _boot: bool,
-        _cache_push: Option<bool>,
-        _throttle: i64,
+        _options: mandala_mcp::effects::DeployLaunchOptions<'_>,
     ) -> io::Result<DeployLaunch> {
         panic!("unexpected launch_deploy call")
     }
