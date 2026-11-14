@@ -181,3 +181,33 @@ second build/eval or independent guest transport.
 
 macOS owners remain unsupported. Package installation, a compatibility summary,
 or these fixtures do not qualify a consumer adapter or authorize real adoption.
+
+### Recorded qualification limits
+
+The implementation checkpoint was qualified on `x86_64-linux`:
+
+- Sandboxed `nix build .#mandala-rs`: **597 passed, 0 failed, 19 intentionally
+  ignored doctests**, across 43 workspace test binaries/doctest suites. This is
+  the authoritative package check, including transport-dependent context tests.
+- Focused `vm-owner-resolution`: 11 Rust tests; `vm-owner-backend`: 44 Rust tests
+  across core/deploy/MCP/TUI, including the MCP launch-boundary integration test.
+- VM schema/projections, owner module/artifact graph, all seven builder checks
+  and fake-fleet checks passed. Non-VM baseline fixture bytes were unchanged.
+- Scoped all-target clippy (`mandala-core`, `mandala-deploy`, `mandala-mcp`,
+  `mandala-tui`, `mandala`, `--no-deps -- -D warnings`) and formatting passed.
+- Every executable CI step passed: synthetic controller identity evaluation,
+  root flake check, formatting, fleet template check, showcase check,
+  showcase `network-tf` rendering and the Rust package build. No lock/input or
+  workflow files were changed.
+- Host `nix develop -c cargo test --workspace --no-fail-fast` ran all suites:
+  **567 passed, 30 failed, 19 ignored**. Failures are transport/`LeaderBusy`
+  limitations across the existing stdio/context/proxy/TUI-context targets;
+  all corresponding tests pass in the authoritative sandboxed package. The
+  untouched baseline also reproduces the context limitation. This is not a
+  claim that the unsandboxed command was green.
+- OpenSpec CLI was unavailable, so strict CLI validation was **not run**.
+  Local delta/scenario structure and coverage review covered four delta files,
+  25 requirements and 72 scenarios; this does not substitute for the CLI.
+- No ARM or Darwin execution was tested. Pure synthetic Darwin identity parity
+  is not a runtime/backend support claim. No consumer, owner or live guest was
+  contacted or enrolled; all new backend effects use local fixtures/stubs.

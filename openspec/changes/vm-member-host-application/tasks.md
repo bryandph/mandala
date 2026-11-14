@@ -45,7 +45,16 @@ Implementation is approved. The pure contract, opt-in owner backend, durable fro
 - [x] 6.1b Add `vm-owner-resolution` and `vm-owner-backend` Rust checks for the fake-effect suites. Gate backend apply/verify/restore, per-owner concurrent-run serialization, partial recovery and durable protocol behavior.
 - [x] 6.2a Run `nix build .#checks.x86_64-linux.vm-member-schema .#checks.x86_64-linux.vm-projections` for the pure Nix suites.
 - [x] 6.2b Run `nix build .#checks.<system>.vm-owner-resolution .#checks.<system>.vm-owner-backend` after the Rust targets exist; these are implemented additions.
-- [ ] 6.3 Run existing `nix build .#checks.<system>.fake-fleet`, `nix build .#packages.<system>.mandala-rs` and `nix develop -c cargo test --workspace` for non-VM parity and workspace/deploy/registry/termination regression coverage. Substitute the actual platform; `flake.nix` owns current target names.
-- [ ] 6.4 Run `nix fmt -- --check .` and `nix flake check`; record platform and environmental limits, not unrun-platform success. No effect-isolated check may require a real owner, guest, cache or fleet.
-- [ ] 6.5 Run `openspec validate vm-member-host-application --strict` when the CLI is available, validate delta/scenario coverage and scan new artifacts for organization-specific content. Report missing tooling explicitly.
-- [ ] 6.6 Return reviewed implementation evidence before any merge, deployment or consumer adoption. A macOS adapter remains a separate designed/approved change; completion of these artifacts does not authorize deployment or consumer adoption.
+- [x] 6.3 Run existing `nix build .#checks.<system>.fake-fleet`, `nix build .#packages.<system>.mandala-rs` and `nix develop -c cargo test --workspace` for non-VM parity and workspace/deploy/registry/termination regression coverage. Substitute the actual platform; `flake.nix` owns current target names.
+- [x] 6.4 Run `nix fmt -- --check .` and `nix flake check`; record platform and environmental limits, not unrun-platform success. No effect-isolated check may require a real owner, guest, cache or fleet.
+- [x] 6.5 Run `openspec validate vm-member-host-application --strict` when the CLI is available, validate delta/scenario coverage and scan new artifacts for organization-specific content. Report missing tooling explicitly.
+- [x] 6.6 Return reviewed implementation evidence before any merge, deployment or consumer adoption. A macOS adapter remains a separate designed/approved change; completion of these artifacts does not authorize deployment or consumer adoption.
+
+Qualification evidence and limits are recorded in `docs/vm-owner-backend.md`:
+`sandboxed mandala-rs` has 597 passing tests, 0 failures and 19 ignored doctests;
+all executable CI steps and all targeted checks passed on x86_64-linux. The host
+workspace replay ran but has 30 transport/LeaderBusy failures (567 passed), not a
+green unsandboxed result. OpenSpec CLI is unavailable; strict CLI validation was
+not run, and the local four-file/25-requirement/72-scenario structure/coverage
+review is recorded separately. No ARM/Darwin execution or consumer adoption is
+claimed. Final code review and merge remain with the repository coordinator.
