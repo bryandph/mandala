@@ -830,6 +830,8 @@ impl crate::campaign::execution::Executor for TestExecutor {
         let outcome = crate::engines::deploy::DeployOutcome {
             results,
             summary,
+            vm_summary: None,
+            vm_rows: Vec::new(),
             process_rc: 0,
             rc,
         };

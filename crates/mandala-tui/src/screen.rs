@@ -826,6 +826,7 @@ impl DeployViewState {
                         .iter()
                         .map(|copy| copy.describe())
                         .chain(h.lines.iter().cloned())
+                        .chain(tailer.vm.owner_lines(&h.name))
                         .collect(),
                 })
                 .collect();
@@ -859,7 +860,7 @@ impl DeployViewState {
     /// Build the summary tab data (`_show_summary`).
     fn make_summary(&self, tailer: Option<&EventTailer>, elapsed_secs: u64) -> SummaryState {
         let rc = self.returncode;
-        let ok = rc == Some(0);
+        let ok = rc == Some(0) && !tailer.is_some_and(|t| t.vm.unsuccessful());
         let reboot_pending = self
             .hosts
             .iter()
@@ -904,6 +905,11 @@ impl DeployViewState {
                 mandala_core::engines::cache_publish::describe(publish)
             ),
             None => build_line,
+        };
+        let build_line = if let Some(vm) = tailer.map(|t| &t.vm).filter(|vm| vm.present()) {
+            format!("{build_line} · {}", vm.summary.describe())
+        } else {
+            build_line
         };
         let recap_at = self
             .playbook_lines
@@ -1462,6 +1468,44 @@ mod tests {
     /// The exhaustiveness gate for the deploy tier's style/glyph tables:
     /// every host state maps through `rich_style` (a new state extends the
     /// match — compile-enforced — and must land here styleable).
+    #[test]
+    fn vm_owner_backend_tui_uses_shared_failure_verdict_and_owner_guest_rows() {
+        let mut journal: mandala_core::vm::owner::Journal = serde_json::from_str(include_str!(
+            "../../mandala-core/src/vm/fixtures/confirmed.json"
+        ))
+        .unwrap();
+        journal
+            .observed
+            .as_mut()
+            .unwrap()
+            .guests
+            .get_mut("guest-a")
+            .unwrap()
+            .ready = false;
+        let unit = journal.unit.clone().unwrap();
+        let verdict = mandala_core::vm::observations::judge(&unit, journal, false);
+        let mut tailer = EventTailer::new(std::path::Path::new("/nonexistent-fixture"));
+        tailer.vm.plan = Some(mandala_core::vm::OwnerPlan::default());
+        tailer.vm.owners.insert("host-a".into(), verdict);
+        tailer.vm.summary.failed = 1;
+        let mut state = DeployViewState::new("guest-a", false, false, true, false);
+        state.returncode = Some(0);
+        let summary = state.make_summary(Some(&tailer), 1);
+        assert!(!summary.ok);
+        assert!(summary.build_line.contains("failed=1"));
+        let lines = tailer.vm.owner_lines("host-a");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("guest-a owner host-a: Failed"))
+        );
+        assert_eq!(
+            state.hosts.len(),
+            0,
+            "VM guests are not independent transport tasks"
+        );
+    }
+
     #[test]
     fn every_host_state_has_style_and_glyph() {
         for state in [

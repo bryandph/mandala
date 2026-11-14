@@ -28,7 +28,11 @@ configurations to projections. Management surfaces (`deployment.ansible`,
 typically `mkDefault`s them on for standalone hosts it builds. VM guests must
 keep both enables false, including factory defaults; see the
 [VM member contract](vm-members.md) for explicit ownership and the owner-side
-application declaration. The pure contract alone does not enable VM deployment.
+application declaration and exact version-1 runtime manifest schema. The
+consumer owns the artifact/runtime adapter; the optional
+[owner helper](vm-owner-backend.md) has no listener and is disabled by default.
+The pure contract or helper package alone does not enable VM deployment or
+authorize consumer adoption.
 
 ## 2. Non-NixOS members are validated plain data
 

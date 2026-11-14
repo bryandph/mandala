@@ -1192,7 +1192,7 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
             serde_json::to_value(snapshot.into_summary()).unwrap_or_default(),
         );
     }
-    json!({
+    let mut snapshot = json!({
         "run_id": obs.info.run_id,
         "kind": obs.info.kind(),
         "meta": if diagnostics {
@@ -1204,7 +1204,11 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
         "phase": phase,
         "hosts": hosts,
         "build": build,
-    })
+    });
+    if obs.tailer.vm.present() {
+        snapshot["vm"] = serde_json::to_value(&obs.tailer.vm).expect("VM snapshot serializes");
+    }
+    snapshot
 }
 
 /// Count/row limits alone cannot bound producer-controlled diagnostic strings.
@@ -1344,6 +1348,57 @@ mod tests {
         ] {
             meta.remove(field);
         }
+    }
+
+    #[test]
+    fn vm_owner_backend_mcp_attaches_with_shared_guest_failure_despite_zero_rc() {
+        let path = std::env::temp_dir().join(format!("mandala-mcp-vm-{}", std::process::id()));
+        std::fs::create_dir_all(path.join("vm")).unwrap();
+        let mut journal: mandala_core::vm::owner::Journal = serde_json::from_str(include_str!(
+            "../../mandala-core/src/vm/fixtures/confirmed.json"
+        ))
+        .unwrap();
+        journal
+            .observed
+            .as_mut()
+            .unwrap()
+            .guests
+            .get_mut("guest-a")
+            .unwrap()
+            .ready = false;
+        let plan = mandala_core::vm::OwnerPlan {
+            selected_members: vec!["guest-a".into()],
+            requested_guests: vec!["guest-a".into()],
+            units: std::collections::BTreeMap::from([(
+                "host-a".into(),
+                journal.unit.clone().unwrap(),
+            )]),
+        };
+        let meta = json!({"kind":"deploy","rc":0,"vm_owner_plan":plan});
+        registry::write_meta(&path, meta.as_object().unwrap()).unwrap();
+        std::fs::write(
+            path.join("vm/host-a.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(path.join("host-a.jsonl"),"{\"v\":2,\"host\":\"host-a\",\"plugin\":\"deploy\",\"event\":\"milestone\",\"milestone\":\"confirm\"}\n").unwrap();
+        let mut observed = ObservedRun {
+            info: registry::RunInfo {
+                run_id: "fixture".into(),
+                path: path.clone(),
+                meta: registry::read_meta(&path),
+            },
+            tailer: mandala_core::runner::EventTailer::new(&path),
+        };
+        let snapshot = run_snapshot(&mut observed, SnapshotDetail::Listing);
+        assert_eq!(snapshot["liveness"], "failed");
+        assert_eq!(snapshot["vm"]["summary"]["failed"], 1);
+        assert_eq!(
+            snapshot["vm"]["owners"]["host-a"]["guests"]["guest-a"],
+            "failed"
+        );
+        assert_eq!(snapshot["hosts"].as_object().unwrap().len(), 1);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

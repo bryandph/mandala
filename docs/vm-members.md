@@ -77,6 +77,95 @@ No virtualization toolchain is pinned or guest system generated here. System
 support is an explicit consumer assertion, not inferred emulation or proof of
 available build capacity. A macOS owner adapter remains unsupported.
 
+## Runtime manifest schema (version 1)
+
+The injected consumer module writes `mandala/vm-application.json` into the owner
+application profile. Every field below is required; Mandala validates these
+values and never infers a guest, system, runtime instance or immutable identity.
+
+| Field | Type and meaning |
+| --- | --- |
+| `manifestVersion` | Integer `1`; unsupported versions fail closed. |
+| `owner` | Canonical standalone NixOS owner member ID. |
+| `backend` | Exactly `"nixos-module"`. |
+| `ownerSystem` | Exact owner's `host.build.system`, included in supported systems. |
+| `ownerGeneration` | Immutable NixOS toplevel store path expected running after live activation; distinct from a deploy-rs wrapper profile. |
+| `supportedSystems` | Array of explicit owner/guest system strings, exactly matching `host.vmApplication.supportedSystems`. |
+| `adapter` | Immutable store executable implementing the typed owner-local adapter protocol. |
+| `guests` | Object keyed by exactly the affected guest IDs; no extra, omitted or unrelated guest. |
+| `guests.<id>.system` | Exact guest system from the pure facet and ownership relation. |
+| `guests.<id>.desiredIdentity` | Immutable running generation store path or lowercase `sha256:` plus 64 hexadecimal digits for an image. Mutable aliases are forbidden. |
+| `guests.<id>.artifact` | Prebuilt closure/image store reference, a dependency of this owner artifact. |
+| `guests.<id>.runtimeInstance` | Nonempty owner-local runtime instance identity. |
+| `guests.<id>.readiness.contract` | Immutable owner-local runtime/service probe contract; never guest SSH. |
+| `guests.<id>.readiness.deadlineSeconds` | Integer from 1 to 3600. A failed live restart/deadline is failure, not pending. |
+| `guests.<id>.recoveryContract` | Immutable runtime restoration contract reference, not a writable-data rollback promise. |
+
+The adapter, owner generation, artifacts and contract references must occur in
+the independently queried owner closure. The helper also compares the copied
+artifact's manifest to the approved manifest. `ManifestError.field` identifies
+the failing field, for example `guests.guest-a.readiness.deadlineSeconds` or
+`guests` for relation disagreement. Additive fields remain ignorable; version
+changes and missing evidence do not.
+
+A fictional two-guest JSON example (store hashes are illustrative):
+
+```json
+{
+  "manifestVersion": 1,
+  "owner": "host-a",
+  "backend": "nixos-module",
+  "ownerSystem": "x86_64-linux",
+  "ownerGeneration": "/nix/store/00000000000000000000000000000000-owner-new",
+  "supportedSystems": [
+    "x86_64-linux"
+  ],
+  "adapter": "/nix/store/00000000000000000000000000000000-adapter/bin/adapter",
+  "guests": {
+    "guest-a": {
+      "system": "x86_64-linux",
+      "desiredIdentity": "/nix/store/00000000000000000000000000000000-guest-a",
+      "artifact": "/nix/store/00000000000000000000000000000000-guest-a",
+      "runtimeInstance": "runtime-guest-a",
+      "readiness": {
+        "contract": "/nix/store/00000000000000000000000000000000-probe",
+        "deadlineSeconds": 30
+      },
+      "recoveryContract": "/nix/store/00000000000000000000000000000000-restore"
+    },
+    "guest-b": {
+      "system": "x86_64-linux",
+      "desiredIdentity": "/nix/store/00000000000000000000000000000000-guest-b",
+      "artifact": "/nix/store/00000000000000000000000000000000-guest-b",
+      "runtimeInstance": "runtime-guest-b",
+      "readiness": {
+        "contract": "/nix/store/00000000000000000000000000000000-probe",
+        "deadlineSeconds": 30
+      },
+      "recoveryContract": "/nix/store/00000000000000000000000000000000-restore"
+    }
+  }
+}
+```
+
+The consumer authoring example is
+[`tests/fixtures/vm-owner-artifacts.nix`](../tests/fixtures/vm-owner-artifacts.nix).
+It constructs independent guest NixOS configurations first. Its consumer-style
+owner module references their toplevel outputs directly in the JSON template;
+guest configurations never reference the owner configuration. During the owner
+toplevel build it substitutes the actual `$out` for `ownerGeneration`, avoiding
+a recursive evaluation of `config.system.build.toplevel` inside its own manifest.
+This is build-time artifact authoring, never activation-time evaluation or
+construction. The fixture adapter intentionally refuses execution and does not
+qualify a real runtime. `vm-owner-artifacts` evaluates this graph and rejects the
+negative unrelated-guest manifest; Rust tests also reject relation/system
+mismatches with typed field errors.
+
+The opt-in helper module does not add a second manifest authoring surface:
+`host.vmApplication` remains the pure compatibility facet, while the consumer's
+runtime module owns this artifact. See [owner backend authoring](vm-owner-backend.md)
+for the helper, adapter protocol, lock, readiness and recovery contracts.
+
 ## Identity versus transport projections
 
 VMs remain in aggregate members and canonical groups. Their own network facts

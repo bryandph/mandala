@@ -7,6 +7,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[tokio::test]
 async fn vm_owner_backend_native_owner_only_copy_activation_verify_order() {
+    native_case(false, false).await;
+}
+#[tokio::test]
+async fn vm_owner_backend_inhibitor_refusal_stages_without_guest_restart() {
+    native_case(true, false).await;
+}
+#[tokio::test]
+async fn vm_owner_backend_inhibitor_dry_preview_never_starts_host_or_guest_mutation() {
+    native_case(true, true).await;
+}
+async fn native_case(inhibited: bool, dry: bool) {
     let directory = std::env::temp_dir().join(format!(
         "mandala-owner-native-{}-{}",
         std::process::id(),
@@ -56,25 +67,65 @@ async fn vm_owner_backend_native_owner_only_copy_activation_verify_order() {
         journal: None,
     })
     .unwrap();
+    let final_state = if dry {
+        State::Prepared
+    } else if inhibited {
+        State::Pending
+    } else {
+        State::Confirmed
+    };
+    let final_guest = if dry {
+        GuestOutcome::Preview
+    } else if inhibited {
+        GuestOutcome::Pending
+    } else {
+        GuestOutcome::Confirmed
+    };
     let mut session = String::new();
     for (step, reply) in [
         ("hello", handshake),
         ("lock", response(State::Locked, GuestOutcome::Unknown)),
-        ("prepare", response(State::Prepared, GuestOutcome::Unknown)),
+        (
+            "prepare",
+            response(
+                State::Prepared,
+                if dry {
+                    GuestOutcome::Preview
+                } else {
+                    GuestOutcome::Unknown
+                },
+            ),
+        ),
         (
             "host-start",
             response(State::Mutating, GuestOutcome::Unknown),
         ),
-        ("apply", response(State::Confirmed, GuestOutcome::Confirmed)),
-        (
-            "finish",
-            response(State::Confirmed, GuestOutcome::Confirmed),
-        ),
+        ("apply", response(final_state, final_guest)),
+        ("finish", response(final_state, final_guest)),
     ] {
-        session.push_str(&format!("IFS= read -r request || exit 1\nprintf '%s\\n' helper-{step} >> '{}'\nprintf '%s\\n' '{}'\n",trace.display(), reply));
+        if dry && matches!(step, "host-start" | "apply") {
+            continue;
+        }
+        if step == "apply" && inhibited {
+            session.push_str("IFS= read -r request || exit 1\ncase \"$request\" in *'\"mode\":\"boot\"'*) ;; *) exit 1;; esac\n");
+        }
+        let read = if step == "apply" && inhibited {
+            ""
+        } else {
+            "IFS= read -r request || exit 1\n"
+        };
+        session.push_str(&format!(
+            "{read}printf '%s\\n' helper-{step} >> '{}'\nprintf '%s\\n' '{}'\n",
+            trace.display(),
+            reply
+        ));
     }
     let ssh = directory.join("ssh");
     std::fs::write(&ssh, format!("#!/bin/sh\nprintf 'ssh %s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *mandala-vm-owner*)\n{session}exit 0;;\n  *switch-inhibitors*) exit 1;;\n  *) exit 0;;\nesac\n",trace.display())).unwrap();
+    if inhibited {
+        let script = std::fs::read_to_string(&ssh).unwrap().replace("*switch-inhibitors*) exit 1;;", "*switch-inhibitors*) exit 0;;\n *'switch-to-configuration check'*) exit 1;;\n *readlink*) printf '%s\\n' '/nix/store/00000000000000000000000000000000-old-owner'; exit 0;;");
+        std::fs::write(&ssh, script).unwrap();
+    }
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
     let nix = directory.join("nix");
     let paths: BTreeMap<_, _> = closure.into_iter().map(|p| (p, Value::Null)).collect();
@@ -98,7 +149,7 @@ async fn vm_owner_backend_native_owner_only_copy_activation_verify_order() {
                 requested_guests: vec!["guest-a".into()],
                 units: BTreeMap::from([("host-a".into(), unit)]),
             },
-            dry_activate: false,
+            dry_activate: dry,
             boot: false,
             halt_on_build_failure: false,
             publish: Default::default(),
@@ -121,17 +172,43 @@ async fn vm_owner_backend_native_owner_only_copy_activation_verify_order() {
     )
     .await;
     let trace = std::fs::read_to_string(&trace).unwrap();
-    assert_eq!(result.state, HostState::Confirmed, "{result:?}\n{trace}");
+    assert_eq!(
+        result.state,
+        if inhibited {
+            HostState::RebootPending
+        } else {
+            HostState::Confirmed
+        },
+        "{result:?}\n{trace}"
+    );
+    if dry {
+        assert!(
+            !trace.contains("helper-host-start")
+                && !trace.contains("helper-apply")
+                && !trace.contains("nix-env")
+                && !trace.contains("switch-to-configuration boot")
+        );
+    }
     let positions: Vec<_> = [
         "helper-lock",
         "nix copy",
         "helper-prepare",
         "helper-host-start",
-        "activate-rs",
+        if inhibited {
+            "switch-to-configuration boot"
+        } else {
+            "activate-rs"
+        },
         "helper-apply",
         "helper-finish",
     ]
     .iter()
+    .filter(|step| {
+        !dry || !matches!(
+            **step,
+            "helper-host-start" | "helper-apply" | "switch-to-configuration boot"
+        )
+    })
     .map(|step| {
         trace
             .find(step)
@@ -151,13 +228,8 @@ async fn vm_owner_backend_native_owner_only_copy_activation_verify_order() {
     );
     let journal: Journal =
         serde_json::from_slice(&std::fs::read(run_path.join("vm/host-a.json")).unwrap()).unwrap();
-    assert_eq!(journal.state, State::Confirmed);
-    assert!(
-        journal
-            .guests
-            .values()
-            .all(|s| *s == GuestOutcome::Confirmed)
-    );
+    assert_eq!(journal.state, final_state);
+    assert!(journal.guests.values().all(|s| *s == final_guest));
     assert!(!run_path.join("guest-a.jsonl").exists() && !run_path.join("guest-b.jsonl").exists());
     std::fs::remove_dir_all(directory).unwrap();
 }

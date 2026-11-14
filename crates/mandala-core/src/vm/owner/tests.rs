@@ -143,7 +143,7 @@ impl Effects for Arc<Mock> {
             }
             Operation::Verify => {
                 if request.target == VerificationTarget::Desired {
-                    observation.owner_profile = request.manifest.owner_generation.clone();
+                    observation.owner_profile = request.profile.clone();
                     observation.boot_default = request.manifest.owner_generation.clone();
                     if request.mode == Mode::Live {
                         observation.owner_running = request.manifest.owner_generation.clone();

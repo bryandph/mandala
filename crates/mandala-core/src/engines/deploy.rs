@@ -133,11 +133,15 @@ impl DeployPlan {
     /// Pure shared frontend preview; does not allocate a run or authorize effects.
     #[must_use]
     pub fn preview(&self) -> Value {
-        serde_json::json!({
+        let mut preview = serde_json::json!({
             "limit": self.limit, "targets": self.targets, "skipped": self.skipped,
-            "ownerPlan": self.vm, "settings": self.settings,
+            "settings": self.settings,
             "dryActivate": self.dry_activate, "boot": self.boot,
-        })
+        });
+        if !self.vm.units.is_empty() {
+            preview["ownerPlan"] = serde_json::to_value(&self.vm).expect("owner plan serializes");
+        }
+        preview
     }
 }
 
@@ -238,6 +242,8 @@ pub struct DeploySummary {
 pub struct DeployOutcome {
     pub results: BTreeMap<String, HostDeployResult>,
     pub summary: DeploySummary,
+    pub vm_summary: Option<crate::vm::observations::Summary>,
+    pub vm_rows: Vec<String>,
     pub process_rc: i32,
     pub rc: i32,
 }
@@ -474,16 +480,18 @@ pub fn plan_run_with_boot(
     if throttle <= 0 {
         return Err(DeployRunError::InvalidThrottle(throttle));
     }
-    let canonical_limit = inv.to_limit(limit)?;
-    let selected: Vec<String> = canonical_limit.split(',').map(str::to_string).collect();
-    let vm = crate::vm::resolve(inv, limit)?;
+    let (selected, excluded) = inv.resolve_with_exclusions(limit)?;
+    let canonical_limit = selected.join(",");
+    let vm = crate::vm::resolve_selected(inv, selected.clone(), excluded)?;
     let (mut targets, skipped): (Vec<_>, Vec<_>) = selected
         .into_iter()
         .filter(|host| inv.members()[host].get("kind").and_then(Value::as_str) != Some("vm"))
         .partition(|host| deploy_rs_enabled(inv, host));
-    targets.extend(vm.units.keys().cloned());
-    targets.sort();
-    targets.dedup();
+    if !vm.units.is_empty() {
+        targets.extend(vm.units.keys().cloned());
+        targets.sort();
+        targets.dedup();
+    }
 
     if targets.is_empty() {
         return Err(DeployRunError::NoDeployableMembers(canonical_limit));
@@ -553,6 +561,12 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
     meta.insert("limit".into(), Value::from(plan.limit.clone()));
     meta.insert("targets".into(), Value::from(plan.targets.clone()));
     meta.insert("skipped".into(), Value::from(plan.skipped.clone()));
+    if !plan.vm.units.is_empty() {
+        meta.insert(
+            "vm_owner_plan".into(),
+            serde_json::to_value(&plan.vm).map_err(io::Error::other)?,
+        );
+    }
     meta.insert("dry_activate".into(), Value::from(plan.dry_activate));
     meta.insert("boot".into(), Value::from(plan.boot));
     meta.insert("publish".into(), plan.publish.initial());
@@ -1623,8 +1637,31 @@ fn summarize(results: &BTreeMap<String, HostDeployResult>) -> DeploySummary {
 
 fn settle_fan_out(
     run: &RegisteredDeployRun,
-    results: BTreeMap<String, HostDeployResult>,
+    mut results: BTreeMap<String, HostDeployResult>,
 ) -> io::Result<DeployOutcome> {
+    let vm = crate::vm::observations::VmRun::read(&run.path);
+    for (owner, view) in &vm.owners {
+        if let Some(result) = results.get_mut(owner) {
+            use crate::vm::observations::Verdict;
+            match view.verdict {
+                Verdict::Verified | Verdict::Pending | Verdict::Preview => (),
+                Verdict::RolledBack => result.state = HostState::RolledBack,
+                _ => {
+                    result.state = HostState::Failed;
+                    result.error = view
+                        .diagnostic
+                        .clone()
+                        .or_else(|| Some("owner runtime evidence unsuccessful".into()));
+                }
+            }
+        }
+    }
+    let vm_summary = vm.present().then(|| vm.summary.clone());
+    let vm_rows = vm
+        .owners
+        .keys()
+        .flat_map(|owner| vm.owner_lines(owner))
+        .collect();
     let summary = summarize(&results);
     // Every host-level error is contained and represented durably. Reaching
     // settlement means the native controller itself completed successfully;
@@ -1634,8 +1671,16 @@ fn settle_fan_out(
         .get("build_rc")
         .and_then(Value::as_i64)
         .is_some_and(|rc| rc != 0);
-    let rc = i32::from(build_failed || summary.failed > 0 || summary.rolled_back > 0);
+    let rc = i32::from(
+        build_failed || summary.failed > 0 || summary.rolled_back > 0 || vm.unsuccessful(),
+    );
     let mut fields = Meta::new();
+    if let Some(summary) = &vm_summary {
+        fields.insert(
+            "vm_summary".into(),
+            serde_json::to_value(summary).map_err(io::Error::other)?,
+        );
+    }
     fields.insert("process_rc".into(), Value::from(process_rc));
     fields.insert("rc".into(), Value::from(rc));
     fields.insert("finished_at".into(), Value::from(now_epoch_f64()));
@@ -1647,6 +1692,8 @@ fn settle_fan_out(
     Ok(DeployOutcome {
         results,
         summary,
+        vm_summary,
+        vm_rows,
         process_rc,
         rc,
     })
@@ -1674,6 +1721,15 @@ fn outcome_lines(outcome: &DeployOutcome) -> Vec<String> {
         outcome.summary.failed,
         outcome.summary.rolled_back
     )];
+    if let Some(summary) = &outcome.vm_summary {
+        lines.push(format!("mandala: {}", summary.describe()));
+    }
+    lines.extend(
+        outcome
+            .vm_rows
+            .iter()
+            .map(|line| format!("mandala: {line}")),
+    );
     for result in outcome
         .results
         .values()
@@ -2618,6 +2674,47 @@ exit 0
     }
 
     #[test]
+    fn vm_owner_resolution_legacy_selectors_preserve_order_shape_and_effect_free_plan() {
+        let inventory = inv();
+        assert_eq!(inventory.aggregate().schema_version, 1);
+        for selector in [
+            "@fleet",
+            "@fleet,!router",
+            "web,cache",
+            "@all,!router",
+            "cache,web,cache",
+        ] {
+            let canonical = inventory.to_limit(selector).unwrap();
+            let (targets, skipped): (Vec<_>, Vec<_>) = canonical
+                .split(',')
+                .map(str::to_string)
+                .partition(|name| deploy_rs_enabled(&inventory, name));
+            let before = serde_json::to_value(inventory.aggregate()).unwrap();
+            let owner_plan = crate::vm::resolve(&inventory, selector).unwrap();
+            assert_eq!(owner_plan, crate::vm::OwnerPlan::default());
+            let plan = plan_run(&inventory, selector, 4, false).unwrap();
+            assert_eq!(plan.targets, targets);
+            assert_eq!(plan.skipped, skipped);
+            assert_eq!(serde_json::to_value(inventory.aggregate()).unwrap(), before);
+            assert!(plan.preview().get("ownerPlan").is_none());
+            assert!(plan.preview().get("vm").is_none());
+            let base = tmp_base("legacy-vm-parity");
+            let _guard = registry::test_hooks::install_runs_base(base.clone());
+            assert!(
+                !base.exists(),
+                "pure planning allocated no files or effects"
+            );
+            let run = register_run(plan).unwrap();
+            let meta = registry::read_meta(&run.path);
+            assert!(
+                meta.keys()
+                    .all(|key| !key.contains("vm") && !key.contains("owner"))
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
     fn registry_run_has_metadata_and_one_stream_per_target() {
         let base = tmp_base("registry");
         let _guard = registry::test_hooks::install_runs_base(base);
@@ -2944,18 +3041,40 @@ exit 0 ;; esac"#;
 
     #[tokio::test]
     async fn partial_build_deploys_only_the_verified_sibling() {
-        partial_build_with_pins(false).await;
+        partial_build_with_pins(false, false).await;
     }
 
     #[tokio::test]
     async fn campaign_partial_build_recovers_exact_outputs_without_retargeting() {
-        partial_build_with_pins(true).await;
+        partial_build_with_pins(true, false).await;
     }
 
-    async fn partial_build_with_pins(pinned: bool) {
+    #[tokio::test]
+    async fn vm_owner_backend_guest_dependency_failure_blocks_only_its_owner_unit() {
+        partial_build_with_pins(false, true).await;
+    }
+
+    async fn partial_build_with_pins(pinned: bool, vm_owner: bool) {
         let base = tmp_base("build-partial");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
-        let run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
+        let mut run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
+        if vm_owner {
+            let (_, mut unit, _) = crate::vm::tests::manifest();
+            unit.owner = "cache".into();
+            unit.application.owner = "cache".into();
+            unit.application.application = ".#deploy.nodes.cache.profiles.system.path".into();
+            run.plan.vm.units.insert("cache".into(), unit);
+            run.plan.vm.selected_members = vec!["guest-a".into(), "web".into()];
+            run.plan.vm.requested_guests = vec!["guest-a".into()];
+            registry::update_meta(
+                &run.path,
+                serde_json::json!({"vm_owner_plan":run.plan.vm})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        }
         let (stub, invocations, _) = build_stub(&base, 23);
         // Nix leaves no batch out-links on failure. Only web's exact output
         // is valid, even though cache appeared first in the selection.

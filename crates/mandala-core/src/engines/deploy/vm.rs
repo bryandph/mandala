@@ -32,9 +32,8 @@ impl Transaction {
         writer: Arc<EventWriter>,
     ) -> io::Result<Self> {
         let unit = run.plan.vm.units[host].clone();
-        let manifest: Manifest =
-            serde_json::from_slice(&std::fs::read(profile.join(RELATIVE_PATH))?)
-                .map_err(io::Error::other)?;
+        let manifest = Manifest::parse(&std::fs::read(profile.join(RELATIVE_PATH))?)
+            .map_err(io::Error::other)?;
         let output = mandala_deploy::process::output(
             tokio::process::Command::new(
                 deploy

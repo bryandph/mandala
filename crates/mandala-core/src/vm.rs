@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::inventory::{Inventory, InventoryError};
 
 pub mod manifest;
+pub mod observations;
 pub mod owner;
 
 /// Campaign mutation stays closed until frozen owner units and retry evidence
@@ -36,7 +37,7 @@ pub const RECOVERY_LIMIT: &str = "Runtime/image restoration only; writable disks
 
 /// Owner-side compatibility summary published by the consumer module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Application {
     pub owner: String,
     pub backend: String,
@@ -47,7 +48,6 @@ pub struct Application {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GuestSystem {
     pub system: String,
 }
@@ -218,14 +218,16 @@ pub fn validate(inv: &Inventory) -> Result<(), InventoryError> {
 /// # Errors
 /// Invalid selectors/ownership or an excluded owner/affected sibling.
 pub fn resolve(inv: &Inventory, selector: &str) -> Result<OwnerPlan, InventoryError> {
+    let (selected, excluded) = inv.resolve_with_exclusions(selector)?;
+    resolve_selected(inv, selected, excluded)
+}
+
+pub(crate) fn resolve_selected(
+    inv: &Inventory,
+    selected: Vec<String>,
+    excluded: Vec<String>,
+) -> Result<OwnerPlan, InventoryError> {
     validate(inv)?;
-    let selected = inv.resolve(selector)?;
-    let mut excluded = BTreeSet::new();
-    for raw in selector.split([',', ':']) {
-        if let Some(atom) = raw.trim().strip_prefix('!') {
-            excluded.extend(inv.resolve(atom)?);
-        }
-    }
     let mut requested = Vec::new();
     let mut owners = BTreeSet::new();
     let vm = inv

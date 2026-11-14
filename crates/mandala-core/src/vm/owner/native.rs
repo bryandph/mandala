@@ -79,7 +79,7 @@ impl Effects for NativeEffects {
             return Err(invalid("owner profile is not a store path"));
         }
         self.store(&["--check-validity", profile]).await?;
-        let actual: crate::vm::manifest::Manifest = serde_json::from_slice(&std::fs::read(
+        let actual = crate::vm::manifest::Manifest::parse(&std::fs::read(
             Path::new(profile).join(crate::vm::manifest::RELATIVE_PATH),
         )?)
         .map_err(io::Error::other)?;

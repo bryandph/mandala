@@ -130,7 +130,7 @@ impl State {
 /// Exact persisted intended, previous and observed evidence. Old/unknown journal
 /// versions fail closed; no host-profile-only reconstruction is permitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Journal {
     pub version: u64,
     pub owner: String,
@@ -215,6 +215,7 @@ pub struct AdapterRequest {
     pub operation: Operation,
     pub target: VerificationTarget,
     pub manifest: Manifest,
+    pub profile: String,
     pub previous: Option<Observation>,
     pub mode: Mode,
 }
@@ -425,6 +426,10 @@ impl<E: Effects> Session<'_, E> {
                 operation,
                 target,
                 manifest,
+                profile: journal
+                    .profile
+                    .clone()
+                    .ok_or_else(|| invalid("missing desired owner profile"))?,
                 previous: journal.previous.clone(),
                 mode,
             }),
@@ -790,10 +795,12 @@ impl<E: Effects> Session<'_, E> {
             );
         }
         good &= if mode == Mode::Live {
-            observation.owner_profile == manifest.owner_generation
+            observation.owner_profile == *journal.profile.as_ref().expect("prepared owner profile")
                 && observation.owner_running == manifest.owner_generation
         } else {
             observation.boot_default == manifest.owner_generation
+                && observation.owner_profile
+                    == *journal.profile.as_ref().expect("prepared owner profile")
                 && observation.owner_running == previous.owner_running
         };
         journal.observed = Some(observation);

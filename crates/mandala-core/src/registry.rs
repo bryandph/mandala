@@ -398,6 +398,12 @@ impl ObservedRun {
         // also corrects pre-fix registry records whose meta says rc=0 despite
         // a failed or rolled-back host.
         self.poll();
+        if self.tailer.vm.has_failure() {
+            return RunLiveness::Failed;
+        }
+        if self.tailer.vm.has_rollback() {
+            return RunLiveness::RolledBack;
+        }
         let states: Vec<HostState> = self.tailer.hosts.values().map(|h| h.state).collect();
         if states.contains(&HostState::RolledBack) {
             return RunLiveness::RolledBack;

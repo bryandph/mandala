@@ -545,6 +545,8 @@ pub struct EventTailer {
     pub build: BuildModel,
     /// Latest shared publish milestone (never a fleet host).
     pub publish: Option<Value>,
+    /// Shared read-only owner/guest settlement, absent for legacy runs.
+    pub vm: crate::vm::observations::VmRun,
     /// Native, tolerant Nix activity state shared by every frontend.
     pub forest: nix_build_forest::BuildForest,
     forest_resolver: Option<ForestResolver>,
@@ -578,6 +580,7 @@ impl EventTailer {
             hosts: BTreeMap::new(),
             build: BuildModel::default(),
             publish: registry::read_meta(directory).get("publish").cloned(),
+            vm: crate::vm::observations::VmRun::read(directory),
             forest: nix_build_forest::BuildForest::with_duration_estimates(duration_estimates),
             forest_resolver: None,
             nixlog_sink: None,
@@ -596,9 +599,11 @@ impl EventTailer {
     /// back, so deploy-level success must consult this independently.
     #[must_use]
     pub fn has_unsuccessful_host(&self) -> bool {
-        self.hosts
-            .values()
-            .any(|host| matches!(host.state, HostState::Failed | HostState::RolledBack))
+        self.vm.unsuccessful()
+            || self
+                .hosts
+                .values()
+                .any(|host| matches!(host.state, HostState::Failed | HostState::RolledBack))
     }
 
     /// Consume newly appended events across every `*.jsonl` file (sorted, for
@@ -608,6 +613,7 @@ impl EventTailer {
     /// trailing newline is a partial write — we stop before it and re-read it
     /// on the next poll (its bytes are not counted toward the offset).
     pub fn poll(&mut self) -> usize {
+        self.vm = crate::vm::observations::VmRun::read(&self.directory);
         self.poll_forest_resolver();
         let mut count = 0usize;
         if !self.directory.is_dir() {
@@ -1758,6 +1764,18 @@ mod tests {
     /// compact bytes: envelope and per-event field order, escaping, and one
     /// flushed newline per record. The supplied clock means this is a byte
     /// golden, not a parsed-JSON comparison with timestamps stripped.
+    #[test]
+    fn vm_owner_backend_event_envelope_canonical_bytes() {
+        let directory = tmp();
+        let writer = EventWriter::new(&directory, "host-a", "host-a", "deploy").unwrap();
+        writer.emit_at("vm", serde_json::json!({"owner":"host-a","guest":"guest-a","backend":"nixos-module","manifest_version":1,"outcome":"confirmed"}).as_object().unwrap().clone(), 42.0).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("host-a.jsonl")).unwrap(),
+            "{\"v\":2,\"ts\":42.0,\"host\":\"host-a\",\"plugin\":\"deploy\",\"event\":\"vm\",\"backend\":\"nixos-module\",\"guest\":\"guest-a\",\"manifest_version\":1,\"outcome\":\"confirmed\",\"owner\":\"host-a\"}\n"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn controller_publish_and_member_mirror_preserve_legacy_bytes() {
         let directory = tmp();

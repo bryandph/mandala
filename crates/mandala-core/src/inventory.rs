@@ -410,6 +410,18 @@ impl Inventory {
     /// [`InventoryError::EmptySelector`], [`InventoryError::ResolvesToNothing`],
     /// or the atom errors of [`Inventory::resolve_part`].
     pub fn resolve(&self, selector: &str) -> Result<Vec<String>, InventoryError> {
+        self.resolve_with_exclusions(selector)
+            .map(|(selected, _)| selected)
+    }
+
+    /// Resolve canonical identity and explicit exclusions together in one pass.
+    ///
+    /// # Errors
+    /// The same selector errors as [`Self::resolve`].
+    pub fn resolve_with_exclusions(
+        &self,
+        selector: &str,
+    ) -> Result<(Vec<String>, Vec<String>), InventoryError> {
         let mut include: BTreeSet<String> = BTreeSet::new();
         let mut exclude: BTreeSet<String> = BTreeSet::new();
         let mut saw_include = false;
@@ -445,7 +457,7 @@ impl Inventory {
         if resolved.is_empty() {
             return Err(InventoryError::ResolvesToNothing(selector.to_string()));
         }
-        Ok(resolved)
+        Ok((resolved, exclude.into_iter().collect()))
     }
 
     /// Resolve one selector atom: `all` or `@all` → every member; `@group` →

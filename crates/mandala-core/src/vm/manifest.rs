@@ -11,7 +11,7 @@ pub const VERSION: u64 = 1;
 pub const RELATIVE_PATH: &str = "mandala/vm-application.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Manifest {
     pub manifest_version: u64,
     pub owner: String,
@@ -26,7 +26,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Guest {
     pub system: String,
     /// Immutable running generation/image identity required from inspection.
@@ -39,7 +39,7 @@ pub struct Guest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Readiness {
     /// Host-local runtime/service probe contract. Guest SSH is not a probe.
     pub contract: String,
@@ -48,7 +48,7 @@ pub struct Readiness {
 
 /// A complete observed runtime, not desired config or an image symlink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Observation {
     pub manifest_version: u64,
     pub adapter: String,
@@ -59,7 +59,7 @@ pub struct Observation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Runtime {
     pub running_identity: String,
     pub runtime_instance: String,
@@ -109,80 +109,241 @@ pub(crate) fn immutable_identity(identity: &str) -> bool {
         })
 }
 
+/// A field-addressable validation failure shared by runtime and authoring tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestError {
+    pub field: String,
+    pub message: String,
+}
+impl std::fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.message)
+    }
+}
+impl std::error::Error for ManifestError {}
+impl From<ManifestError> for String {
+    fn from(error: ManifestError) -> Self {
+        error.to_string()
+    }
+}
+fn error(field: impl Into<String>, message: &str) -> ManifestError {
+    ManifestError {
+        field: field.into(),
+        message: message.into(),
+    }
+}
+
 impl Manifest {
-    /// Validate the built artifact against the preview and its actual closure.
-    /// The closure must come from a store query, not from this manifest.
+    /// Parse the published manifest with field-addressable type errors.
     ///
     /// # Errors
-    /// Rejects unsupported versions/systems, missing dependency references,
-    /// unbounded readiness or mismatched owner/guest impact.
-    pub fn validate(&self, unit: &OwnerUnit, closure: &BTreeSet<String>) -> Result<(), String> {
-        if self.manifest_version != VERSION
-            || self.manifest_version != unit.application.manifest_version
-            || self.owner != unit.owner
-            || self.owner_system != unit.owner_system
-            || self.backend != "nixos-module"
-            || self.backend != unit.application.backend
-            || self.guests.keys().ne(unit.affected_guests.iter())
-            || self.supported_systems != unit.application.supported_systems
-            || !self.supported_systems.contains(&self.owner_system)
-        {
-            return Err("owner manifest does not match approved application".into());
-        }
-        let dependency = |path: &str| {
-            if !store_reference(path) {
-                return false;
+    /// Missing/malformed fields or invalid JSON. Additive fields are ignored.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
+        use serde_json::Value;
+        let value: Value = serde_json::from_slice(bytes).map_err(|e| error("$", &e.to_string()))?;
+        let string = |field: &str, value: &Value| {
+            if value.is_string() {
+                Ok(())
+            } else {
+                Err(error(field, "expected a string"))
             }
-            let root = path.split('/').take(4).collect::<Vec<_>>().join("/");
-            closure.contains(&root)
         };
-        if !dependency(&self.owner_generation) || !dependency(&self.adapter) {
-            return Err("owner adapter is not an immutable application dependency".into());
+        for field in [
+            "owner",
+            "backend",
+            "ownerSystem",
+            "ownerGeneration",
+            "adapter",
+        ] {
+            string(field, &value[field])?;
         }
-        for (name, guest) in &self.guests {
-            if guest.system != unit.application.guests[name].system
-                || !self.supported_systems.contains(&guest.system)
-                || !immutable_identity(&guest.desired_identity)
-                || guest.runtime_instance.trim().is_empty()
-                || !(1..=3600).contains(&guest.readiness.deadline_seconds)
-                || !dependency(&guest.artifact)
-                || !dependency(&guest.readiness.contract)
-                || !dependency(&guest.recovery_contract)
-            {
-                return Err(format!(
-                    "{name}: incomplete/unbounded runtime manifest or missing closure dependency"
+        if value["manifestVersion"].as_u64().is_none() {
+            return Err(error("manifestVersion", "expected an unsigned integer"));
+        }
+        if !value["supportedSystems"]
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_string))
+        {
+            return Err(error(
+                "supportedSystems",
+                "expected an array of system strings",
+            ));
+        }
+        let guests = value["guests"]
+            .as_object()
+            .ok_or_else(|| error("guests", "expected a guest-ID keyed object"))?;
+        for (name, guest) in guests {
+            for field in [
+                "system",
+                "desiredIdentity",
+                "artifact",
+                "runtimeInstance",
+                "recoveryContract",
+            ] {
+                string(&format!("guests.{name}.{field}"), &guest[field])?;
+            }
+            string(
+                &format!("guests.{name}.readiness.contract"),
+                &guest["readiness"]["contract"],
+            )?;
+            if guest["readiness"]["deadlineSeconds"].as_u64().is_none() {
+                return Err(error(
+                    format!("guests.{name}.readiness.deadlineSeconds"),
+                    "expected an unsigned integer",
                 ));
             }
+        }
+        serde_json::from_value(value).map_err(|e| error("$", &e.to_string()))
+    }
+
+    /// Validate exact compatibility and independently queried closure membership.
+    ///
+    /// # Errors
+    /// The returned error names the first incompatible manifest field.
+    pub fn validate(
+        &self,
+        unit: &OwnerUnit,
+        closure: &BTreeSet<String>,
+    ) -> Result<(), ManifestError> {
+        if self.manifest_version != VERSION
+            || self.manifest_version != unit.application.manifest_version
+        {
+            return Err(error(
+                "manifestVersion",
+                "unsupported or differs from host.vmApplication",
+            ));
+        }
+        if self.owner != unit.owner {
+            return Err(error("owner", "differs from approved owner identity"));
+        }
+        if self.owner_system != unit.owner_system {
+            return Err(error("ownerSystem", "differs from owner build.system"));
+        }
+        if self.backend != "nixos-module" || self.backend != unit.application.backend {
+            return Err(error(
+                "backend",
+                "unsupported or differs from host.vmApplication",
+            ));
+        }
+        if self.guests.keys().ne(unit.affected_guests.iter()) {
+            return Err(error(
+                "guests",
+                "must exactly match host.vmApplication and ownership relations",
+            ));
+        }
+        if self.supported_systems != unit.application.supported_systems
+            || !self.supported_systems.contains(&self.owner_system)
+        {
+            return Err(error(
+                "supportedSystems",
+                "must match host.vmApplication and support the owner system",
+            ));
+        }
+        let dependency = |field: &str, path: &str| {
+            let root = path.split('/').take(4).collect::<Vec<_>>().join("/");
+            if store_reference(path) && !path.ends_with(".drv") && closure.contains(&root) {
+                Ok(())
+            } else {
+                Err(error(
+                    field,
+                    "must be an immutable prebuilt reference in the owner application closure",
+                ))
+            }
+        };
+        dependency("ownerGeneration", &self.owner_generation)?;
+        dependency("adapter", &self.adapter)?;
+        for (name, guest) in &self.guests {
+            let field = |key: &str| format!("guests.{name}.{key}");
+            if guest.system != unit.application.guests[name].system
+                || !self.supported_systems.contains(&guest.system)
+            {
+                return Err(error(
+                    field("system"),
+                    "differs from host.vmApplication or unsupported",
+                ));
+            }
+            if !immutable_identity(&guest.desired_identity) {
+                return Err(error(
+                    field("desiredIdentity"),
+                    "must be an immutable store path or lowercase sha256 digest",
+                ));
+            }
+            if guest.runtime_instance.trim().is_empty() {
+                return Err(error(
+                    field("runtimeInstance"),
+                    "must identify the owner-local runtime instance",
+                ));
+            }
+            if !(1..=3600).contains(&guest.readiness.deadline_seconds) {
+                return Err(error(
+                    field("readiness.deadlineSeconds"),
+                    "must be between 1 and 3600",
+                ));
+            }
+            dependency(&field("artifact"), &guest.artifact)?;
+            dependency(&field("readiness.contract"), &guest.readiness.contract)?;
+            dependency(&field("recoveryContract"), &guest.recovery_contract)?;
         }
         Ok(())
     }
 
-    /// Require prior owner state and every previous running sibling. The first
-    /// backend cannot claim to recover initial creation or missing evidence.
+    /// Require complete prior owner/guest state, refusing fictitious rollback.
     ///
     /// # Errors
-    /// Missing/ambiguous runtime, instance mismatch, unreadiness or no artifact.
-    pub fn validate_previous(&self, previous: &Observation) -> Result<(), String> {
-        if previous.manifest_version != VERSION
-            || !store_reference(&previous.adapter)
-            || !store_reference(&previous.owner_profile)
-            || !store_reference(&previous.owner_running)
-            || !store_reference(&previous.boot_default)
-            || previous.guests.keys().ne(self.guests.keys())
-        {
-            return Err("previous owner/guest state is not recoverable".into());
+    /// The error names missing/unrecoverable previous evidence.
+    pub fn validate_previous(&self, previous: &Observation) -> Result<(), ManifestError> {
+        if previous.manifest_version != VERSION {
+            return Err(error("previous.manifestVersion", "unsupported"));
+        }
+        for (field, path) in [
+            ("adapter", &previous.adapter),
+            ("ownerProfile", &previous.owner_profile),
+            ("ownerRunning", &previous.owner_running),
+            ("bootDefault", &previous.boot_default),
+        ] {
+            if !store_reference(path) {
+                return Err(error(
+                    format!("previous.{field}"),
+                    "missing immutable previous reference",
+                ));
+            }
+        }
+        if previous.guests.keys().ne(self.guests.keys()) {
+            return Err(error(
+                "previous.guests",
+                "every affected guest requires a prior runtime; first-time creation refused",
+            ));
         }
         for (name, runtime) in &previous.guests {
-            if !immutable_identity(&runtime.running_identity)
-                || !runtime.ready
-                || runtime.runtime_instance != self.guests[name].runtime_instance
-                || !store_reference(&runtime.artifact)
-                || !store_reference(&runtime.readiness.contract)
-                || !(1..=3600).contains(&runtime.readiness.deadline_seconds)
-                || !store_reference(&runtime.recovery_contract)
-            {
-                return Err(format!(
-                    "{name}: no verified recoverable prior runtime; first-time creation refused"
+            let field = |key: &str| format!("previous.guests.{name}.{key}");
+            if !immutable_identity(&runtime.running_identity) {
+                return Err(error(
+                    field("runningIdentity"),
+                    "missing recoverable running identity; first-time creation refused",
+                ));
+            }
+            if !runtime.ready {
+                return Err(error(field("ready"), "prior runtime must be ready"));
+            }
+            if runtime.runtime_instance != self.guests[name].runtime_instance {
+                return Err(error(
+                    field("runtimeInstance"),
+                    "does not match the affected runtime",
+                ));
+            }
+            for (key, reference) in [
+                ("artifact", &runtime.artifact),
+                ("readiness.contract", &runtime.readiness.contract),
+                ("recoveryContract", &runtime.recovery_contract),
+            ] {
+                if !store_reference(reference) {
+                    return Err(error(field(key), "missing immutable recovery reference"));
+                }
+            }
+            if !(1..=3600).contains(&runtime.readiness.deadline_seconds) {
+                return Err(error(
+                    field("readiness.deadlineSeconds"),
+                    "must be between 1 and 3600",
                 ));
             }
         }

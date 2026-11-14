@@ -215,11 +215,12 @@
       });
       vm-owner-backend = self.packages.${pkgs.stdenv.hostPlatform.system}.mandala-rs.overrideAttrs (_: {
         pname = "mandala-vm-owner-backend";
-        cargoBuildFlags = ["-p" "mandala-core" "-p" "mandala-deploy"];
-        cargoTestFlags = ["-p" "mandala-core" "-p" "mandala-deploy" "vm_owner_backend"];
+        cargoBuildFlags = ["-p" "mandala-core" "-p" "mandala-deploy" "-p" "mandala-mcp" "-p" "mandala-tui"];
+        cargoTestFlags = ["-p" "mandala-core" "-p" "mandala-deploy" "-p" "mandala-mcp" "-p" "mandala-tui" "vm_owner_backend"];
         installPhase = "mkdir -p $out";
         postFixup = "";
       });
+      vm-owner-artifacts = assert import ./tests/vm-owner-artifacts.nix {inherit lib;}; pkgs.runCommand "vm-owner-artifacts" {} "touch $out";
       vm-owner-module = assert import ./tests/vm-owner-module.nix {inherit lib pkgs;}; pkgs.runCommand "vm-owner-module" {} "touch $out";
       vm-member-schema = assert import ./tests/vm-member-schema.nix {inherit lib;}; pkgs.runCommand "vm-member-schema" {} "touch $out";
       vm-projections = assert import ./tests/vm-projections.nix {inherit lib;}; pkgs.runCommand "vm-projections" {} "touch $out";
