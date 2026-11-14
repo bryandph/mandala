@@ -84,7 +84,17 @@ impl App {
         let Some(capture) = self.campaign_capture.take() else {
             return;
         };
-        let names = capture.plan.targets.join(",");
+        let names =
+            match capture
+                .target
+                .required_confirm(AttemptKind::Deploy, &capture.plan.targets, false)
+            {
+                Ok(names) => names,
+                Err(error) => {
+                    self.state.set_status(error.to_string(), true);
+                    return;
+                }
+            };
         let request = self.campaign_request(if preview {
             "Binding preview without host effects"
         } else {
@@ -125,6 +135,9 @@ impl App {
         match result {
             Ok(capture) => {
                 view.payload = json!({"unbound_target":capture.target,"target_digest":capture.target.digest().ok(),"eligible_names":capture.plan.targets,"notice":"No campaign is bound and no host effects occur before confirmation"});
+                if !capture.plan.vm.is_empty() {
+                    view.payload["owner_preview"] = capture.plan.preview();
+                }
                 view.status = "Frozen target ready for explicit review".into();
                 view.review = Some(Review::Create);
                 view.id = None;
@@ -345,8 +358,21 @@ impl App {
                         match Store::default().load(&id) {
                             Ok(campaign) => match c {
                                 't' | 'T' => {
-                                    let names =
-                                        campaign.eligible(AttemptKind::Deploy, None)?.join(",");
+                                    let eligible = campaign.eligible(AttemptKind::Deploy, None)?;
+                                    let names = campaign.required_confirm(
+                                        AttemptKind::Deploy,
+                                        &eligible,
+                                        c == 'T',
+                                    )?;
+                                    if !campaign
+                                        .target
+                                        .vm_owner_plan
+                                        .for_targets(&eligible)
+                                        .is_empty()
+                                    {
+                                        view.payload["owner_preview"] =
+                                            campaign.target.deploy_preview(&eligible, c == 'T')?;
+                                    }
                                     view.review = Some(Review::Call {
                                         tool: "campaign_retry".into(),
                                         args: json!({"campaign_id":id,"generation":campaign.generation,"confirm":names,"dry_activate":c=='T',"cache_push":view.cache_push,"halt_on_build_failure":view.halt}),

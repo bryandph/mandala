@@ -266,14 +266,17 @@ pub struct BuildTool {
         "Take the confirmation target from `resolve`'s `limit` field, a\n",
         "prior run's `limit`, or this tool's refusal (`required_confirm`) —\n",
         "else it refuses WITHOUT launching. Returns the engine-owned run id; follow with\n",
-        "`deploy_status` (its `wait_seconds` blocks until the run settles)."
+        "`deploy_status` (its `wait_seconds` blocks until the run settles).\n",
+        "VM owner applications additionally require `owner_approval` equal to\n",
+        "the shared refusal preview's `requiredOwnerApproval`, even when dry.\n",
+        "Source/settings/mode/impact changes require renewed approval."
     )
 )]
 #[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct DeployTool {
     /// The selector to deploy.
     pub selector: String,
-    /// Build + copy only, no switch (the ungated default).
+    /// Build + copy only, no switch (default; VM impact approval still required).
     #[json_schema(default = true)]
     pub dry_activate: Option<bool>,
     /// Use boot activation for every selected member (default false).
@@ -284,6 +287,8 @@ pub struct DeployTool {
     pub cache_push: Option<bool>,
     /// For a real activation: must equal the resolved `--limit` target.
     pub confirm: Option<String>,
+    /// Exact requiredOwnerApproval from the shared VM preview (also for dry runs).
+    pub owner_approval: Option<String>,
 }
 
 /// `restart_service` arguments.

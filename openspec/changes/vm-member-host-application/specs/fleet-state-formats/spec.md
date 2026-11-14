@@ -3,6 +3,12 @@
 ### Requirement: Durable VM owner-unit plans and runtime evidence
 Deploy metadata SHALL add a VM owner-unit section keyed by owner, containing selected member IDs, requested and affected guest IDs, backend and manifest version, desired/previous/observed immutable owner and guest identities, per-guest readiness/results, staging disposition, primary failure and recovery diagnostics. Before mutation, recovery metadata SHALL be written atomically and referenced previous artifacts SHALL be retained through settlement/reconciliation. Observed state SHALL remain distinct from intended state. Missing evidence SHALL never be reconstructed as verified success.
 
+VM-specific metadata SHALL retain the approved plan, inventory/frozen-source identity, exact fingerprint and settings/mode/target context. Readers SHALL recompute that binding before granting verified status; missing or changed approval evidence SHALL be unknown/unsuccessful, not an owner-only success.
+
+#### Scenario: approved context is missing or changed
+- **WHEN** a run retains a confirmed owner journal but its approval, revision or effect context is missing or inconsistent
+- **THEN** attachment reports unknown/unsuccessful VM evidence without evaluation or host effects
+
 #### Scenario: attach after controller restart
 - **WHEN** an updated frontend attaches to a run after a controller restart
 - **THEN** it reconstructs approved owner/guest impact and observed/recovery outcomes from durable records without evaluating the fleet or inferring success from the owner profile

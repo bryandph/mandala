@@ -91,6 +91,8 @@ pub struct ConfirmState {
     pub boot: bool,
     pub halt_on_build_failure: bool,
     pub cache_push: Option<bool>,
+    /// Captured immutable preview; never refreshed silently while confirming.
+    pub vm_plan: Option<Box<mandala_core::engines::deploy::DeployPlan>>,
 }
 
 impl ConfirmState {
@@ -102,7 +104,26 @@ impl ConfirmState {
             boot: false,
             halt_on_build_failure: false,
             cache_push: None,
+            vm_plan: None,
         }
+    }
+    #[must_use]
+    pub fn owner_preview_fits(&self, size: (u16, u16)) -> bool {
+        self.vm_plan.is_none() || {
+            let lines = confirm_lines(self);
+            lines.len() + 2 <= usize::from(size.1)
+                && lines
+                    .iter()
+                    .all(|line| line.width() + 2 <= usize::from(70.min(size.0 * 9 / 10)))
+        }
+    }
+    #[must_use]
+    pub fn owner_approval(&self) -> Option<String> {
+        self.vm_plan.as_ref().and_then(|original| {
+            let mut plan = original.clone();
+            plan.boot = self.boot;
+            plan.required_owner_approval()
+        })
     }
 }
 
@@ -120,6 +141,15 @@ pub fn confirm_lines(state: &ConfirmState) -> Vec<Line<'static>> {
             ))
         })
         .collect();
+    if let Some(original) = &state.vm_plan {
+        let mut plan = original.clone();
+        plan.boot = state.boot;
+        lines.push(Line::from("Complete bound VM owner preview:"));
+        let preview: Vec<_> = plan.preview().to_string().chars().collect();
+        for chunk in preview.chunks(60) {
+            lines.push(Line::from(chunk.iter().collect::<String>()));
+        }
+    }
     lines.push(Line::default());
     lines.push(Line::from(format!(
         "[{}] Use boot activation for every target (b to toggle)",
@@ -826,6 +856,7 @@ impl DeployViewState {
                         .iter()
                         .map(|copy| copy.describe())
                         .chain(h.lines.iter().cloned())
+                        .chain(tailer.vm.owner_lines(&h.name))
                         .collect(),
                 })
                 .collect();
@@ -859,7 +890,7 @@ impl DeployViewState {
     /// Build the summary tab data (`_show_summary`).
     fn make_summary(&self, tailer: Option<&EventTailer>, elapsed_secs: u64) -> SummaryState {
         let rc = self.returncode;
-        let ok = rc == Some(0);
+        let ok = rc == Some(0) && !tailer.is_some_and(|t| t.vm.unsuccessful());
         let reboot_pending = self
             .hosts
             .iter()
@@ -904,6 +935,18 @@ impl DeployViewState {
                 mandala_core::engines::cache_publish::describe(publish)
             ),
             None => build_line,
+        };
+        let build_line = if let Some(vm) = tailer.map(|t| &t.vm).filter(|vm| vm.present()) {
+            format!(
+                "{build_line} · {}{}",
+                vm.summary.describe(),
+                vm.error
+                    .as_ref()
+                    .map(|error| format!(" · VM evidence unavailable: {error}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            build_line
         };
         let recap_at = self
             .playbook_lines
@@ -990,8 +1033,9 @@ pub fn render_confirm(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let message_lines = state.message.lines().count() as u16;
-    let rect = render_modal(frame, confirm_lines(state), 70, theme);
+    let lines = confirm_lines(state);
+    let message_lines = lines.len().saturating_sub(7) as u16;
+    let rect = render_modal(frame, lines, 70, theme);
     let inner_x = rect.x.saturating_add(1);
     let inner_width = rect.width.saturating_sub(2);
     let inner_y = rect.y.saturating_add(1);
@@ -1462,6 +1506,96 @@ mod tests {
     /// The exhaustiveness gate for the deploy tier's style/glyph tables:
     /// every host state maps through `rich_style` (a new state extends the
     /// match — compile-enforced — and must land here styleable).
+    #[test]
+    fn vm_owner_backend_tui_uses_shared_failure_verdict_and_owner_guest_rows() {
+        let mut journal: mandala_core::vm::owner::Journal = serde_json::from_str(include_str!(
+            "../../mandala-core/src/vm/fixtures/confirmed.json"
+        ))
+        .unwrap();
+        journal
+            .observed
+            .as_mut()
+            .unwrap()
+            .guests
+            .get_mut("guest-a")
+            .unwrap()
+            .ready = false;
+        let unit = journal.unit.clone().unwrap();
+        let verdict = mandala_core::vm::observations::judge(&unit, journal, false);
+        let mut tailer = EventTailer::new(std::path::Path::new("/nonexistent-fixture"));
+        tailer.vm.plan = Some(mandala_core::vm::OwnerPlan::default());
+        tailer.vm.owners.insert("host-a".into(), verdict);
+        tailer.vm.summary.failed = 1;
+        let mut state = DeployViewState::new("guest-a", false, false, true, false);
+        state.returncode = Some(0);
+        let summary = state.make_summary(Some(&tailer), 1);
+        assert!(!summary.ok);
+        assert!(summary.build_line.contains("failed=1"));
+        let lines = tailer.vm.owner_lines("host-a");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("guest-a owner host-a: Failed"))
+        );
+        assert_eq!(
+            state.hosts.len(),
+            0,
+            "VM guests are not independent transport tasks"
+        );
+    }
+
+    #[test]
+    fn vm_owner_backend_tui_preview_binding_tracks_mode_but_not_silent_inventory_refresh() {
+        let inv = mandala_core::inventory::Inventory::from_value(
+            serde_json::from_str(include_str!(
+                "../../mandala-core/tests/fixtures/vm-inventory.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let plan = mandala_core::engines::deploy::plan_run(&inv, "guest-a", 4, false).unwrap();
+        let mut confirm = ConfirmState::new(
+            "Deploy guest-a?",
+            ConfirmAction::Deploy {
+                target: "guest-a".into(),
+            },
+        );
+        confirm.vm_plan = Some(Box::new(plan.clone()));
+        assert_eq!(confirm.owner_approval(), plan.required_owner_approval());
+        let lines = confirm_lines(&confirm)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        for key in [
+            "ownerPlan",
+            "requestedGuests",
+            "potentiallyAffectedGuests",
+            "requiredOwnerApproval",
+        ] {
+            assert!(lines.contains(key));
+        }
+        assert!(!confirm.owner_preview_fits((80, 24)));
+        assert!(confirm.owner_preview_fits((160, 200)));
+        confirm.boot = true;
+        assert_ne!(confirm.owner_approval(), plan.required_owner_approval());
+        let mut boot = plan.clone();
+        boot.boot = true;
+        assert_eq!(confirm.owner_approval(), boot.required_owner_approval());
+        let captured = confirm.owner_approval();
+        let mut moved = serde_json::to_value(inv.aggregate()).unwrap();
+        moved["members"]["host-a"]["tags"] = serde_json::json!(["moved"]);
+        let fresh = mandala_core::engines::deploy::plan_run_with_boot(
+            &mandala_core::inventory::Inventory::from_value(moved).unwrap(),
+            "guest-a",
+            4,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_ne!(captured, fresh.required_owner_approval());
+        assert_eq!(confirm.owner_approval(), captured);
+    }
+
     #[test]
     fn every_host_state_has_style_and_glyph() {
         for state in [

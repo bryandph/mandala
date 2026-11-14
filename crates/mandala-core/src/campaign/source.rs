@@ -1083,6 +1083,16 @@ impl Capture {
         if actor.trim().is_empty() {
             return Err(invalid("campaign creation requires an actor"));
         }
+        // Reject-only live preflight. No observed value flows into capture.
+        // Failure (including evaluation failure) precedes archive/root effects.
+        let preflight = Inventory::from_value(nix(&[
+            "eval",
+            "--json",
+            "--no-write-lock-file",
+            &format!("{flake}#mandala"),
+        ])?)
+        .map_err(|e| invalid(e.to_string()))?;
+        validate_campaign_selection(&preflight, selector)?;
         let frozen = freeze_source(flake)?;
         let frozen_path = frozen.source.snapshot.store_path.clone();
         let empty_plan = deploy::DeployPlan {
@@ -1090,6 +1100,8 @@ impl Capture {
             targets: Vec::new(),
             skipped: Vec::new(),
             settings: BTreeMap::new(),
+            vm: Default::default(),
+            vm_revision: None,
             dry_activate: false,
             boot,
             halt_on_build_failure: false,
@@ -1106,6 +1118,7 @@ impl Capture {
                 },
                 hosts: BTreeMap::new(),
                 initial_exclusions: BTreeMap::new(),
+                vm_owner_plan: Default::default(),
             },
             plan: empty_plan,
             actor: actor.into(),
@@ -1120,7 +1133,7 @@ impl Capture {
             &aggregate_ref,
         ])?)
         .map_err(|error| invalid(error.to_string()))?;
-        let (members, operator_exclusions) = bound_selection(&inv, selector)?;
+        let (mut members, operator_exclusions) = validate_campaign_selection(&inv, selector)?;
         let mut plan =
             match deploy::plan_run_with_boot(&inv, &members.join(","), throttle, false, boot) {
                 Ok(plan) => plan,
@@ -1129,6 +1142,8 @@ impl Capture {
                     targets: Vec::new(),
                     skipped: members.clone(),
                     settings: BTreeMap::new(),
+                    vm: Default::default(),
+                    vm_revision: None,
                     dry_activate: false,
                     boot,
                     halt_on_build_failure: false,
@@ -1137,6 +1152,18 @@ impl Capture {
                 },
                 Err(error) => return Err(invalid(error.to_string())),
             };
+        capture.target.vm_owner_plan = plan.vm.clone();
+        if !plan.vm.is_empty() {
+            members.extend(plan.vm.units.keys().cloned());
+            members.extend(
+                plan.vm
+                    .units
+                    .values()
+                    .flat_map(|unit| unit.affected_guests.iter().cloned()),
+            );
+            members.sort();
+            members.dedup();
+        }
         let systems = system_identities(&reference, &plan.targets)?;
         let installables: Vec<_> = plan
             .targets
@@ -1260,7 +1287,14 @@ impl Capture {
             .retain(|name| !capture.target.initial_exclusions.contains_key(name));
         plan.settings.retain(|name, _| plan.targets.contains(name));
         plan.limit = plan.targets.join(",");
-        capture.plan = plan;
+        plan.vm = capture.target.vm_owner_plan.for_targets(&plan.targets);
+        plan.vm_revision =
+            (!plan.vm.is_empty()).then(|| capture.target.source.snapshot.content_digest.clone());
+        capture.plan = if plan.vm.is_empty() {
+            plan
+        } else {
+            super::execution::target_plan(&capture.target, &plan.targets, false, throttle)?
+        };
         let (after_metadata, after_archive) = archive(flake)?;
         if capture.frozen.archived != after_archive
             || capture.frozen.metadata["locked"] != after_metadata["locked"]
@@ -1296,6 +1330,19 @@ impl Capture {
             File::open(directory)?.sync_all()
         })
     }
+}
+
+fn validate_campaign_selection(
+    inv: &Inventory,
+    selector: &str,
+) -> io::Result<(Vec<String>, BTreeMap<String, String>)> {
+    let (members, exclusions) = bound_selection(inv, selector)?;
+    let (_, explicit_exclusions) = inv
+        .resolve_with_exclusions(selector)
+        .map_err(|e| invalid(e.to_string()))?;
+    crate::vm::resolve_selected(inv, members.clone(), explicit_exclusions)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok((members, exclusions))
 }
 
 fn bound_selection(

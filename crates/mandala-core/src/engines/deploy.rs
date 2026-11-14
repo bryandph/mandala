@@ -32,6 +32,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::cache_publish;
+mod vm;
 use crate::cli::Engine;
 use crate::inventory::{Inventory, InventoryError};
 use crate::registry::{self, Meta};
@@ -54,6 +55,15 @@ pub fn engine() -> Engine {
                         .long("limit")
                         .required(true)
                         .help("Selector: @group (expanded to the projected members), member, or comma-list"),
+                )
+                .arg(
+                    Arg::new("approve-owner-plan").long("approve-owner-plan").value_name("FINGERPRINT").help("Approve the exact VM owner impact returned by --preview"),
+                )
+                .arg(
+                    Arg::new("preview")
+                        .long("preview")
+                        .action(ArgAction::SetTrue)
+                        .help("Print resolved owner/sibling impact without registering or building"),
                 )
                 .arg(
                     Arg::new("dry-activate")
@@ -108,6 +118,10 @@ pub struct DeployPlan {
     pub skipped: Vec<String>,
     /// Flattened settings for exactly [`Self::targets`].
     pub settings: BTreeMap<String, Value>,
+    /// Conservative owner/guest impact shared by every frontend.
+    pub vm: crate::vm::OwnerPlan,
+    /// Immutable inventory/frozen-source identity, present only for VM work.
+    pub vm_revision: Option<String>,
     /// Whether activation is suppressed after copy.
     pub dry_activate: bool,
     /// Whether every selected member uses boot activation for this run.
@@ -118,6 +132,41 @@ pub struct DeployPlan {
     pub publish: cache_publish::Config,
     /// Maximum per-host concurrency for the later fan-out stage.
     pub throttle: i64,
+}
+
+impl DeployPlan {
+    /// Bind complete owner impact, source identity, flattened settings and mode.
+    #[must_use]
+    pub fn required_owner_approval(&self) -> Option<String> {
+        (!self.vm.is_empty()).then(|| {
+            self.vm
+                .fingerprint(
+                    self.vm_revision
+                        .as_deref()
+                        .unwrap_or("missing-inventory-identity"),
+                    &self.owner_approval_context(),
+                )
+                .expect("typed approval serializes")
+        })
+    }
+    #[must_use]
+    pub fn owner_approval_context(&self) -> Value {
+        serde_json::json!({"settings":self.settings,"boot":self.boot,"dryActivate":self.dry_activate,"targets":self.targets})
+    }
+    /// Pure shared frontend preview; does not allocate a run or authorize effects.
+    #[must_use]
+    pub fn preview(&self) -> Value {
+        let mut preview = serde_json::json!({
+            "limit": self.limit, "targets": self.targets, "skipped": self.skipped,
+            "settings": self.settings,
+            "dryActivate": self.dry_activate, "boot": self.boot,
+        });
+        if !self.vm.units.is_empty() {
+            preview["ownerPlan"] = serde_json::to_value(&self.vm).expect("owner plan serializes");
+            preview["requiredOwnerApproval"] = Value::from(self.required_owner_approval());
+        }
+        preview
+    }
 }
 
 /// A prepared native deploy after its discoverable registry files exist.
@@ -217,6 +266,8 @@ pub struct DeploySummary {
 pub struct DeployOutcome {
     pub results: BTreeMap<String, HostDeployResult>,
     pub summary: DeploySummary,
+    pub vm_summary: Option<crate::vm::observations::Summary>,
+    pub vm_rows: Vec<String>,
     pub process_rc: i32,
     pub rc: i32,
 }
@@ -360,6 +411,8 @@ pub enum DeployRunError {
         host: String,
         error: serde_json::Error,
     },
+    /// Missing/stale owner-impact approval; refused before registration/build.
+    OwnerApprovalRequired(String),
     /// Creating the run registry failed.
     Registry(io::Error),
 }
@@ -383,6 +436,10 @@ impl fmt::Display for DeployRunError {
             Self::InvalidMemberSettings { host, error } => {
                 write!(f, "invalid flattened deploy settings for {host}: {error}")
             }
+            Self::OwnerApprovalRequired(required) => write!(
+                f,
+                "VM owner application requires current preview approval: --approve-owner-plan {required}"
+            ),
             Self::Registry(err) => write!(f, "creating deploy registry run: {err}"),
         }
     }
@@ -447,11 +504,18 @@ pub fn plan_run_with_boot(
     if throttle <= 0 {
         return Err(DeployRunError::InvalidThrottle(throttle));
     }
-    let canonical_limit = inv.to_limit(limit)?;
-    let selected: Vec<String> = canonical_limit.split(',').map(str::to_string).collect();
-    let (targets, skipped): (Vec<_>, Vec<_>) = selected
+    let (selected, excluded) = inv.resolve_with_exclusions(limit)?;
+    let canonical_limit = selected.join(",");
+    let vm = crate::vm::resolve_selected(inv, selected.clone(), excluded)?;
+    let (mut targets, skipped): (Vec<_>, Vec<_>) = selected
         .into_iter()
+        .filter(|host| inv.members()[host].get("kind").and_then(Value::as_str) != Some("vm"))
         .partition(|host| deploy_rs_enabled(inv, host));
+    if !vm.units.is_empty() {
+        targets.extend(vm.units.keys().cloned());
+        targets.sort();
+        targets.dedup();
+    }
 
     if targets.is_empty() {
         return Err(DeployRunError::NoDeployableMembers(canonical_limit));
@@ -477,11 +541,21 @@ pub fn plan_run_with_boot(
         settings.insert(host.clone(), value.clone());
     }
 
+    let vm_revision = (!vm.is_empty()).then(|| {
+        crate::vm::OwnerPlan::default()
+            .fingerprint(
+                "inventory-content-v2",
+                &serde_json::to_value(inv.aggregate()).expect("aggregate serializes"),
+            )
+            .expect("inventory identity serializes")
+    });
     Ok(DeployPlan {
         limit: canonical_limit,
         targets,
         skipped,
         settings,
+        vm,
+        vm_revision,
         dry_activate,
         boot,
         halt_on_build_failure: false,
@@ -504,6 +578,46 @@ fn now_epoch_f64() -> f64 {
 /// # Errors
 /// Any registry directory, stream, or metadata write failure.
 pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunError> {
+    register_approved_run(plan, None)
+}
+
+/// Register only after matching current immutable VM impact approval.
+///
+/// # Errors
+/// Invalid/stale owner plans or approval, and registry I/O errors.
+pub fn register_approved_run(
+    plan: DeployPlan,
+    approval: Option<&str>,
+) -> Result<RegisteredDeployRun, DeployRunError> {
+    if plan.vm.is_empty() && approval.is_some() {
+        return Err(DeployRunError::OwnerApprovalRequired(
+            "owner impact disappeared; inspect a new preview".into(),
+        ));
+    }
+    if !plan.vm.is_empty() {
+        plan.vm.validate_bound()?;
+        if plan.vm_revision.as_ref().is_none_or(|v| v.is_empty())
+            || plan
+                .vm
+                .units
+                .keys()
+                .any(|owner| !plan.targets.contains(owner))
+            || plan
+                .vm
+                .units
+                .values()
+                .flat_map(|unit| unit.affected_guests.iter())
+                .any(|guest| plan.targets.contains(guest))
+        {
+            return Err(DeployRunError::Inventory(InventoryError::Malformed(
+                "VM run lacks immutable source identity or owner build target".into(),
+            )));
+        }
+        let required = plan.required_owner_approval().expect("VM approval");
+        if approval != Some(required.as_str()) {
+            return Err(DeployRunError::OwnerApprovalRequired(required));
+        }
+    }
     let (run_id, path) = registry::new_run_dir()?;
     for host in &plan.targets {
         std::fs::File::create(path.join(format!("{host}.jsonl")))?;
@@ -515,6 +629,21 @@ pub fn register_run(plan: DeployPlan) -> Result<RegisteredDeployRun, DeployRunEr
     meta.insert("limit".into(), Value::from(plan.limit.clone()));
     meta.insert("targets".into(), Value::from(plan.targets.clone()));
     meta.insert("skipped".into(), Value::from(plan.skipped.clone()));
+    if !plan.vm.units.is_empty() {
+        meta.insert(
+            "vm_owner_plan".into(),
+            serde_json::to_value(&plan.vm).map_err(io::Error::other)?,
+        );
+        meta.insert(
+            "vm_owner_approval".into(),
+            Value::from(plan.required_owner_approval()),
+        );
+        meta.insert("vm_owner_context".into(), plan.owner_approval_context());
+        meta.insert(
+            "vm_inventory_identity".into(),
+            Value::from(plan.vm_revision.clone()),
+        );
+    }
     meta.insert("dry_activate".into(), Value::from(plan.dry_activate));
     meta.insert("boot".into(), Value::from(plan.boot));
     meta.insert("publish".into(), plan.publish.initial());
@@ -1324,11 +1453,33 @@ async fn deploy_host_with(
         Err(error) => return failed_host(&writer, host, error.to_string()),
     };
 
+    let mut owner = if run.plan.vm.units.contains_key(host) {
+        match vm::Transaction::connect(run, host, profile_path, &deploy, &defs, Arc::clone(&writer))
+            .await
+        {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                return failed_host(&writer, host, format!("owner runtime session: {error}"));
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(error) = emit_milestone(&writer, "copy") {
         return failed_host(&writer, host, format!("writing copy milestone: {error}"));
     }
     if let Err(error) = push_profile(&deploy, &defs, false).await {
+        if let Some(owner) = owner.as_mut() {
+            owner.abort_unapplied(&error.to_string()).await;
+        }
         return failed_host(&writer, host, error.to_string());
+    }
+    if let Some(owner) = owner.as_mut()
+        && let Err(error) = owner.prepare().await
+    {
+        owner.abort_unapplied(&error.to_string()).await;
+        return failed_host(&writer, host, format!("preparing owner runtime: {error}"));
     }
     if let Some(error) = sink.error() {
         return failed_host(&writer, host, format!("writing copied output: {error}"));
@@ -1338,13 +1489,27 @@ async fn deploy_host_with(
     let disposition =
         match resolve_activation_disposition(&deploy, &defs, run.plan.dry_activate, boot).await {
             Ok(disposition) => disposition,
-            Err(error) => return failed_host(&writer, host, error.to_string()),
+            Err(error) => {
+                if let Some(owner) = owner.as_mut() {
+                    owner.abort_unapplied(&error.to_string()).await;
+                }
+                return failed_host(&writer, host, error.to_string());
+            }
         };
     if let Some(error) = sink.error() {
         return failed_host(&writer, host, format!("writing preflight output: {error}"));
     }
 
     if disposition.reboot_pending() && run.plan.dry_activate {
+        if let Some(owner) = owner.as_mut()
+            && let Err(error) = owner.finish().await
+        {
+            return failed_host(
+                &writer,
+                host,
+                format!("settling owner dry preview: {error}"),
+            );
+        }
         let _ = writer.emit(
             "line",
             event_fields([
@@ -1382,6 +1547,16 @@ async fn deploy_host_with(
             format!("writing activation-wait milestone: {error}"),
         );
     }
+    if !run.plan.dry_activate
+        && let Some(owner) = owner.as_mut()
+        && let Err(error) = owner.start().await
+    {
+        return failed_host(
+            &writer,
+            host,
+            format!("persisting owner mutation intent: {error}"),
+        );
+    }
     let deployment = match disposition {
         ActivationDisposition::BootStaging => stage_profile_for_boot(&deploy, &defs).await,
         ActivationDisposition::LiveSwitch
@@ -1392,6 +1567,59 @@ async fn deploy_host_with(
             reboot_pending: true,
         } => unreachable!("reboot-pending dry previews return before activation"),
     };
+    if let Some(mut owner) = owner {
+        let mut primary = deployment
+            .err()
+            .map(|error| error.to_string())
+            .or_else(|| sink.error());
+        if !run.plan.dry_activate
+            && primary.is_none()
+            && let Err(error) = owner
+                .apply(matches!(disposition, ActivationDisposition::BootStaging))
+                .await
+        {
+            primary = Some(error.to_string());
+        }
+        if !run.plan.dry_activate
+            && let Some(error) = &primary
+            && let Err(recovery) = owner.recover(settings.auto_rollback, error).await
+        {
+            let _ = writer.emit(
+                "line",
+                event_fields([
+                    ("line", Value::from(format!("owner recovery: {recovery}"))),
+                    ("stream", Value::from("deploy")),
+                ]),
+            );
+        }
+        if let Err(error) = owner.finish().await {
+            primary = Some(format!(
+                "{}; owner settlement: {error}",
+                primary.unwrap_or_default()
+            ));
+        }
+        let state = if run.plan.dry_activate && primary.is_none() {
+            HostState::Confirmed
+        } else {
+            let state = owner.state();
+            if primary.is_some() && matches!(state, HostState::Confirmed | HostState::RebootPending)
+            {
+                HostState::Failed
+            } else {
+                state
+            }
+        };
+        let milestone = match state {
+            HostState::Confirmed => "confirm",
+            HostState::RebootPending => "reboot-pending",
+            HostState::RolledBack => "rollback",
+            _ => "failed",
+        };
+        if let Err(error) = emit_milestone(&writer, milestone) {
+            return failed_host(&writer, host, error.to_string());
+        }
+        return host_result(&writer, host, state, primary);
+    }
     match deployment {
         Ok(()) => {
             if let Some(error) = sink.error() {
@@ -1486,8 +1714,38 @@ fn summarize(results: &BTreeMap<String, HostDeployResult>) -> DeploySummary {
 
 fn settle_fan_out(
     run: &RegisteredDeployRun,
-    results: BTreeMap<String, HostDeployResult>,
+    mut results: BTreeMap<String, HostDeployResult>,
 ) -> io::Result<DeployOutcome> {
+    let vm = crate::vm::observations::VmRun::read(&run.path);
+    for (owner, view) in &vm.owners {
+        if let Some(result) = results.get_mut(owner) {
+            use crate::vm::observations::Verdict;
+            match view.verdict {
+                Verdict::Verified | Verdict::Pending | Verdict::Preview => (),
+                Verdict::RolledBack => result.state = HostState::RolledBack,
+                _ => {
+                    result.state = HostState::Failed;
+                    result.error = view
+                        .diagnostic
+                        .clone()
+                        .or_else(|| Some("owner runtime evidence unsuccessful".into()));
+                }
+            }
+        }
+    }
+    for owner in run.plan.vm.units.keys() {
+        if !vm.owners.contains_key(owner)
+            && let Some(result) = results.get_mut(owner)
+        {
+            result.state = HostState::Failed;
+            result.error = vm
+                .error
+                .clone()
+                .or_else(|| Some("missing VM owner evidence".into()));
+        }
+    }
+    let vm_summary = vm.present().then(|| vm.summary.clone());
+    let vm_rows = vm.lines();
     let summary = summarize(&results);
     // Every host-level error is contained and represented durably. Reaching
     // settlement means the native controller itself completed successfully;
@@ -1497,8 +1755,16 @@ fn settle_fan_out(
         .get("build_rc")
         .and_then(Value::as_i64)
         .is_some_and(|rc| rc != 0);
-    let rc = i32::from(build_failed || summary.failed > 0 || summary.rolled_back > 0);
+    let rc = i32::from(
+        build_failed || summary.failed > 0 || summary.rolled_back > 0 || vm.unsuccessful(),
+    );
     let mut fields = Meta::new();
+    if let Some(summary) = &vm_summary {
+        fields.insert(
+            "vm_summary".into(),
+            serde_json::to_value(summary).map_err(io::Error::other)?,
+        );
+    }
     fields.insert("process_rc".into(), Value::from(process_rc));
     fields.insert("rc".into(), Value::from(rc));
     fields.insert("finished_at".into(), Value::from(now_epoch_f64()));
@@ -1510,6 +1776,8 @@ fn settle_fan_out(
     Ok(DeployOutcome {
         results,
         summary,
+        vm_summary,
+        vm_rows,
         process_rc,
         rc,
     })
@@ -1537,6 +1805,15 @@ fn outcome_lines(outcome: &DeployOutcome) -> Vec<String> {
         outcome.summary.failed,
         outcome.summary.rolled_back
     )];
+    if let Some(summary) = &outcome.vm_summary {
+        lines.push(format!("mandala: {}", summary.describe()));
+    }
+    lines.extend(
+        outcome
+            .vm_rows
+            .iter()
+            .map(|line| format!("mandala: {line}")),
+    );
     for result in outcome
         .results
         .values()
@@ -1678,6 +1955,24 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
     let flake = m.get_one::<String>("flake").map_or(".", String::as_str);
     match m.subcommand() {
         Some(("run", sm)) => {
+            if sm.get_flag("preview") {
+                return match plan_run_with_boot(
+                    inv,
+                    sm.get_one::<String>("limit").map_or("", String::as_str),
+                    *sm.get_one::<i64>("throttle").unwrap_or(&4),
+                    sm.get_flag("dry-activate"),
+                    sm.get_flag("boot"),
+                ) {
+                    Ok(plan) => {
+                        println!("{}", plan.preview());
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("mandala: {error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             let _signals = match mandala_deploy::process::SignalForwarder::install(true) {
                 Ok(signals) => signals,
                 Err(error) => {
@@ -1697,7 +1992,11 @@ fn run(inv: &Inventory, m: &ArgMatches) -> ExitCode {
                         std::env::var_os("MANDALA_CACHE_URL"),
                         std::env::var_os("MANDALA_CACHE_NETRC_FILE"),
                     )?;
-                    register_run(plan)
+                    register_approved_run(
+                        plan,
+                        sm.get_one::<String>("approve-owner-plan")
+                            .map(String::as_str),
+                    )
                 },
             );
             match prepared {
@@ -2463,6 +2762,47 @@ exit 0
     }
 
     #[test]
+    fn vm_owner_resolution_legacy_selectors_preserve_order_shape_and_effect_free_plan() {
+        let inventory = inv();
+        assert_eq!(inventory.aggregate().schema_version, 1);
+        for selector in [
+            "@fleet",
+            "@fleet,!router",
+            "web,cache",
+            "@all,!router",
+            "cache,web,cache",
+        ] {
+            let canonical = inventory.to_limit(selector).unwrap();
+            let (targets, skipped): (Vec<_>, Vec<_>) = canonical
+                .split(',')
+                .map(str::to_string)
+                .partition(|name| deploy_rs_enabled(&inventory, name));
+            let before = serde_json::to_value(inventory.aggregate()).unwrap();
+            let owner_plan = crate::vm::resolve(&inventory, selector).unwrap();
+            assert_eq!(owner_plan, crate::vm::OwnerPlan::default());
+            let plan = plan_run(&inventory, selector, 4, false).unwrap();
+            assert_eq!(plan.targets, targets);
+            assert_eq!(plan.skipped, skipped);
+            assert_eq!(serde_json::to_value(inventory.aggregate()).unwrap(), before);
+            assert!(plan.preview().get("ownerPlan").is_none());
+            assert!(plan.preview().get("vm").is_none());
+            let base = tmp_base("legacy-vm-parity");
+            let _guard = registry::test_hooks::install_runs_base(base.clone());
+            assert!(
+                !base.exists(),
+                "pure planning allocated no files or effects"
+            );
+            let run = register_run(plan).unwrap();
+            let meta = registry::read_meta(&run.path);
+            assert!(
+                meta.keys()
+                    .all(|key| !key.contains("vm") && !key.contains("owner"))
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
     fn registry_run_has_metadata_and_one_stream_per_target() {
         let base = tmp_base("registry");
         let _guard = registry::test_hooks::install_runs_base(base);
@@ -2789,18 +3129,40 @@ exit 0 ;; esac"#;
 
     #[tokio::test]
     async fn partial_build_deploys_only_the_verified_sibling() {
-        partial_build_with_pins(false).await;
+        partial_build_with_pins(false, false).await;
     }
 
     #[tokio::test]
     async fn campaign_partial_build_recovers_exact_outputs_without_retargeting() {
-        partial_build_with_pins(true).await;
+        partial_build_with_pins(true, false).await;
     }
 
-    async fn partial_build_with_pins(pinned: bool) {
+    #[tokio::test]
+    async fn vm_owner_backend_guest_dependency_failure_blocks_only_its_owner_unit() {
+        partial_build_with_pins(false, true).await;
+    }
+
+    async fn partial_build_with_pins(pinned: bool, vm_owner: bool) {
         let base = tmp_base("build-partial");
         let _guard = registry::test_hooks::install_runs_base(base.clone());
-        let run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
+        let mut run = prepare_run(&inv(), "@k3s", 4, false).unwrap();
+        if vm_owner {
+            let (_, mut unit, _) = crate::vm::tests::manifest();
+            unit.owner = "cache".into();
+            unit.application.owner = "cache".into();
+            unit.application.application = ".#deploy.nodes.cache.profiles.system.path".into();
+            run.plan.vm.units.insert("cache".into(), unit);
+            run.plan.vm.selected_members = vec!["guest-a".into(), "web".into()];
+            run.plan.vm.requested_guests = vec!["guest-a".into()];
+            registry::update_meta(
+                &run.path,
+                serde_json::json!({"vm_owner_plan":run.plan.vm})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        }
         let (stub, invocations, _) = build_stub(&base, 23);
         // Nix leaves no batch out-links on failure. Only web's exact output
         // is valid, even though cache appeared first in the selection.

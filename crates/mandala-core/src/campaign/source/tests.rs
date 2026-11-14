@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+mod vm;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +29,9 @@ struct Fake {
     relative: bool,
     unsupported_version: bool,
     metadata_epoch: u64,
+    vm: bool,
+    frozen_vm: bool,
+    preflight_failure: bool,
 }
 pub(super) fn state_root() -> Option<PathBuf> {
     HARNESS.with(|h| h.borrow().as_ref().map(|h| h.root.clone()))
@@ -88,6 +92,18 @@ fn locks() -> Value {
 fn inventory() -> Value {
     let settings = |name: &str| json!({"activation":"switch","hostname":name,"sshUser":"root","sshPort":22,"identityFile":null,"autoRollback":true,"fastConnection":true});
     json!({"schemaVersion":1,"members":{"node-a":{"name":"node-a","deployment":{"deployRs":{"enable":true}}},"node-b":{"name":"node-b","deployment":{"deployRs":{"enable":true}}},"node-c":{"name":"node-c","deployment":{"deployRs":{"enable":true}}},"router":{"name":"router","deployment":{"deployRs":{"enable":false}}}},"groups":{"fleet":["node-a","node-b","router"]},"projections":{"deploy":{"nodes":["node-a","node-b","node-c"],"settings":{"node-a":settings("node-a"),"node-b":settings("node-b"),"node-c":settings("node-c")}}}})
+}
+fn vm_inventory() -> Value {
+    let mut value = inventory();
+    value["schemaVersion"] = json!(2);
+    value["members"]["node-a"]["kind"] = json!("standalone");
+    value["members"]["node-a"]["platform"] = json!("nixos");
+    value["members"]["node-a"]["build"] = json!({"system":"x86_64-linux"});
+    for name in ["node-b", "guest-d"] {
+        value["members"][name] = json!({"name":name,"kind":"vm","platform":"nixos","build":{"system":"x86_64-linux"},"deployment":{"deployRs":{"enable":false},"ansible":{"enable":false}},"vm":{"owner":"node-a","backend":"nixos-module"}});
+    }
+    value["projections"]["vm"] = json!({"guestsByOwner":{"node-a":["guest-d","node-b"]},"applications":{"node-a":{"owner":"node-a","backend":"nixos-module","manifestVersion":1,"supportedSystems":["x86_64-linux"],"application":".#deploy.nodes.node-a.profiles.system.path","guests":{"node-b":{"system":"x86_64-linux"},"guest-d":{"system":"x86_64-linux"}}}}});
+    value
 }
 fn metadata(fake: &Fake) -> Value {
     let path = if fake.replacement {
@@ -264,9 +280,23 @@ fn fake_output(fake: &mut Fake, program: &str, args: &[String]) -> io::Result<Ve
                 } else {
                     ""
                 };
-                json_bytes(Value::Object(["node-a","node-b","node-c"].into_iter().map(|name|{let part=if name=="node-a"{"a"}else{"b"};(name.into(),json!({"path":if fake.missing_system{Value::Null}else{json!(format!("/nix/store/system-{part}"))},"drv":format!("/nix/store/system-{part}{suffix}.drv")}))}).collect()))
+                let prefix = if fake.vm {
+                    "00000000000000000000000000000000-"
+                } else {
+                    ""
+                };
+                json_bytes(Value::Object(["node-a","node-b","node-c"].into_iter().map(|name|{let part=if name=="node-a"{"a"}else{"b"};(name.into(),json!({"path":if fake.missing_system{Value::Null}else{json!(format!("/nix/store/{prefix}system-{part}"))},"drv":format!("/nix/store/{prefix}system-{part}{suffix}.drv")}))}).collect()))
             } else if reference.ends_with("#mandala") {
-                json_bytes(inventory())
+                if fake.preflight_failure && !reference.starts_with("path:") {
+                    return Err(invalid("live preflight evaluation failed"));
+                }
+                json_bytes(
+                    if fake.vm || (fake.frozen_vm && reference.starts_with("path:")) {
+                        vm_inventory()
+                    } else {
+                        inventory()
+                    },
+                )
             } else if reference.ends_with(".drvPath") {
                 Ok(b"/nix/store/system-a.drv".to_vec())
             } else if reference.ends_with(".outPath") {
@@ -295,9 +325,14 @@ fn fake_output(fake: &mut Fake, program: &str, args: &[String]) -> io::Result<Ve
                     .any(|window| window == ["--option", "pure-eval", "true"])
             );
             assert!(args.contains(&"--dry-run".into()), "capture cannot build");
+            let prefix = if fake.vm {
+                "00000000000000000000000000000000-"
+            } else {
+                ""
+            };
             json_bytes(Value::Array(args.iter().filter(|arg| arg.contains("#deploy.nodes.")).map(|arg| {
                 let name = if arg.contains(".node-a.") {"a"} else {"b"};
-                json!({"drvPath":format!("/nix/store/profile-{name}{}.drv",if fake.stripped_profile&&arg.starts_with("path:"){"-metadata-lost"}else{""}),"outputs":{"out":if fake.unknown_output {Value::Null} else {Value::String(if fake.wrapper { format!("/nix/store/wrapper-{name}") } else { format!("/nix/store/system-{name}") })}}})
+                json!({"drvPath":format!("/nix/store/{prefix}profile-{name}{}.drv",if fake.stripped_profile&&arg.starts_with("path:"){"-metadata-lost"}else{""}),"outputs":{"out":if fake.unknown_output {Value::Null} else {Value::String(if fake.wrapper { format!("/nix/store/{prefix}wrapper-{name}") } else { format!("/nix/store/{prefix}system-{name}") })}}})
             }).collect()))
         }
         _ => panic!("unexpected Nix call {args:?}"),
@@ -698,6 +733,7 @@ struct ExecutionState {
     build_failures: BTreeSet<String>,
     activation_failures: BTreeSet<String>,
     trace: Vec<(String, String)>,
+    omit_vm_evidence: bool,
 }
 struct TestExecutor {
     store: Store,
@@ -780,6 +816,12 @@ impl crate::campaign::execution::Executor for TestExecutor {
             }
             let failed =
                 built.failures.contains_key(name) || state.activation_failures.contains(name);
+            if !failed
+                && !state.omit_vm_evidence
+                && let Some(unit) = run.plan.vm.units.get(name)
+            {
+                vm::write_vm_evidence(run, unit, &built.paths[name]);
+            }
             let outcome = if failed {
                 HostState::Failed
             } else {
@@ -830,6 +872,8 @@ impl crate::campaign::execution::Executor for TestExecutor {
         let outcome = crate::engines::deploy::DeployOutcome {
             results,
             summary,
+            vm_summary: None,
+            vm_rows: Vec::new(),
             process_rc: 0,
             rc,
         };
@@ -865,6 +909,7 @@ async fn create_and_deploy_retry_preserves_success_and_refuses_moved_or_unavaila
             build_failures: BTreeSet::from(["node-c".into()]),
             activation_failures: BTreeSet::from(["node-b".into()]),
             trace: Vec::new(),
+            omit_vm_evidence: false,
         }),
     };
     let request = |generation, confirm| execution::DeployRequest {
@@ -1039,7 +1084,10 @@ impl crate::campaign::execution::RebootExecutor for TestReboot {
             format!("{}#ans-reboot", c.target.source.snapshot.store_path)
         );
         assert_eq!(cwd, Path::new(&c.target.source.snapshot.store_path));
-        assert!(argv.windows(2).any(|args| args == ["-l", "node-a"]));
+        assert!(
+            argv.windows(2)
+                .any(|args| args[0] == "-l" && args[1] == attempt.targets.join(","))
+        );
         assert!(argv.contains(&"reboot_serial=2".into()));
         assert!(argv.contains(&"drain=false".into()));
         let meta = registry::read_meta(

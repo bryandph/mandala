@@ -76,6 +76,21 @@ If the target's live-switch preflight refuses, preserve transactional boot-only 
 
 **Alternatives:** start with a generic multi-backend abstraction or guest-exec. Rejected to keep the first conformance/recovery boundary finite. The owner does not execute a foreign guest's switch binary as if it were a host binary.
 
+#### Approved owner-side runtime boundary
+
+The optional `mandala-vm-owner` helper is shipped through
+`nixosModules.vm-owner`, behind explicit `mandala.vmOwner.enable` (off by
+default). The consumer supplies the package and immutable runtime adapter.
+The helper has no listener, daemon or activation service: the controller starts
+one bounded SSH stdio session through the owner's existing transport and
+privilege settings. A version handshake precedes locking or runtime effects and
+fails closed on either-direction mismatch. An OS file lock below
+`/var/lib/mandala/vm/<owner>` spans copy, host deployment, runtime verification
+and recovery. Owner-side atomic records and store roots precede mutation.
+Session loss leaves unknown/reconciliation-required state; a later session may
+reconcile under the lock but cannot infer completion or steal a held lock.
+This boundary does not enable the helper on any consumer or real owner.
+
 ### 6. Recovery is runtime restoration, not profile reversal
 
 Before mutation, atomically persist and root the previous owner profile/boot default and affected guests' runtime generation/image pointers, manifest version, readiness contract and data-rollback limitations. The first backend requires recoverable prior runtimes; first-time creation without one is refused rather than claiming fictitious rollback support.
@@ -99,6 +114,20 @@ Pin exact serialization and reader judgements before shipping. CLI, TUI and MCP 
 Add schema and pure fixtures before orchestration; keep ordinary non-VM output parity. Then implement guarded projections/owner resolution, graph/artifacts, the single module adapter, recovery and durable frontend observation in separate shippable increments. Do not switch a consumer as part of these increments.
 
 Use fake fleets (acme/globex) and injected build/transport/runtime effects only. Assert exact effect traces, no guest SSH or activation-time evaluation, build dependency failure isolation, concurrent-run locking, stale recovery reconciliation, generation/readiness mismatches, staged outcomes, host-only rollback, sibling partial recovery, missing evidence, timeouts and cancellation. Serialization tests cover old records and unsupported aggregate rejection. Existing checks/target names are owned by `flake.nix`; planned new check names are listed in `tasks.md`.
+
+### 9. Frozen campaign owner units and shared approval
+
+This approved extension integrates with [deploy-campaign-target](../deploy-campaign-target/design.md). VM-bearing campaigns write schema version 2 with additive `target.vm_owner_plan`; ordinary campaigns still write/read byte-compatible version 1. Bound membership expands to complete affected owner/guest units while `selectedMembers`, `requestedGuests` and sibling impact retain original intent. Host targets contain owners only. Conflicting owner/sibling exclusions refuse before capture; later policy changes can exclude whole owner units, never silently omit a sibling.
+
+Campaign capture first performs a pure live `#mandala` reject-only preflight. Selector, ownership, exclusion and evaluation failures stop before archive/root effects. No preflight value flows into the target. Resolution is repeated against the frozen graph, and a source race that becomes invalid drops temporary roots without publishing a campaign. Profile/system capture remains frozen-authoritative and retains the independent live/frozen derivation equality guard.
+
+Native CLI/TUI/MCP approval fingerprints bind the evaluated inventory-content identity, complete owner plan, settings, target set and boot/dry mode. Campaign approval instead uses the frozen capsule content identity and captured settings. VM work, including dry build/copy, requires exact current approval. CLI uses `--approve-owner-plan`, MCP uses `owner_approval`; campaign `required_confirm` combines exact eligible owner names with that fingerprint. Native child dispatch rechecks captured approval before registration/build, including when VM impact disappears. TUI never silently refreshes its captured plan; a clipped native preview cannot be confirmed and directs the operator to resize or CLI/MCP.
+
+Retries narrow only frozen owner units. Requested guest identities persist; selecting a bound affected guest maps to the whole owner unit. Successful independent units are not rebuilt/copied/activated. Registration records the VM-only approved context, revision and fingerprint; readers independently validate it and reconstruct owner/guest runtime evidence without evaluation or transport. Campaign settlement and reconciliation cannot infer guest confirmation from host labels or rc 0. Unknown guest evidence blocks replay; partial failure remains per owner with producing attempt/run provenance.
+
+VM campaign comparisons stay incomplete and explicitly report `guest evidence missing` unless durable verified runtime evidence matches the frozen owner unit, profile and system generation. An owner-only survey or reboot command is not guest readiness. This extension does not authorize a consumer migration or a new runtime/reboot adapter.
+
+**Explicit deferred item: serialized owner reboot/reconnect transaction.** Campaign reboot refuses the whole eligible request if it includes any VM owner, before survey/wrapper/run allocation. It names those owners and requires explicitly excluding them to dispatch an ordinary-host-only reboot; no partial dispatch or silent dropping occurs. Existing ordinary-host reboots are unchanged. VM owners remain reboot-pending with guest evidence missing, and read-only verification remains permitted. Do not route a reboot around the owner lock or add a reconnect transaction in this change.
 
 ## Approval and Open Items
 

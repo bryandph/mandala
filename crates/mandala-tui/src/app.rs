@@ -780,15 +780,22 @@ impl App {
                     self.dirty = true;
                 }
                 Some(KeyAction::Confirm) => {
+                    if !confirm.owner_preview_fits(size) {
+                        self.state.set_status("VM preview does not fit: enlarge the terminal or use CLI --preview; no deployment started", true);
+                        self.dirty = true;
+                        return Ok(());
+                    }
                     let Some(ScreenState::Confirm(confirm)) = self.state.screen.take() else {
                         unreachable!("matched Confirm above");
                     };
                     self.dirty = true;
+                    let owner_approval = confirm.owner_approval();
                     match confirm.action {
                         ConfirmAction::Deploy { target } => {
                             let mut run = DeployRun::new(target);
                             run.flake = self.cfg.flake.clone();
                             run.boot = confirm.boot;
+                            run.owner_approval = owner_approval;
                             run.cache_push = confirm.cache_push;
                             run.halt_on_build_failure = confirm.halt_on_build_failure;
                             if let Some(program) = self.cfg.deploy_program.clone() {
@@ -1306,12 +1313,38 @@ impl App {
                 self.dirty = true;
             }
             FleetAction::Deploy => {
-                self.state.screen = Some(ScreenState::Confirm(ConfirmState::new(
+                let vm_plan = if let Some(inv) = &self.state.inventory {
+                    match mandala_core::vm::resolve(inv, &target).and_then(|vm| {
+                        if vm.is_empty() {
+                            Ok(None)
+                        } else {
+                            mandala_core::engines::deploy::plan_run(inv, &target, 4, false)
+                                .map(Some)
+                                .map_err(|e| {
+                                    mandala_core::inventory::InventoryError::Malformed(
+                                        e.to_string(),
+                                    )
+                                })
+                        }
+                    }) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            self.state.set_status(error.to_string(), true);
+                            self.dirty = true;
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut confirm = ConfirmState::new(
                     format!(
                         "Deploy '{target}'?\n(eval-once batch build, then deploy-rs per host with magic rollback)"
                     ),
                     ConfirmAction::Deploy { target },
-                )));
+                );
+                confirm.vm_plan = vm_plan.map(Box::new);
+                self.state.screen = Some(ScreenState::Confirm(confirm));
                 self.dirty = true;
             }
         }

@@ -13,6 +13,10 @@ name = "mandala"
 path = "src/main.rs"
 
 [[bin]]
+name = "mandala-vm-owner"
+path = "src/vm_owner.rs"
+
+[[bin]]
 name = "mandala-run-supervisor"
 path = "src/supervisor.rs"
 

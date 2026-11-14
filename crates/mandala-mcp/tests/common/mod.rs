@@ -140,11 +140,15 @@ impl Effects for FakeEffects {
         &self,
         flake: &str,
         limit: &str,
-        dry_activate: bool,
-        boot: bool,
-        cache_push: Option<bool>,
-        throttle: i64,
+        options: mandala_mcp::effects::DeployLaunchOptions<'_>,
     ) -> io::Result<DeployLaunch> {
+        let mandala_mcp::effects::DeployLaunchOptions {
+            dry_activate,
+            boot,
+            cache_push,
+            owner_approval,
+            throttle,
+        } = options;
         assert!(self.fake_deploy, "unexpected launch_deploy call");
         assert_eq!(flake, ".");
         assert_eq!(throttle, 4);
@@ -165,6 +169,15 @@ impl Effects for FakeEffects {
                 ("rc".into(), Value::from(0)),
             ]),
         )?;
+        if let Some(token) = owner_approval {
+            registry::update_meta(
+                &events_dir,
+                serde_json::json!({"owner_approval_test":token})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )?;
+        }
         Ok(DeployLaunch { run_id, events_dir })
     }
 

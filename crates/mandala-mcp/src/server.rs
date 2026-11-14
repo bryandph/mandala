@@ -845,6 +845,28 @@ impl MandalaHandler {
             .map_err(|e| tool_error(e.to_string()))?;
         let dry_activate = t.dry_activate.unwrap_or(true);
         let boot = t.boot.unwrap_or(false);
+        let owner_plan =
+            mandala_core::vm::resolve(&inv, &t.selector).map_err(|e| tool_error(e.to_string()))?;
+        if owner_plan.is_empty() && t.owner_approval.is_some() {
+            return Ok(
+                json!({"ok":false,"refused":true,"reason":"VM owner impact disappeared; request a new preview"}),
+            );
+        }
+        if !owner_plan.is_empty() {
+            let plan = mandala_core::engines::deploy::plan_run_with_boot(
+                &inv,
+                &t.selector,
+                DEPLOY_THROTTLE,
+                dry_activate,
+                boot,
+            )
+            .map_err(|e| tool_error(e.to_string()))?;
+            if t.owner_approval != plan.required_owner_approval() {
+                return Ok(
+                    json!({"ok":false,"refused":true,"confirmation_required":true,"reason":"VM owner application requires exact current preview approval","preview":plan.preview(),"required_owner_approval":plan.required_owner_approval()}),
+                );
+            }
+        }
         if !dry_activate && t.confirm.as_deref() != Some(target.as_str()) {
             return Ok(json!({
                 "ok": false,
@@ -861,10 +883,13 @@ impl MandalaHandler {
             .launch_deploy(
                 &self.state.flake,
                 &target,
-                dry_activate,
-                boot,
-                t.cache_push,
-                DEPLOY_THROTTLE,
+                crate::effects::DeployLaunchOptions {
+                    dry_activate,
+                    boot,
+                    cache_push: t.cache_push,
+                    owner_approval: t.owner_approval.as_deref(),
+                    throttle: DEPLOY_THROTTLE,
+                },
             )
             .await
             .map_err(|e| tool_error(e.to_string()))?;
@@ -1192,7 +1217,7 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
             serde_json::to_value(snapshot.into_summary()).unwrap_or_default(),
         );
     }
-    json!({
+    let mut snapshot = json!({
         "run_id": obs.info.run_id,
         "kind": obs.info.kind(),
         "meta": if diagnostics {
@@ -1204,7 +1229,11 @@ fn run_snapshot(obs: &mut ObservedRun, detail: SnapshotDetail) -> Value {
         "phase": phase,
         "hosts": hosts,
         "build": build,
-    })
+    });
+    if obs.tailer.vm.present() {
+        snapshot["vm"] = serde_json::to_value(&obs.tailer.vm).expect("VM snapshot serializes");
+    }
+    snapshot
 }
 
 /// Count/row limits alone cannot bound producer-controlled diagnostic strings.
@@ -1344,6 +1373,59 @@ mod tests {
         ] {
             meta.remove(field);
         }
+    }
+
+    #[test]
+    fn vm_owner_backend_mcp_attaches_with_shared_guest_failure_despite_zero_rc() {
+        let path = std::env::temp_dir().join(format!("mandala-mcp-vm-{}", std::process::id()));
+        std::fs::create_dir_all(path.join("vm")).unwrap();
+        let mut journal: mandala_core::vm::owner::Journal = serde_json::from_str(include_str!(
+            "../../mandala-core/src/vm/fixtures/confirmed.json"
+        ))
+        .unwrap();
+        journal
+            .observed
+            .as_mut()
+            .unwrap()
+            .guests
+            .get_mut("guest-a")
+            .unwrap()
+            .ready = false;
+        let plan = mandala_core::vm::OwnerPlan {
+            selected_members: vec!["guest-a".into()],
+            requested_guests: vec!["guest-a".into()],
+            units: std::collections::BTreeMap::from([(
+                "host-a".into(),
+                journal.unit.clone().unwrap(),
+            )]),
+        };
+        let context = json!({"settings":{},"boot":false,"dryActivate":false,"targets":["host-a"]});
+        let token = plan.fingerprint("fixture-revision", &context).unwrap();
+        let meta = json!({"kind":"deploy","rc":0,"vm_owner_plan":plan,"vm_owner_context":context,"vm_inventory_identity":"fixture-revision","vm_owner_approval":token,"targets":["host-a"]});
+        registry::write_meta(&path, meta.as_object().unwrap()).unwrap();
+        std::fs::write(
+            path.join("vm/host-a.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(path.join("host-a.jsonl"),"{\"v\":2,\"host\":\"host-a\",\"plugin\":\"deploy\",\"event\":\"milestone\",\"milestone\":\"confirm\"}\n").unwrap();
+        let mut observed = ObservedRun {
+            info: registry::RunInfo {
+                run_id: "fixture".into(),
+                path: path.clone(),
+                meta: registry::read_meta(&path),
+            },
+            tailer: mandala_core::runner::EventTailer::new(&path),
+        };
+        let snapshot = run_snapshot(&mut observed, SnapshotDetail::Listing);
+        assert_eq!(snapshot["liveness"], "failed");
+        assert_eq!(snapshot["vm"]["summary"]["failed"], 1);
+        assert_eq!(
+            snapshot["vm"]["owners"]["host-a"]["guests"]["guest-a"],
+            "failed"
+        );
+        assert_eq!(snapshot["hosts"].as_object().unwrap().len(), 1);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

@@ -125,19 +125,85 @@ pub fn inspect(store: &Store, id: Option<&str>, offset: usize, limit: usize) -> 
     } else {
         Value::Null
     };
-    Ok(json!({
-        "ok":true,"campaign_id":c.campaign_id,"schema_version":c.schema_version,
-        "created_at":c.created_at,"created_by":c.created_by,"lifecycle":c.lifecycle,
-        "closure":c.closure,"generation":c.generation,"target_digest":c.target_digest,
-        "source":source,"source_state":"unchecked","members":rows,
-        "original_count":members.len(),
-        "eligible_count":c.target.hosts.len()-excluded.keys().filter(|n|c.target.hosts.contains_key(*n)).count(),
-        "excluded_count":excluded.len(),"next_offset":next(offset,rows.len(),members.len()),
-        "attempts":attempts,"attempts_total":c.attempts.len(),
-        "attempts_elided":c.attempts.len().saturating_sub(attempts.len()),
-        "attempts_next_offset":next(offset,attempts.len(),c.attempts.len()),
-        "verification":verification,"verification_total":c.verification.len(),
-    }))
+    with_vm_evidence(
+        json!({
+            "ok":true,"campaign_id":c.campaign_id,"schema_version":c.schema_version,
+            "created_at":c.created_at,"created_by":c.created_by,"lifecycle":c.lifecycle,
+            "closure":c.closure,"generation":c.generation,"target_digest":c.target_digest,
+            "source":source,"source_state":"unchecked","members":rows,
+            "original_count":members.len(),
+            "eligible_count":c.target.hosts.len()-excluded.keys().filter(|n|c.target.hosts.contains_key(*n)).count(),
+            "excluded_count":excluded.len(),"next_offset":next(offset,rows.len(),members.len()),
+            "attempts":attempts,"attempts_total":c.attempts.len(),
+            "attempts_elided":c.attempts.len().saturating_sub(attempts.len()),
+            "attempts_next_offset":next(offset,attempts.len(),c.attempts.len()),
+            "verification":verification,"verification_total":c.verification.len(),
+        }),
+        &c,
+    )
+}
+
+/// Shared, read-only campaign VM qualification. Owner surveys alone are never
+/// evidence of guest readiness or of a completed staged reboot.
+pub fn guest_evidence_matches(c: &Campaign, owner: &str) -> bool {
+    let Some(unit) = c.target.vm_owner_plan.units.get(owner) else {
+        return true;
+    };
+    let Some(evidence) = c.outcomes.get(owner) else {
+        return false;
+    };
+    let Some(obs) = registry::open_run(&evidence.run_id) else {
+        return false;
+    };
+    if obs
+        .info
+        .meta
+        .get("campaign_target_digest")
+        .and_then(Value::as_str)
+        != Some(c.target_digest.as_str())
+    {
+        return false;
+    }
+    let vm = crate::vm::observations::VmRun::read(&obs.info.path);
+    let Some(view) = vm.owners.get(owner) else {
+        return false;
+    };
+    let target = &c.target.hosts[owner];
+    view.verdict == crate::vm::observations::Verdict::Verified
+        && view.journal.as_ref().is_some_and(|j| {
+            j.unit.as_ref() == Some(unit)
+                && j.profile.as_deref() == Some(target.profile.as_str())
+                && j.manifest
+                    .as_ref()
+                    .is_some_and(|m| m.owner_generation == target.system_toplevel)
+        })
+}
+
+pub(super) fn with_vm_evidence(mut value: Value, c: &Campaign) -> io::Result<Value> {
+    if !c.target.vm_owner_plan.is_empty() {
+        value["vm_owner_plan"] =
+            serde_json::to_value(&c.target.vm_owner_plan).map_err(invalid_json)?;
+        value["vm_guest_evidence"] = Value::Object(
+            c.target
+                .vm_owner_plan
+                .units
+                .keys()
+                .map(|owner| {
+                    (
+                        owner.clone(),
+                        Value::from(if c.effective_exclusions().contains_key(owner) {
+                            "excluded owner unit"
+                        } else if guest_evidence_matches(c, owner) {
+                            "confirmed against bound target"
+                        } else {
+                            "guest evidence missing"
+                        }),
+                    )
+                })
+                .collect(),
+        );
+    }
+    Ok(value)
 }
 
 pub fn entries(
@@ -170,6 +236,11 @@ pub fn entries(
                 entry.status = DriftStatus::Drift;
             }
         }
+        if matches!(entry.status, DriftStatus::InSync | DriftStatus::Activated)
+            && !guest_evidence_matches(c, &entry.host)
+        {
+            entry.status = DriftStatus::Incomplete;
+        }
     }
     Ok(entries)
 }
@@ -190,6 +261,7 @@ pub fn complete(c: &Campaign, entries: &[DriftEntry]) -> bool {
             matches!(entry.status, DriftStatus::InSync | DriftStatus::Activated)
                 && entry.booted.as_ref().is_some_and(|path| !path.is_empty())
                 && entry.system_profile == entry.expected
+                && guest_evidence_matches(c, &entry.host)
         })
 }
 
@@ -219,12 +291,15 @@ pub fn dual_drift(
         now,
     );
     let source = latest_source.map(source_summary).transpose()?;
-    Ok(json!({
-        "ok":true,"campaign_id":c.campaign_id,"target_digest":c.target_digest,
-        "campaign":{"basis":"bound-campaign","source":source_summary(&c.target.source)?,"entries":campaign,"summary":summary(&campaign),"total":campaign.len(),"complete":complete(c,&campaign)},
-        "latest_source":{"basis":"latest-evaluated-source","source":source,"expected_source":if latest_source.is_some()&&latest.is_some(){"eval"}else{"none"},"entries":latest_entries,"summary":summary(&latest_entries),"total":latest_entries.len()},
-        "exclusions":c.effective_exclusions(),"original_count":c.target.selection.members.len(),"eligible_count":campaign.len(),
-    }))
+    with_vm_evidence(
+        json!({
+            "ok":true,"campaign_id":c.campaign_id,"target_digest":c.target_digest,
+            "campaign":{"basis":"bound-campaign","source":source_summary(&c.target.source)?,"entries":campaign,"summary":summary(&campaign),"total":campaign.len(),"complete":complete(c,&campaign)},
+            "latest_source":{"basis":"latest-evaluated-source","source":source,"expected_source":if latest_source.is_some()&&latest.is_some(){"eval"}else{"none"},"entries":latest_entries,"summary":summary(&latest_entries),"total":latest_entries.len()},
+            "exclusions":c.effective_exclusions(),"original_count":c.target.selection.members.len(),"eligible_count":campaign.len(),
+        }),
+        c,
+    )
 }
 
 /// Only still-staged members need rebooting. Freshly surveyed, already-running
