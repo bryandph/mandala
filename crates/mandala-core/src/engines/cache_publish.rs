@@ -323,7 +323,6 @@ mod tests {
     use crate::runner::{EventTailer, HostState};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     struct Fixture(RegisteredDeployRun);
     impl Fixture {
@@ -361,8 +360,8 @@ mod tests {
         }
         fn stub(&self, body: &str) -> PathBuf {
             let path = self.0.path.join("nix-stub");
-            fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_program(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))
+                .unwrap();
             path
         }
     }

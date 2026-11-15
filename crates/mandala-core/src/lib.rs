@@ -44,3 +44,11 @@ mod tests {
         assert!(!VERSION.is_empty());
     }
 }
+
+#[cfg(test)]
+mod test_support {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../mandala-core/tests/support/executable.rs"
+    ));
+}

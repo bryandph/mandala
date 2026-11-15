@@ -3,7 +3,13 @@
 use mandala_core::{DeployRun, registry};
 use serde_json::json;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+mod executable {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../mandala-core/tests/support/executable.rs"
+    ));
+}
+use executable::write_program;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -26,22 +32,7 @@ fn until(mut condition: impl FnMut() -> bool) {
 }
 
 fn program(path: &Path, text: &str) {
-    // Close the writer before any parallel test forks an executable fixture.
-    let mut child = Command::new("sh")
-        .args(["-c", "cat > \"$1\"", "sh"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(text.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    write_program(path, text).unwrap();
 }
 
 struct Fixture {

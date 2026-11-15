@@ -1,7 +1,14 @@
 //! Real native engine with shell-only Nix/SSH effects; never a live cache.
+mod executable {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../mandala-core/tests/support/executable.rs"
+    ));
+}
+use executable::write_program;
+
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -51,8 +58,7 @@ esac
     }
     fn program(&self, name: &str, text: &str) {
         let path = self.0.join("bin").join(name);
-        fs::write(&path, text).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_program(&path, text).unwrap();
     }
     fn command(&self) -> Command {
         self.command_mode(true)

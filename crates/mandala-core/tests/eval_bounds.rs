@@ -2,8 +2,15 @@
 //! call within the configured bound and is killed, and a reply that answers a
 //! different request is rejected rather than returned.
 
+mod executable {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../mandala-core/tests/support/executable.rs"
+    ));
+}
+use executable::write_program;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -21,8 +28,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn write_stub(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\n{body}")).expect("write worker stub");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod worker stub");
+    write_program(path, format!("#!/bin/sh\n{body}")).expect("write worker stub");
 }
 
 fn with_worker<T>(stub: &Path, f: impl FnOnce() -> T) -> T {
