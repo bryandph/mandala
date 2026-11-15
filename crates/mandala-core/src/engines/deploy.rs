@@ -2113,40 +2113,12 @@ fn exit_byte(code: Option<i32>) -> u8 {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
-    /// `std::fs::write` for executable fixtures, WITHOUT this process ever
-    /// holding a write fd to the file. Tests run on parallel threads, and every
-    /// fork (each fake `nix`/`ssh` spawn) inherits the whole fd table until its
-    /// exec; exec'ing a file some process still holds open for writing fails
-    /// with ETXTBSY ("Text file busy"), which surfaced as random `Io` build and
-    /// copy failures in the sandboxed nix check phase. A short-lived `sh` child
-    /// does the write, so the fd never enters this process's table at all.
-    fn write_program(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-        use std::io::Write as _;
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", r#"cat > "$1""#, "sh"])
-            .arg(path)
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(contents.as_ref())?;
-        if child.wait()?.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "writing fixture {}",
-                path.display()
-            )))
-        }
-    }
+    use crate::test_support::write_program;
 
     fn tmp_base(label: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2274,9 +2246,6 @@ done
             ),
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
         (script, invocations, args)
     }
 
@@ -2347,11 +2316,6 @@ exit 0
             ),
         )
         .unwrap();
-        for program in [&nix, &ssh] {
-            let mut permissions = std::fs::metadata(program).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(program, permissions).unwrap();
-        }
         (
             DeployPrograms {
                 nix: Some(nix),
@@ -2402,9 +2366,6 @@ exit 99
             ),
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(ssh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(ssh, permissions).unwrap();
         (programs, trace)
     }
 
@@ -2550,11 +2511,6 @@ exit 0
             ),
         )
         .unwrap();
-        for program in [&nix, &ssh] {
-            let mut permissions = std::fs::metadata(program).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(program, permissions).unwrap();
-        }
         (
             DeployPrograms {
                 nix: Some(nix),
@@ -2861,7 +2817,7 @@ exit 0
             "#!/bin/sh\ncase \" $* \" in *' --dry-run '*) exit 99;; esac",
             1,
         );
-        std::fs::write(&stub, script).unwrap();
+        write_program(&stub, script).unwrap();
         let resolved = vec![(
             "/nix/store/00000000000000000000000000000000-cache-profile.drv^out".into(),
             "/nix/store/00000000000000000000000000000000-cache-profile".into(),
@@ -2903,7 +2859,7 @@ exit 0 ;; esac"#;
         let script = std::fs::read_to_string(&stub)
             .unwrap()
             .replacen("#!/bin/sh", prefix, 1);
-        std::fs::write(&stub, script).unwrap();
+        write_program(&stub, script).unwrap();
         let built = build_profiles_with(&run, "/legacy", stub.as_os_str()).unwrap();
         assert_eq!(
             built.paths["cache"],
@@ -3366,7 +3322,7 @@ exit 0 ;; esac"#;
                 }
             }
             script.push_str(&format!("exit {rc}\n"));
-            std::fs::write(nix, script).unwrap();
+            write_program(nix, script).unwrap();
             let result = deploy_host_with(&run, &built_cache_profile(), "cache", &programs).await;
             assert_eq!(result.state == HostState::Failed, rc != 0, "{case}");
             let events = jsonl(&run.path.join("cache.jsonl"));

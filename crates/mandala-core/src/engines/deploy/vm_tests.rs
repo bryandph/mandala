@@ -1,7 +1,6 @@
 use super::*;
 use crate::vm::owner::{GuestOutcome, Reply};
 use crate::vm::tests::manifest;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -121,16 +120,17 @@ async fn native_case(inhibited: bool, dry: bool) {
         ));
     }
     let ssh = directory.join("ssh");
-    std::fs::write(&ssh, format!("#!/bin/sh\nprintf 'ssh %s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *mandala-vm-owner*)\n{session}exit 0;;\n  *switch-inhibitors*) exit 1;;\n  *) exit 0;;\nesac\n",trace.display())).unwrap();
+    let mut script = format!(
+        "#!/bin/sh\nprintf 'ssh %s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *mandala-vm-owner*)\n{session}exit 0;;\n  *switch-inhibitors*) exit 1;;\n  *) exit 0;;\nesac\n",
+        trace.display()
+    );
     if inhibited {
-        let script = std::fs::read_to_string(&ssh).unwrap().replace("*switch-inhibitors*) exit 1;;", "*switch-inhibitors*) exit 0;;\n *'switch-to-configuration check'*) exit 1;;\n *readlink*) printf '%s\\n' '/nix/store/00000000000000000000000000000000-old-owner'; exit 0;;");
-        std::fs::write(&ssh, script).unwrap();
+        script = script.replace("*switch-inhibitors*) exit 1;;", "*switch-inhibitors*) exit 0;;\n *'switch-to-configuration check'*) exit 1;;\n *readlink*) printf '%s\\n' '/nix/store/00000000000000000000000000000000-old-owner'; exit 0;;");
     }
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_program(&ssh, script).unwrap();
     let nix = directory.join("nix");
     let paths: BTreeMap<_, _> = closure.into_iter().map(|p| (p, Value::Null)).collect();
-    std::fs::write(&nix,format!("#!/bin/sh\nprintf 'nix %s\\n' \"$*\" >> '{}'\ncase \"$1\" in path-info) printf '%s\\n' '{}' ;; copy) exit 0;; *) exit 1;; esac\n",trace.display(),serde_json::to_string(&paths).unwrap())).unwrap();
-    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_program(&nix,format!("#!/bin/sh\nprintf 'nix %s\\n' \"$*\" >> '{}'\ncase \"$1\" in path-info) printf '%s\\n' '{}' ;; copy) exit 0;; *) exit 1;; esac\n",trace.display(),serde_json::to_string(&paths).unwrap())).unwrap();
     let run_path = directory.join("run");
     std::fs::create_dir_all(&run_path).unwrap();
     let run = RegisteredDeployRun {

@@ -696,7 +696,6 @@ mod tests {
     /// stay the only test in this binary that spawns a real worker.
     #[test]
     fn shutdown_workers_unblocks_a_stuck_roundtrip() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
         let _env = ENV_LOCK.lock().expect("env lock poisoned");
@@ -705,8 +704,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let script = dir.join("stuck-worker.sh");
         // A worker that never answers: the roundtrip blocks in read_line.
-        std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").expect("write stub");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_program(&script, "#!/bin/sh\nexec sleep 600\n")
+            .expect("write stub");
         unsafe { std::env::set_var("MANDALA_EVAL_WORKER", &script) };
 
         let (tx, rx) = std::sync::mpsc::channel();

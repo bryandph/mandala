@@ -742,7 +742,6 @@ pub async fn deploy_profile(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -825,7 +824,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let trace = base.join("trace");
         let program = base.join("ssh");
-        std::fs::write(
+        crate::test_support::write_program(
             &program,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}\n",
@@ -834,9 +833,6 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&program, permissions).unwrap();
         (program, trace)
     }
 

@@ -2,14 +2,21 @@
 //! process (and therefore the Nix EvalState), not ask a warm worker to clear a
 //! shallower cache.
 
+mod executable {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../mandala-core/tests/support/executable.rs"
+    ));
+}
+use executable::write_program;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use mandala_core::eval::{Backend, Evaluator};
 
 fn write_worker(path: &Path) {
-    fs::write(
+    write_program(
         path,
         r#"#!/bin/sh
 counter=${MANDALA_RELOAD_TEST_COUNTER:?}
@@ -26,7 +33,6 @@ done
 "#,
     )
     .expect("write worker stub");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod worker stub");
 }
 
 #[test]

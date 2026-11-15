@@ -42,33 +42,15 @@ fn read_response(reader: &mut impl BufRead, id: i64) -> serde_json::Value {
     }
 }
 
-/// A per-test scratch tree: a `flake/` working directory (the context scope),
-/// a `state/` dir, and the injected aggregate. Unique per test AND per run.
-/// Write an executable fixture through a child process so this test binary
-/// never holds a write fd to it (a sibling test's fork would inherit that fd
-/// until exec, and the exec would fail with ETXTBSY). Twin of the helper in
-/// mandala-core's deploy engine tests.
-fn write_program(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let mut child = Command::new("sh")
-        .args(["-c", r#"cat > "$1""#, "sh"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(contents.as_ref())?;
-    if child.wait()?.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "writing fixture {}",
-            path.display()
-        )))
-    }
+mod executable {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../mandala-core/tests/support/executable.rs"
+    ));
 }
+use executable::write_program;
 
+/// A per-test scratch tree: a flake directory, state, and injected aggregate.
 fn scratch_tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let scratch = std::env::temp_dir().join(format!(
         "mandala-mcp-stdio-{tag}-{}-{}",
@@ -366,8 +348,6 @@ fn second_instance_proxies_and_promotes_when_the_leader_exits() {
 /// follower promotes + attaches the exact live run after the leader is killed.
 #[test]
 fn native_deploy_survives_leader_death_and_attaches_after_promotion() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (flake, state, aggregate) = scratch_tree("deploy-orphan");
     let setting = serde_json::json!({
         "activation": "switch",
@@ -459,10 +439,6 @@ sleep 1
 "#,
     )
     .unwrap();
-    let mut permissions = std::fs::metadata(&nix).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&nix, permissions.clone()).unwrap();
-    std::fs::set_permissions(&ssh, permissions).unwrap();
     let path = std::env::join_paths(
         std::iter::once(fake_bin.clone())
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -812,7 +788,6 @@ fn wait_with_timeout(
 /// flake inventory, not either process's cwd.
 #[test]
 fn follower_ping_uses_canonical_flake_inventory() {
-    use std::os::unix::fs::PermissionsExt;
     let (flake, state, aggregate) = scratch_tree("flake-ping");
     let root = flake.parent().unwrap();
     let elsewhere = root.join("elsewhere");
@@ -833,7 +808,6 @@ fn follower_ping_uses_canonical_flake_inventory() {
         "#!/bin/sh\npwd > '{}'\ncat inventory >> '{}'\nprintf 'web | SUCCESS => {{\"ping\": \"pong\"}}\\n'\n",
         observed.display(), observed.display()
     )).unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let spawn = || {
         Command::new(env!("CARGO_BIN_EXE_mandala"))
             .args(["--flake", flake.to_str().unwrap(), "mcp"])
