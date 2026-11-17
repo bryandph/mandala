@@ -2201,8 +2201,10 @@ mod write_tests {
         std::fs::create_dir(&old).unwrap();
         prune_deploy_launches(&base, 20, 0, now);
         assert!(old.exists(), "age 0 disables age pruning");
-        prune_deploy_launches(&base, 20, 30, now);
-        assert!(!old.exists());
+        // Keep an age-disabled fixture through the polling phase as well.
+        let disabled_base = root.join("age-disabled-launches");
+        let disabled = disabled_base.join("1000000000-999999-0");
+        std::fs::create_dir_all(&disabled).unwrap();
 
         let run_id = "20261031T120000_000001-999999";
         let run = root.join("runs").join(run_id);
@@ -2213,11 +2215,31 @@ mod write_tests {
         std::fs::write(launch.join(COMMAND_LOG), format!("$ deploy\n{run_id}\n")).unwrap();
         // Even if its supervisor died, the engine can still be running.
         std::fs::write(launch.join("active.json"), r#"{"pid":999999}"#).unwrap();
+        // An unrelated concurrent fork can inherit the scan's flock until
+        // exec closes its CLOEXEC fd. The removal recheck then conservatively
+        // skips that launch. Poll pruning, not the test, until that transient
+        // lock is released; timestamps and PID liveness stay fixed throughout.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            prune_deploy_launches(&base, 20, 30, now);
+            prune_deploy_launches(&disabled_base, 20, 0, now);
+            if !old.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expired launch was not pruned before deadline: {}",
+                old.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!old.exists());
         prune_deploy_launches(&base, 0, 1, now);
         assert!(
             launch.exists(),
             "live registered engine must survive pruning"
         );
+        assert!(disabled.exists(), "age 0 disables age pruning");
         std::fs::remove_dir_all(root).unwrap();
     }
 

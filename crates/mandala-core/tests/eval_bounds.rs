@@ -47,7 +47,9 @@ fn a_silent_worker_times_out_is_killed_and_replaced() {
     let stub = dir.join("worker.sh");
     let counter = dir.join("counter");
     let pidfile = dir.join("pid");
-    // First spawn wedges (never answers); later spawns echo each request id.
+    // First spawn acknowledges readiness, then wedges on its next request;
+    // later spawns echo each request id. Startup is outside the measured
+    // roundtrip so the timeout cannot kill the shell before it records its PID.
     write_stub(
         &stub,
         &format!(
@@ -57,11 +59,17 @@ n=$((n + 1))
 echo "$n" > '{counter}'
 if [ "$n" = 1 ]; then
   echo $$ > '{pidfile}'
-  exec sleep 600
 fi
+requests=0
 while IFS= read -r line; do
+  requests=$((requests + 1))
+  if [ "$n" = 1 ] && [ "$requests" = 2 ]; then
+    exec sleep 600
+  fi
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  printf '{{"id":%s,"ok":true,"value":"fresh"}}\n' "$id"
+  value=fresh
+  test "$n" = 1 && value=ready
+  printf '{{"id":%s,"ok":true,"value":"%s"}}\n' "$id" "$value"
 done
 "#,
             counter = counter.display(),
@@ -72,8 +80,16 @@ done
     with_worker(&stub, || {
         let mut evaluator = Evaluator::new(Backend::Worker)
             .quiet()
-            .timeout(Some(Duration::from_millis(300)));
-
+            .timeout(Some(Duration::from_secs(10)));
+        assert_eq!(evaluator.aggregate(".").expect("worker ready"), "ready");
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .expect("ready worker recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        // Only the deliberately silent request gets the short timeout. The
+        // readiness reply proves startup and PID publication already finished.
+        evaluator = evaluator.timeout(Some(Duration::from_millis(300)));
         let started = Instant::now();
         let err = evaluator
             .aggregate(".")
@@ -86,11 +102,6 @@ done
         );
 
         // The wedged worker was killed and reaped, not left running.
-        let pid: i32 = fs::read_to_string(&pidfile)
-            .expect("stub recorded its pid")
-            .trim()
-            .parse()
-            .expect("pid");
         assert!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
             "timed-out worker {pid} is gone"
@@ -99,8 +110,11 @@ done
         // No retry after a timeout: exactly one worker was spawned so far.
         assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1");
 
-        // The next call starts a fresh worker.
+        // The next call starts a fresh worker. As with the readiness call,
+        // do not charge process startup against the silent-roundtrip deadline.
+        evaluator = evaluator.timeout(Some(Duration::from_secs(10)));
         assert_eq!(evaluator.aggregate(".").expect("fresh worker"), "fresh");
+        assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
     });
     fs::remove_dir_all(&dir).expect("remove temp dir");
 }
