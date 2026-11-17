@@ -104,11 +104,10 @@ printf '%s\n' "$rid"
 export MANDALA_NATIVE_TEST_EVENTS="$events"
 {body}"#
     );
-    ExplorerConfig {
-        survey_argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
-        deploy_program: Some(vec!["sh".into(), "-c".into(), native]),
-        ..ExplorerConfig::default()
-    }
+    let mut cfg = ExplorerConfig::default();
+    cfg.survey_argv = vec!["sh".into(), "-c".into(), "sleep 5".into()];
+    cfg.deploy_program = Some(vec!["sh".into(), "-c".into(), native]);
+    cfg
 }
 
 fn key(code: KeyCode) -> io::Result<Event> {

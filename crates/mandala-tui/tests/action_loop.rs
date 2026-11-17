@@ -63,10 +63,9 @@ fn filled_state() -> AppState {
 /// A config whose every launch line is a stub — the survey sleeps so a
 /// fired after-mutation refresh stays observable at loop exit.
 fn stub_cfg() -> ExplorerConfig {
-    ExplorerConfig {
-        survey_argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
-        ..ExplorerConfig::default()
-    }
+    let mut cfg = ExplorerConfig::default();
+    cfg.survey_argv = vec!["sh".into(), "-c".into(), "sleep 5".into()];
+    cfg
 }
 
 fn key(code: KeyCode) -> io::Result<Event> {
@@ -131,10 +130,9 @@ fn stub_ping_ok(_target: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn ping_streams_lines_and_exit_through_the_real_loop() {
-    let cfg = ExplorerConfig {
-        ping_argv: stub_ping_ok,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.ping_argv = stub_ping_ok;
+
     // p pushes the task screen; the stream stays open while the subprocess
     // runs so its lines and settle flow through the loop; then it closes
     // with the screen still up for inspection.
@@ -161,10 +159,9 @@ async fn ping_targets_the_selection_comma_joined() {
     state.members_table.toggle(); // cache
     state.members_table.skip(2); // cursor to web
     state.members_table.toggle(); // + web
-    let cfg = ExplorerConfig {
-        ping_argv: stub_ping_ok,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.ping_argv = stub_ping_ok;
+
     let app = run_keys(state, cfg, vec![key(KeyCode::Char('p'))]).await;
     let Some(ScreenState::Task(task)) = &app.state.screen else {
         panic!("task screen not up");
@@ -178,10 +175,9 @@ fn stub_launch_failure(_target: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn task_launch_failure_is_surfaced_in_pane() {
-    let cfg = ExplorerConfig {
-        ping_argv: stub_launch_failure,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.ping_argv = stub_launch_failure;
+
     let app = run_keys(filled_state(), cfg, vec![key(KeyCode::Char('p'))]).await;
     let Some(ScreenState::Task(task)) = &app.state.screen else {
         panic!("task screen not up");
@@ -199,10 +195,9 @@ fn stub_sleep(_target: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn esc_on_a_running_task_dismisses_with_rc_none() {
-    let cfg = ExplorerConfig {
-        ping_argv: stub_sleep,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.ping_argv = stub_sleep;
+
     // p → running stub; esc terminates-then-dismisses; rc is still None
     // (the subprocess hasn't been reaped) → operator cancel, no refresh.
     let app = run_scripted(
@@ -230,10 +225,9 @@ fn reboot_unavailable(
 
 #[tokio::test]
 async fn reboot_pre_check_surfaces_the_unavailable_message() {
-    let cfg = ExplorerConfig {
-        reboot_argv: reboot_unavailable,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.reboot_argv = reboot_unavailable;
+
     let app = run_keys(filled_state(), cfg, vec![key(KeyCode::Char('R'))]).await;
     assert!(app.state.screen.is_none(), "no modal without the wrapper");
     assert_eq!(
@@ -264,10 +258,9 @@ fn reboot_capture(
 #[tokio::test]
 async fn reboot_modal_options_ride_into_the_shared_argv() {
     REBOOT_CALLS.with(|calls| calls.borrow_mut().clear());
-    let cfg = ExplorerConfig {
-        reboot_argv: reboot_capture,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.reboot_argv = reboot_capture;
+
     // R → modal (pre-check probes with serial=1, drain=true), 3 → all-at-
     // once, d → skip drain, y → the chosen options reach reboot_argv.
     let app = run_keys(
@@ -300,10 +293,9 @@ async fn reboot_modal_options_ride_into_the_shared_argv() {
 #[tokio::test]
 async fn reboot_modal_esc_cancels_without_running() {
     REBOOT_CALLS.with(|calls| calls.borrow_mut().clear());
-    let cfg = ExplorerConfig {
-        reboot_argv: reboot_capture,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.reboot_argv = reboot_capture;
+
     let app = run_keys(
         filled_state(),
         cfg,
@@ -322,10 +314,9 @@ fn reboot_quick(_flake: &std::path::Path, _t: &str, _s: &str, _d: bool) -> Optio
 
 #[tokio::test]
 async fn completed_reboot_dismissal_fires_the_drift_refresh() {
-    let cfg = ExplorerConfig {
-        reboot_argv: reboot_quick,
-        ..stub_cfg()
-    };
+    let mut cfg = stub_cfg();
+    cfg.reboot_argv = reboot_quick;
+
     // R → y (defaults) → the stub exits 0 → esc dismisses with rc Some(0)
     // → the after-mutation rule fires the concurrent eval+survey refresh
     // (the survey stub sleeps, so the flag is still up at loop exit).

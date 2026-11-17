@@ -110,10 +110,9 @@ fn filled_state() -> AppState {
 }
 
 fn stub_cfg() -> ExplorerConfig {
-    ExplorerConfig {
-        survey_argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
-        ..ExplorerConfig::default()
-    }
+    let mut cfg = ExplorerConfig::default();
+    cfg.survey_argv = vec!["sh".into(), "-c".into(), "sleep 5".into()];
+    cfg
 }
 
 // ---- loop driving -----------------------------------------------------------

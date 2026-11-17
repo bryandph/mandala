@@ -81,17 +81,52 @@ type McpLauncher = Box<dyn Fn(&str) -> ExitCode>;
 /// A parsed `mandala tui …` invocation, handed to the [`Cli::tui_launcher`]
 /// closure together with the resolved `--flake` value. The flag plumbing is
 /// asserted at this seam ([`tui_request`] is pure); the launch itself lives
-/// only in the binary — a real TUI needs a real terminal.
+/// in `mandala-tui` — a real TUI needs a real terminal. Downstream binaries
+/// should pass this to `mandala_tui::launch_blocking` instead of copying fields.
+/// Construct requests with [`Self::explorer`], [`Self::deploy`], or [`Self::attach`].
+/// Custom launchers must allow both new fields (`..`) and new modes (`_`).
+///
+/// ```compile_fail
+/// // A new field must never make downstream request construction fail.
+/// let _ = mandala_core::TuiRequest::Explorer { debug_mcp: false };
+/// ```
+/// ```compile_fail
+/// let _ = mandala_core::TuiRequest::Deploy {
+///     limit: "web".into(), dry_activate: false, boot: false,
+///     halt_on_build_failure: false, cache_push: None, throttle: 4,
+/// };
+/// ```
+/// ```compile_fail
+/// let _ = mandala_core::TuiRequest::Attach { run_id: "run".into() };
+/// ```
+/// ```compile_fail
+/// let request = mandala_core::TuiRequest::explorer(false);
+/// match request {
+///     mandala_core::TuiRequest::Explorer { .. } => {},
+///     mandala_core::TuiRequest::Deploy { .. } => {},
+///     mandala_core::TuiRequest::Attach { .. } => {},
+/// }
+/// ```
+/// ```compile_fail
+/// // Even with an enum catch-all, struct-like variants need `..`.
+/// match mandala_core::TuiRequest::explorer(false) {
+///     mandala_core::TuiRequest::Explorer { debug_mcp } => {},
+///     _ => {},
+/// }
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiRequest {
     /// `mandala tui` — the fleet explorer. `debug_mcp` opts into the
     /// context call-monitoring surface (`--debug-mcp`).
+    #[non_exhaustive]
     Explorer {
         /// The `--debug-mcp` flag.
         debug_mcp: bool,
     },
     /// `mandala tui deploy` — the standalone deploy runner. The launcher's
     /// exit code is the run's rc (0 on operator cancel).
+    #[non_exhaustive]
     Deploy {
         /// The required `-l/--limit` selector (resolved through
         /// `Inventory::to_limit` inside the runner, before the terminal
@@ -111,11 +146,42 @@ pub enum TuiRequest {
     /// `mandala tui attach <RUN_ID>` — open an observer screen on a registry
     /// run (live or settled, launched by any frontend). Exit code = the
     /// run's effective rc when observed to settlement, 0 on live detach.
+    #[non_exhaustive]
     Attach {
         /// The Mandala-generated run id (validated against the registry
         /// before any terminal setup).
         run_id: String,
     },
+}
+
+impl TuiRequest {
+    /// An explorer request with the selected call-monitoring setting.
+    #[must_use]
+    pub fn explorer(debug_mcp: bool) -> Self {
+        Self::Explorer { debug_mcp }
+    }
+
+    /// A deploy request with the CLI defaults. Optional settings remain
+    /// publicly mutable through a `Deploy { field, .. }` pattern.
+    #[must_use]
+    pub fn deploy(limit: impl Into<String>) -> Self {
+        Self::Deploy {
+            limit: limit.into(),
+            dry_activate: false,
+            boot: false,
+            halt_on_build_failure: false,
+            cache_push: None,
+            throttle: 4,
+        }
+    }
+
+    /// An observer request for a registry run.
+    #[must_use]
+    pub fn attach(run_id: impl Into<String>) -> Self {
+        Self::Attach {
+            run_id: run_id.into(),
+        }
+    }
 }
 
 /// The native-TUI launcher closure: the resolved `--flake` value plus the
