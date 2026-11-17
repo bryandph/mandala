@@ -386,15 +386,36 @@ async fn dropping_frontend_leaves_supervised_native_child_alive() {
             .unwrap()
             .as_nanos()
     ));
-    let body = format!("sleep 0.4; printf survived > '{}'", marker.display());
+    let ready = marker.with_extension("ready");
+    let release = marker.with_extension("release");
+    // The engine cannot complete before the frontend is dropped. A handshake,
+    // rather than a startup + sleep budget, also tolerates a delayed supervisor.
+    let body = format!(
+        "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; printf survived > '{}'",
+        ready.display(),
+        release.display(),
+        marker.display()
+    );
     let cfg = stub_cfg(&["sh", "-c", &body]);
     let mut run = DeployRun::new("web");
     run.program = cfg.deploy_program;
     let mut app = App::new(AppState::new(), ExplorerConfig::default());
     assert!(app.start_deploy(run, false, false, false, (100, 20)).await);
     drop(app);
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    for path in [&ready, &marker] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.is_file() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Always release the stub, including on timeout, so a failing test
+        // does not leave a supervised shell waiting for its frontend forever.
+        std::fs::write(&release, "continue").unwrap();
+        assert!(path.is_file(), "supervised engine died with its frontend");
+    }
     assert!(marker.is_file(), "supervised engine died with its frontend");
+    for path in [&ready, &release, &marker] {
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[tokio::test]
