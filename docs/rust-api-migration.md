@@ -107,8 +107,8 @@ Audited and left alone:
 - `Cli`, `Engine`, `Inventory`, and `Evaluator` already hide construction fields
   behind constructors/loaders. An engine handler accepts a borrowed `Inventory`;
   downstream registration does not construct its representation.
-- The supervisor capture guard is opaque; MCP's `serve_stdio_blocking` takes a
-  flake string, not a public config. `MandalaHandler` and `ContextHandler` have
+- Supervisor `capture_at_entry` takes no config; MCP's `serve_stdio_blocking`
+  takes a flake string, not a public config. `MandalaHandler` and `ContextHandler` have
   private state and constructors, not all-public launcher configs.
 - `HostConfig` (already has `new`), `ContextIdentity`, discovery/protocol types,
   and MCP effects/tool DTOs belong to the context/server/protocol APIs, not the
