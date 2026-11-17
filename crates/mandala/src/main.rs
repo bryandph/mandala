@@ -13,10 +13,8 @@
 
 use std::process::ExitCode;
 
+use mandala_core::Cli;
 use mandala_core::engines::{ansible, deploy};
-use mandala_core::{Cli, TuiRequest};
-use mandala_tui::deploy::{DeployConfig, run_attach_blocking, run_deploy_blocking};
-use mandala_tui::explorer::{ExplorerConfig, run_explorer_blocking};
 
 fn main() -> ExitCode {
     // SAFETY: first operation at executable entry, before any threads or other
@@ -30,58 +28,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         })
-        .tui_launcher(|flake, request| match request {
-            TuiRequest::Explorer { debug_mcp } => {
-                let mut cfg = ExplorerConfig::for_flake(flake);
-                cfg.debug_mcp = debug_mcp;
-                match run_explorer_blocking(cfg) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(err) => {
-                        eprintln!("mandala tui: {err}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
-            TuiRequest::Deploy {
-                limit,
-                dry_activate,
-                boot,
-                halt_on_build_failure,
-                cache_push,
-                throttle,
-            } => {
-                let cfg = DeployConfig {
-                    flake: flake.to_string(),
-                    limit,
-                    dry_activate,
-                    boot,
-                    halt_on_build_failure,
-                    cache_push,
-                    throttle,
-                    program: None,
-                };
-                match run_deploy_blocking(cfg) {
-                    // The process exit code IS the run's rc (0 on operator
-                    // detach); an out-of-range rc collapses to 1.
-                    Ok(rc) => ExitCode::from(u8::try_from(rc).unwrap_or(1)),
-                    Err(err) => {
-                        eprintln!("mandala tui deploy: {err}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
-            TuiRequest::Attach { run_id } => {
-                match run_attach_blocking(flake.to_string(), run_id) {
-                    // Exit code = the run's effective rc once settled, 0 on
-                    // live detach.
-                    Ok(rc) => ExitCode::from(u8::try_from(rc).unwrap_or(1)),
-                    Err(err) => {
-                        eprintln!("mandala tui attach: {err}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
-        })
+        .tui_launcher(mandala_tui::launch_blocking)
         .register(deploy::engine())
         .register(ansible::engine())
         .run()

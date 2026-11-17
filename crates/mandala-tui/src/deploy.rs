@@ -134,6 +134,13 @@ impl DeployJob {
 }
 
 /// What `mandala tui deploy -l <sel> [--dry-activate] [--boot] [--throttle N]` needs.
+/// Construct with [`Self::new`], then override the public optional settings.
+///
+/// ```compile_fail
+/// use mandala_tui::deploy::DeployConfig;
+/// let _ = DeployConfig { throttle: 8, ..DeployConfig::new(".", "web") };
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeployConfig {
     /// The fleet flake reference (selector resolution).
@@ -149,6 +156,23 @@ pub struct DeployConfig {
     /// Test seam: override the launched argv verbatim (`DeployRun::program`)
     /// — never a real native deploy in tests.
     pub program: Option<Vec<String>>,
+}
+
+impl DeployConfig {
+    /// Config for a flake and required selector, with the CLI defaults.
+    #[must_use]
+    pub fn new(flake: impl Into<String>, limit: impl Into<String>) -> Self {
+        Self {
+            flake: flake.into(),
+            limit: limit.into(),
+            dry_activate: false,
+            boot: false,
+            halt_on_build_failure: false,
+            cache_push: None,
+            throttle: 4,
+            program: None,
+        }
+    }
 }
 
 /// Run the standalone deploy screen on the real terminal. Returns the

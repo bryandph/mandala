@@ -18,16 +18,7 @@ use mandala_tui::deploy::{DeployConfig, run_deploy};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut cfg = DeployConfig {
-        flake: ".".to_string(),
-        limit: String::new(),
-        dry_activate: false,
-        boot: false,
-        halt_on_build_failure: false,
-        cache_push: None,
-        throttle: 4,
-        program: None,
-    };
+    let mut cfg = DeployConfig::new(".", "");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {

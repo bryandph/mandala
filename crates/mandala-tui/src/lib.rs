@@ -46,6 +46,7 @@ pub mod event;
 pub mod explorer;
 pub mod hit;
 pub mod keymap;
+mod launcher;
 pub mod nom_pane;
 pub mod render;
 pub mod screen;
@@ -54,3 +55,5 @@ pub mod select;
 pub mod state;
 pub mod term;
 pub mod theme;
+
+pub use launcher::launch_blocking;

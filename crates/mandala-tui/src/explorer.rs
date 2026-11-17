@@ -36,7 +36,14 @@ use crate::term::{TerminalGuard, install_panic_hook};
 
 /// What the runtime needs beyond state: the contract to read and the
 /// action-tier launch lines. Tests override the argv seams with `sh -c`
-/// stubs — never a live fleet, never real ansible/nix.
+/// stubs — never a live fleet, never real ansible/nix. Construct with
+/// [`Self::for_flake`] or [`Self::default`], then override public settings.
+///
+/// ```compile_fail
+/// use mandala_tui::explorer::ExplorerConfig;
+/// let _ = ExplorerConfig { debug_mcp: true, ..ExplorerConfig::default() };
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ExplorerConfig {
     /// The fleet flake reference (`--flake`).
