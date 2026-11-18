@@ -1,0 +1,48 @@
+## Planning and scope gate
+
+- [ ] Review the LAB-218 spec-first artifacts; completeness is not implementation or rollout approval. Keep this branch docs-only and defer canonical-spec synchronization until archive.
+- [ ] Confirm the implementation review covers acquire, host ownership, local dispatch, lock helper/root resolution and frontend option plumbing; no CI/flake, deployment, secrets or unrelated repository changes.
+
+## 1. First implementation task: lifecycle decision
+
+- [ ] 1.1 Investigate LAB-219 before other implementation: trace every `RunningHost` owner/drop path, demotion, shutdown, in-process restart, frontend teardown and local dispatch snapshot. Record whether a host can be dropped while its process continues. If yes, require a JoinSet or abort handles and equivalent local-call ownership to abort dispatched calls on Drop and stop them before releasing the lock; test actual termination ordering. If no, document the evidence and that diagnostic Drop models connection loss only, and use process-kill tests for process-death claims. Escalate any broader cancellation redesign; do not cancel independent detached supervisors.
+
+## 2. Preserve pre-fix evidence and isolate the harness
+
+- [ ] 2.1 Commit the supplied `lab218_diagnostic.patch` on the implementation branch only as pre-fix evidence (sha256 `25881535aa1ade310c45968e2250c4a0e2cccbc1ca2458f011da1b786d46ffea`); do not apply it to this docs branch. Preserve controlled and abrupt two-authenticated-endpoint observations, including the 32-contender stress failure after 697 successful trials, without treating stochastic success as disproof.
+- [ ] 2.2 Implement the LAB-206 test-only loopback-refusal preflight: bounded connects to unused `127.0.0.1` test ports must return connection-refused, not timeout; report a clear environment failure with private-netns guidance. Keep production busy-leader classification unchanged.
+- [ ] 2.3 Document WSL test execution with `unshare --user --map-root-user --net`, `ip link set lo up`, prebuilt immutable test binaries and isolated scratch roots. Add explicit coordination-root injection to all test acquire/reacquire seams; never touch a live user's coordination files. Preflight macOS native loopback too.
+
+## 3. Add the lease before switching consumers
+
+- [ ] 3.1 Add stable account-home coordination-root resolution independent of state/runtime overrides, explicit test injection and documented secure root provisioning. Missing/unwritable root fails closed. Document secure out-of-acquisition provisioning of the 0700 directory; acquisition validates that directory and securely creates/validates 0600 regular files. Reject symlinks, foreign ownership, invalid permissions and replacement races. Retain existing identity-key derivation and never unlink/replace lock inodes.
+- [ ] 3.2 Add a dedicated descriptor-owning whole-file `fcntl(F_SETLK)` process lock with atomic CLOEXEC and a process-wide keyed async-mutex registry. Exclude OFD/flock semantics; prevent duplicate mutex entries and same-process opens/closes of an owned inode. Surface unsupported locking explicitly; document host-local filesystem support rather than claiming network-home qualification.
+- [ ] 3.3 Add targeted lock-helper tests before routing production acquisition through the helper: distinct processes, independent same-process sessions, independent flakes, persistent inode identity and safe error classification. Review helper ownership and fork semantics on Linux and macOS.
+- [ ] 3.4 Switch acquire/promotion to bounded join-or-lock, re-read discovery/token state and rescan under both guards, then bind/factory/start/publish. Propagate the root through frontend and reacquisition options. Ensure factory, config publication, local dispatch and wire serving never escape the guard; preserve port walk, token mint/reuse/rotation and actual-bound-port discovery.
+- [ ] 3.5 Return dedicated structured coordination busy/unavailable outcomes for contention exhaustion and explicit errors for missing/unwritable/unsafe root or unsupported locking. Keep TCP EOF/call/subscription failure detection, not lock polling. Bound total lock/probe/token waits within client initialization; no unlocked leader, unguarded factory, second endpoint or runtime/tmp fallback.
+- [ ] 3.6 Make one lease close its listener before releasing either guard on graceful shutdown, Drop, cancellation and every error/unwind path. Implement the conditional dispatch teardown selected in 1.1. Preserve bounded drain, guarded discovery cleanup, stale-token reuse and detached-run recovery. Prove actual closure/termination, not just abort notification.
+
+## 4. Regression scenarios and failure matrix
+
+- [ ] 4.1 Rework the deterministic disappearing-occupant witness for serialization: slow owns the guard while gated; an explicit hook proves fast attempted acquisition and stays a candidate, then release the gate. Assert exactly one authenticated wire-serving endpoint and common dispatch results for all successful participants. An unchanged test timing out/deadlocking is not proof of the fix.
+- [ ] 4.2 Test distinct-process mutual exclusion, independent same-process sessions and canonical-path aliases; verify different canonical flakes remain independent. Count authenticated endpoint calls and dispatch labels as well as Role flags; assert losers never invoke factories or publish discovery.
+- [ ] 4.3 Test actual leader SIGKILL and simultaneous promotion with in-flight reads/mutations: one new serving endpoint, bounded failover, at most one read retry and no automatic mutation replay. Test stale discovery, changing collision owners, busy leader, first token mint/reuse and rotation convergence without weakening the busy-leader rule.
+- [ ] 4.4 Test graceful drain, abrupt Drop according to 1.1, cancelled acquisition, bind failure/exhaustion, factory failure/panic, host-start failure and discovery-publication failure. Instrument teardown to prove listener closure before unlock and no local/wire config invocation outside the lease. Assert inode retention through shutdown, recovery and rotation.
+- [ ] 4.5 Fork a child and deliberately block it before exec; kill the leader parent and prove another process can claim while the child remains alive. Cover failed exec and unrelated concurrent forks, plus exclusion while the parent is alive (LAB-210 regression boundary). Never accept CLOEXEC-only or prompt-exec evidence.
+- [ ] 4.6 Test the same flake and injected coordination root with differing `MANDALA_FLEET_STATE`, `XDG_STATE_HOME` and `XDG_RUNTIME_DIR`; test missing `XDG_RUNTIME_DIR`. Require one leader even when differing discovery roots prevent joining; the loser returns safe bounded unavailability.
+- [ ] 4.7 Test missing and unwritable coordination roots, unsupported locking, symlinks in the coordination path, nonregular files, invalid modes, foreign ownership and validation/open races. Use isolated/injected foreign-owner fixtures with explicit native coverage limitations; never modify live user files. Verify no fallback root, unlocked execution or unlink/recreate of a held inode.
+- [ ] 4.8 Pin coordination layout/security/inode judgments and run existing discovery golden-byte tests; assert no discovery JSON or event/run metadata migration and no new lock-file metadata authority.
+
+## 5. Verification and qualification
+
+- [ ] 5.1 Run `openspec validate context-election-lock --strict` and `openspec validate --strict` when available; otherwise manually check delta headings, exact modified requirement names, preserved unaffected behavior and WHEN/THEN scenarios. Review public neutrality and scope-only file list.
+- [ ] 5.2 On the implementation branch run `nix fmt -- --check .`, `cargo fmt --all -- --check` and `nix develop --command cargo test -p mandala-context -- --test-threads=32` against isolated roots, plus targeted lock/fork and frontend acquisition tests. Run existing applicable Nix checks via `nix flake check`; this plan adds no check names or CI/flake edits.
+- [ ] 5.3 On Linux, repeatedly run the original context/failover suites and revised deterministic/stress witnesses at `--test-threads=32` under controlled CPU contention in a private loopback netns, with refusal preflight and owned-load cleanup. Record trial counts, load/environment and authenticated endpoint assertions, not only absence of a failure.
+- [ ] 5.4 Obtain native Linux AND macOS results for lock exclusion, same-process sessions, fork-before-exec/failed exec, lifecycle, root-security and context/failover suites. Linux namespace results do not replace macOS qualification; document any unavailable gate rather than claiming support from one platform.
+- [ ] 5.5 Run sandboxed `nix build .#mandala-rs` on Linux and macOS with the implementation's isolated test-root provisioning, and record sandbox evidence separately from private-netns runs. No live rollout follows from a successful build.
+
+## 6. Compatibility and operator handoff
+
+- [ ] 6.1 Document the interim rule: one TUI or MCP context frontend per checkout per host until the fix ships.
+- [ ] 6.2 Document the operational precondition: stop every context frontend for the user/host, upgrade all launch paths and restart together; old binaries ignore the lock and cannot be fenced by discovery compatibility or cleanup. Do not unlink lock files as a rollout step.
+- [ ] 6.3 Obtain a separate operator decision for actual rollout. Hand off qualification results, the resolved LAB-219 lifecycle decision and remaining limitations before implementation acceptance; do not imply this spec-first change authorizes deployment.
