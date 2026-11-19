@@ -323,6 +323,36 @@ async fn simultaneous_promotion_race_has_exactly_one_winner() {
             winner = Some(format!("s{i}"));
         }
     }
+    // LAB-218 diagnosis only: distinguish stale role flags from two live
+    // context endpoints, without changing acquisition or timing on success.
+    if leaders != 1 {
+        eprintln!(
+            "LAB-218 leaders={leaders}, served_by={served_by:?}, flake={}",
+            identity.flake()
+        );
+        let d = discovery::read(&state, identity.key()).unwrap();
+        for port in identity.ports() {
+            let addr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+            if let Ok(client) = mandala_context::ContextClient::connect(
+                addr,
+                &d.token,
+                "lab218-observer",
+                identity.flake(),
+            )
+            .await
+            {
+                let result = client.call("read", serde_json::Map::new()).await;
+                eprintln!("LAB-218 live endpoint port={port}, result={result:?}");
+            }
+        }
+        for (i, session) in sessions.iter().enumerate() {
+            let result = session.call("read", serde_json::Map::new(), true).await;
+            eprintln!(
+                "LAB-218 session={i}, leader={}, result={result:?}",
+                session.is_leader().await
+            );
+        }
+    }
     assert_eq!(leaders, 1, "the bind arbitrates exactly one promotion");
     let winner = winner.unwrap();
     for label in &served_by {
