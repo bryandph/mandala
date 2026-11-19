@@ -108,14 +108,14 @@ Before implementation, lifecycle investigation SHALL establish whether a host ca
 - **THEN** the conclusion and evidence are documented, diagnostic Drop tests make only connection-loss claims, and process-kill tests establish crash behavior
 
 ### Requirement: Coordination failures never create an unlocked leader
-When another owner holds either lifetime guard, a candidate SHALL join the existing authenticated leader or retry within a bound, then return a dedicated structured coordination busy/unavailable error if still unsuccessful. Missing or unwritable coordination root, unsafe paths, unsupported locking and all other coordination errors SHALL fail closed with explicit diagnostics. No path SHALL elect unlocked, silently move coordination to runtime/tmp state, publish discovery or invoke a leader config without both guards. A held but unreachable owner SHALL remain excluded from replacement; responsiveness SHALL NOT be inferred from lock contents.
+When another owner holds either lifetime guard, a candidate SHALL join the existing authenticated leader or retry within a bound, then return a dedicated structured coordination busy/unavailable error if still unsuccessful. Acquisition SHALL securely create a missing DEFAULT coordination root and its missing parents beneath the account home at mode 0700 without following symlinks, then verify directory type, current-user ownership, root mode 0700 and path safety after opening, as specified in `fleet-state-formats`. An explicitly injected test root SHALL NOT be auto-created. Default-root creation failure, missing injected root, unwritable root, unsafe paths, unsupported locking and all other coordination errors SHALL fail closed with explicit diagnostics. No path SHALL elect unlocked, silently move coordination to runtime/tmp state, publish discovery or invoke a leader config without both guards. A held but unreachable owner SHALL remain excluded from replacement; responsiveness SHALL NOT be inferred from lock contents.
 
 #### Scenario: owner holds the lock before discovery publication
 - **WHEN** a contender cannot join because the lock owner has not yet published or finished its factory
 - **THEN** it waits/retries within the bound and joins or returns coordination busy/unavailable, without binding or invoking its own factory
 
 #### Scenario: coordination is unavailable
-- **WHEN** the root is missing or unwritable, a path is unsafe or record locking is unsupported
+- **WHEN** default-root creation fails, an injected root is missing, the root is unwritable, a path is unsafe or record locking is unsupported
 - **THEN** acquisition returns a classified explicit error with no unlocked election, alternate-root fallback or leader-side execution
 
 #### Scenario: different metadata roots cannot bypass exclusion
