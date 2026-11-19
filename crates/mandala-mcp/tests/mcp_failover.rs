@@ -18,6 +18,7 @@
 //! no discovery release — exactly a killed process). One test fn: the
 //! process-global `MANDALA_FLEET_STATE` seam cannot race.
 
+use common::acquire;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +36,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, ContextIdentity, ContextSession, FleetContext, HostConfig, HostConfigFactory, acquire,
+    Acquired, ContextIdentity, ContextSession, FleetContext, HostConfig, HostConfigFactory,
 };
 
 mod common;
@@ -169,7 +170,7 @@ async fn orphaned_run_attaches_after_promotion(scratch: &std::path::Path, state:
 
     // The follower: no handler, no evaluator, no inventory of its own until
     // (unless) it promotes — its factory builds the promoted handler then.
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         state,
         "follower-mcp",
@@ -265,7 +266,7 @@ async fn promotion_race_at_the_mcp_level(scratch: &std::path::Path, state: &std:
 
     let mut followers = Vec::new();
     for i in 0..2 {
-        let session = ContextSession::acquire(
+        let session = common::session_acquire(
             identity.clone(),
             state,
             &format!("follower-{i}"),

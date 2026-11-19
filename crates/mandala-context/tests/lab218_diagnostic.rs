@@ -15,13 +15,14 @@
 
 mod common;
 
+use common::acquire;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mandala_context::{
-    Acquired, ContextClient, ContextIdentity, ContextSession, Discovery, FleetContext, HostConfig,
-    RunningHost, acquire, discovery,
+    Acquired, ContextClient, ContextIdentity, Discovery, FleetContext, HostConfig, RunningHost,
+    discovery,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -98,7 +99,7 @@ async fn stress_abrupt_promotion() {
         for index in 0..contenders {
             let label = ["s0", "s1", "s2"][index % 3];
             sessions.push(
-                ContextSession::acquire(
+                common::session_acquire(
                     identity.clone(),
                     &state,
                     label,

@@ -28,7 +28,7 @@ pub mod protocol;
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -38,6 +38,15 @@ pub use discovery::{Discovery, mint_token};
 pub use fleet::{CallError, ContextSession, FleetContext, HostConfigFactory, LocalContext};
 pub use host::{Dispatch, DispatchFuture, HostConfig, RunningHost};
 pub use identity::ContextIdentity;
+
+/// Acquisition configuration, retained across session promotion.
+#[derive(Clone, Debug, Default)]
+pub struct AcquireOptions {
+    /// Explicit isolated coordination root. It must already exist and be
+    /// private; acquisition never creates an injected root. `None` uses the
+    /// stable account-home default, independently of client state overrides.
+    pub coordination_root: Option<PathBuf>,
+}
 
 /// How the process joined the context.
 pub enum Acquired {
@@ -121,6 +130,27 @@ pub async fn acquire(
     identity: &ContextIdentity,
     state_dir: &Path,
     client_name: &str,
+    config: impl FnOnce() -> HostConfig,
+) -> Result<Acquired, AcquireError> {
+    acquire_with_options(
+        identity,
+        state_dir,
+        client_name,
+        AcquireOptions::default(),
+        config,
+    )
+    .await
+}
+
+/// Acquire with explicit options, including an isolated test coordination root.
+///
+/// # Errors
+/// See [`acquire`].
+pub async fn acquire_with_options(
+    identity: &ContextIdentity,
+    state_dir: &Path,
+    client_name: &str,
+    _options: AcquireOptions,
     config: impl FnOnce() -> HostConfig,
 ) -> Result<Acquired, AcquireError> {
     let mut config = Some(config);

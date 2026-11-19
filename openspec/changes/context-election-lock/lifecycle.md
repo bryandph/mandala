@@ -25,6 +25,10 @@ A `RunningHost` **can be dropped while its process continues**. Select the live-
 
 Independent deploy supervisors are distinct run owners: `mandala-core/src/runner.rs:1027-1034,1081-1089,1249-1284` launch a dedicated supervisor process; `mandala-mcp/src/lib.rs:121-122` explicitly preserves launched runs across frontend exit. Do not cancel these supervisors as context-dispatch cleanup.
 
+## Coordinator decision
+
+Coordinator approved task 2 onward after reviewing this trace. The checkout watcher is narrowly included as leader-owned work: retain its JoinHandle in the lease, abort and await actual termination before guard release, without changing watch semantics or cancelling independent deploy supervisors. This implements the existing factory/config/local-dispatch lifetime requirement; it is not a deviation.
+
 ## Required implementation evidence
 
 Prove blocked wire calls and local calls are actually dropped/terminated before a contender obtains the released lease, including graceful-drain expiry, abrupt Drop, cancelled shutdown/acquisition and retained local snapshots. Keep listener and guards in a proven teardown ownership order. Test real process death separately with SIGKILL and fork-before-exec children; a Drop-based diagnostic is live-process connection loss, not process-death evidence.

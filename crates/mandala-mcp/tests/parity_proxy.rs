@@ -27,12 +27,12 @@
 //!
 //! One test fn: the process-global `MANDALA_FLEET_STATE` seam cannot race.
 
+use common::acquire;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mandala_context::{
     Acquired, CallError, ContextIdentity, ContextSession, FleetContext, HostConfig, LocalContext,
-    acquire,
 };
 use mandala_core::registry::{self, Meta};
 use mandala_core::runner::COMMAND_LOG;
@@ -181,7 +181,7 @@ async fn leader_and_follower_paths_are_byte_identical() {
         Acquired::Leader(host) => host,
         Acquired::Follower(_) => panic!("no prior context — must lead"),
     };
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "parity-follower",

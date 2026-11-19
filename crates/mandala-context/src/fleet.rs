@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use crate::client::{CallFailure, ContextClient};
 use crate::host::{Dispatch, HostConfig, RunningHost};
 use crate::identity::ContextIdentity;
-use crate::{AcquireError, Acquired, acquire};
+use crate::{AcquireError, AcquireOptions, Acquired, acquire_with_options};
 
 /// Produces the leader-side [`HostConfig`] — the promotion hook. Invoked
 /// exactly when this process becomes (or re-becomes) the leader, so the
@@ -176,6 +176,7 @@ struct SessionInner {
     state_dir: PathBuf,
     client_name: String,
     make_host: HostConfigFactory,
+    options: AcquireOptions,
     role: Mutex<Role>,
 }
 
@@ -203,15 +204,37 @@ impl ContextSession {
         client_name: impl Into<String>,
         make_host: HostConfigFactory,
     ) -> Result<Self, AcquireError> {
+        Self::acquire_with_options(
+            identity,
+            state_dir,
+            client_name,
+            make_host,
+            AcquireOptions::default(),
+        )
+        .await
+    }
+
+    /// Join with explicit options, retained for every reacquisition.
+    ///
+    /// # Errors
+    /// See [`Self::acquire`].
+    pub async fn acquire_with_options(
+        identity: ContextIdentity,
+        state_dir: impl Into<PathBuf>,
+        client_name: impl Into<String>,
+        make_host: HostConfigFactory,
+        options: AcquireOptions,
+    ) -> Result<Self, AcquireError> {
         let state_dir = state_dir.into();
         let client_name = client_name.into();
-        let role = acquire_role(&identity, &state_dir, &client_name, &make_host).await?;
+        let role = acquire_role(&identity, &state_dir, &client_name, &make_host, &options).await?;
         Ok(Self {
             inner: Arc::new(SessionInner {
                 identity,
                 state_dir,
                 client_name,
                 make_host,
+                options,
                 role: Mutex::new(role),
             }),
         })
@@ -267,6 +290,7 @@ impl ContextSession {
             &self.inner.state_dir,
             &self.inner.client_name,
             &self.inner.make_host,
+            &self.inner.options,
         )
         .await
         .map_err(CallError::Acquire)?;
@@ -304,9 +328,10 @@ async fn acquire_role(
     state_dir: &std::path::Path,
     client_name: &str,
     make_host: &HostConfigFactory,
+    options: &AcquireOptions,
 ) -> Result<Role, AcquireError> {
     let mut kept: Option<HostConfig> = None;
-    let acquired = acquire(identity, state_dir, client_name, || {
+    let acquired = acquire_with_options(identity, state_dir, client_name, options.clone(), || {
         let config = (make_host)();
         kept = Some(config.clone());
         config

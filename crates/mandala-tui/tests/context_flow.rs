@@ -14,6 +14,10 @@
 //!   the quit-ordering drain proof, observer detach, and the task-6.5
 //!   failover drill. Never real ansible/nix — every child is an `sh` stub.
 
+#[path = "../../mandala-context/tests/common/mod.rs"]
+mod common;
+
+use common::acquire;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
@@ -705,7 +709,7 @@ async fn acquire_tui(
     let flake_dir = scratch.join(format!("flake-{base_port}"));
     std::fs::create_dir_all(&flake_dir).unwrap();
     let identity = ContextIdentity::with_port_range(&flake_dir, base_port, 4).unwrap();
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         name,
@@ -749,7 +753,7 @@ async fn leader_tui_serves_follower_calls_origin_labeled() {
         leader: true,
     });
 
-    let follower = ContextSession::acquire(
+    let follower = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "agent-1",
@@ -800,7 +804,7 @@ async fn observer_adopts_a_reload_with_one_leader_evaluation() {
     std::fs::create_dir_all(&flake_dir).unwrap();
     let identity = ContextIdentity::with_port_range(&flake_dir, 28882, 2).unwrap();
     let count = Arc::new(AtomicUsize::new(0));
-    let leader = ContextSession::acquire(
+    let leader = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "mcp-0",
@@ -808,7 +812,7 @@ async fn observer_adopts_a_reload_with_one_leader_evaluation() {
     )
     .await
     .unwrap();
-    let observer = ContextSession::acquire(
+    let observer = common::session_acquire(
         identity,
         test_env().join("state"),
         "tui-2",
@@ -853,7 +857,7 @@ async fn first_launch_eval_hydrates_cache_after_inventory_load() {
     std::fs::create_dir_all(&flake_dir).unwrap();
     let identity = ContextIdentity::with_port_range(&flake_dir, 28883, 2).unwrap();
     let expected_eval_count = Arc::new(AtomicUsize::new(0));
-    let leader = ContextSession::acquire(
+    let leader = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "mcp-launch",
@@ -861,7 +865,7 @@ async fn first_launch_eval_hydrates_cache_after_inventory_load() {
     )
     .await
     .unwrap();
-    let observer = ContextSession::acquire(
+    let observer = common::session_acquire(
         identity,
         test_env().join("state"),
         "tui-launch",
@@ -917,7 +921,7 @@ async fn repo_head_watch_follows_context_leadership() {
     let identity = ContextIdentity::with_port_range(&scratch, 28905, 3).unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let factory = watching_stub_factory(scratch.clone(), Arc::clone(&count));
-    let leader = ContextSession::acquire(
+    let leader = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "mcp-watch-0",
@@ -927,7 +931,7 @@ async fn repo_head_watch_follows_context_leadership() {
     .unwrap();
     assert!(leader.is_leader().await);
     let follower =
-        ContextSession::acquire(identity, test_env().join("state"), "mcp-watch-1", factory)
+        common::session_acquire(identity, test_env().join("state"), "mcp-watch-1", factory)
             .await
             .unwrap();
     assert!(!follower.is_leader().await);
@@ -977,7 +981,7 @@ async fn leader_tui_quit_drains_an_in_flight_follower_call() {
         leader: true,
     });
 
-    let follower = ContextSession::acquire(
+    let follower = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "agent-1",
@@ -1018,7 +1022,7 @@ async fn observer_tui_quit_is_a_clean_detach() {
     let (identity, leader) = acquire_tui(&scratch, "mcp-0", 28890, Duration::from_millis(0)).await;
     assert!(leader.is_leader().await);
 
-    let tui = ContextSession::acquire(
+    let tui = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "tui-2",
@@ -1037,7 +1041,7 @@ async fn observer_tui_quit_is_a_clean_detach() {
     app.shutdown_context(Duration::from_secs(1)).await;
 
     // The leader is untouched: a fresh client still gets served.
-    let client = ContextSession::acquire(
+    let client = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "agent-2",
@@ -1076,7 +1080,7 @@ async fn failover_drill_run_survives_leader_tui_death() {
 
     // An mcp-shaped follower launches a confirmed reboot through the
     // leader-TUI — a REAL registered CommandRun `sh` child.
-    let follower = ContextSession::acquire(
+    let follower = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "mcp-1",
@@ -1135,7 +1139,7 @@ async fn failover_drill_run_survives_leader_tui_death() {
     );
 
     // A restarted observer-TUI joins the NEW leader and sees its activity.
-    let restarted = ContextSession::acquire(
+    let restarted = common::session_acquire(
         identity.clone(),
         test_env().join("state"),
         "tui-2",

@@ -7,6 +7,10 @@
 //! Same discipline as `tests/context.rs`: real loopback sockets, small
 //! injected port ranges at distinct bases, relational assertions.
 
+#[path = "../../mandala-context/tests/common/mod.rs"]
+mod common;
+
+use common::acquire;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,8 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, ConnectError, ContextClient, ContextIdentity, Discovery, HostConfig, acquire,
-    discovery,
+    Acquired, ConnectError, ContextClient, ContextIdentity, Discovery, HostConfig, discovery,
 };
 
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)

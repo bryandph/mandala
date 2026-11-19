@@ -10,6 +10,7 @@
 //! the walk is exactly what handles that.
 
 mod common;
+use common::acquire;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -21,8 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, ContextClient, ContextIdentity, Discovery, HostConfig, RunningHost, acquire,
-    discovery,
+    Acquired, ContextClient, ContextIdentity, Discovery, HostConfig, RunningHost, discovery,
 };
 
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)

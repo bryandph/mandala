@@ -10,6 +10,7 @@
 
 mod common;
 
+use common::acquire;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,8 +21,8 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    AcquireError, Acquired, CallError, ContextIdentity, ContextSession, FleetContext, HostConfig,
-    HostConfigFactory, RunningHost, acquire, discovery,
+    AcquireError, Acquired, CallError, ContextIdentity, FleetContext, HostConfig,
+    HostConfigFactory, RunningHost, discovery,
 };
 
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)
@@ -132,7 +133,7 @@ async fn idempotent_read_retries_once_after_promotion() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
@@ -188,7 +189,7 @@ async fn mutation_surfaces_structured_failover_without_retry() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
@@ -239,7 +240,7 @@ async fn call_issued_after_leader_death_fails_over_without_hanging() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
@@ -281,7 +282,7 @@ async fn simultaneous_promotion_race_has_exactly_one_winner() {
     for i in 0..3 {
         let (events, _) = broadcast::channel(64);
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = ContextSession::acquire(
+        let session = common::session_acquire(
             identity.clone(),
             &state,
             &format!("session-{i}"),
@@ -467,7 +468,7 @@ async fn subscribe_stream_resumes_across_promotion() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
