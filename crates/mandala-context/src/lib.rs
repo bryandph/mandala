@@ -22,6 +22,7 @@
 pub mod client;
 pub mod discovery;
 pub mod fleet;
+pub mod election;
 pub mod host;
 pub mod identity;
 pub mod protocol;

@@ -21,7 +21,7 @@ pub fn options(state: &Path) -> AcquireOptions {
         Err(e) => panic!("create test coordination fixture: {e}"),
     }
     AcquireOptions {
-        coordination_root: Some(root),
+        coordination_root: Some(std::fs::canonicalize(root).unwrap()),
     }
 }
 
