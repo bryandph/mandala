@@ -201,6 +201,15 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
         ) {
             Ok(child) => child,
             Err(e) if e.kind() == io::ErrorKind::NotFound && may_create => {
+                // Fail closed even in user namespaces/capability-bearing test
+                // processes that could otherwise bypass missing write bits.
+                if current.metadata()?.mode() & 0o200 == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "default coordination parent is not owner-writable",
+                    )
+                    .into());
+                }
                 // SAFETY: parent is securely opened and name is one component.
                 if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
                     let e = io::Error::last_os_error();
@@ -221,7 +230,8 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
         let is_root = walked == path;
         let private = create_below.is_some_and(|home| walked.starts_with(home));
         let owner_ok = meta.uid() == uid || (!private && !is_root && meta.uid() == system_uid);
-        let sticky_system = !private && !is_root && meta.uid() == system_uid && meta.mode() & 0o1000 != 0;
+        let sticky_system =
+            !private && !is_root && meta.uid() == system_uid && meta.mode() & 0o1000 != 0;
         if !meta.is_dir()
             || !owner_ok
             || (meta.mode() & 0o022 != 0 && !sticky_system)
