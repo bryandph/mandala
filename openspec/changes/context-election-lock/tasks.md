@@ -1,11 +1,11 @@
 ## Planning and scope gate
 
-- [ ] Review the LAB-218 spec-first artifacts; completeness is not implementation or rollout approval. Keep this branch docs-only and defer canonical-spec synchronization until archive.
-- [ ] Confirm the implementation review covers acquire, host ownership, local dispatch, lock helper/root resolution and frontend option plumbing; no CI/flake, deployment, secrets or unrelated repository changes.
+- [x] Review the LAB-218 spec-first artifacts; completeness is not implementation or rollout approval. Keep this branch docs-only and defer canonical-spec synchronization until archive. Implementation branch authorized separately by the operator; canonical-spec synchronization remains deferred.
+- [x] Confirm the implementation review covers acquire, host ownership, local dispatch, lock helper/root resolution and frontend option plumbing; no CI/flake, deployment, secrets or unrelated repository changes.
 
 ## 1. First implementation task: lifecycle decision
 
-- [ ] 1.1 Investigate LAB-219 before other implementation: trace every `RunningHost` owner/drop path, demotion, shutdown, in-process restart, frontend teardown and local dispatch snapshot. Record whether a host can be dropped while its process continues. If yes, require a JoinSet or abort handles and equivalent local-call ownership to abort dispatched calls on Drop and stop them before releasing the lock; test actual termination ordering. If no, document the evidence and that diagnostic Drop models connection loss only, and use process-kill tests for process-death claims. Escalate any broader cancellation redesign; do not cancel independent detached supervisors.
+- [x] 1.1 Investigate LAB-219 before other implementation: trace every `RunningHost` owner/drop path, demotion, shutdown, in-process restart, frontend teardown and local dispatch snapshot. Record whether a host can be dropped while its process continues. If yes, require a JoinSet or abort handles and equivalent local-call ownership to abort dispatched calls on Drop and stop them before releasing the lock; test actual termination ordering. If no, document the evidence and that diagnostic Drop models connection loss only, and use process-kill tests for process-death claims. Escalate any broader cancellation redesign; do not cancel independent detached supervisors. Finding: live-process host drop is reachable; select tracked wire/local-call termination before lease release. Evidence and watcher seam escalation: [lifecycle.md](lifecycle.md). Stopped for coordinator approval before task 2.
 
 ## 2. Preserve pre-fix evidence and isolate the harness
 
