@@ -13,6 +13,8 @@
 //! `stress_abrupt --ignored --nocapture` (LAB218_TRIALS defaults to 1000).
 //! Set TMPDIR, XDG_STATE_HOME and XDG_RUNTIME_DIR to isolated scratch roots.
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +51,7 @@ async fn disappearing_foreign_occupant_invalidates_completed_scan() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "LAB-218: opt-in abrupt promotion stress"]
 async fn stress_abrupt_promotion() {
+    common::refusal_preflight();
     use std::sync::atomic::{AtomicUsize, Ordering};
     let root = std::env::temp_dir().join(format!("lab218-stress-{}", std::process::id()));
     let flake = root.join("flake");
@@ -170,6 +173,7 @@ async fn stress_abrupt_promotion() {
 }
 
 async fn reproduce() {
+    common::refusal_preflight();
     let root = std::env::temp_dir().join(format!(
         "lab218-controlled-{}-{}",
         std::process::id(),

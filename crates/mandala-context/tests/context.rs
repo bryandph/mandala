@@ -9,6 +9,8 @@
 //! so an unrelated local service squatting a test port cannot flake them —
 //! the walk is exactly what handles that.
 
+mod common;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ use mandala_context::{
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)
 /// and `state/` (the isolated mandala state dir).
 fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+    common::refusal_preflight();
     let base = std::env::temp_dir().join(format!(
         "mandala-context-spike-{tag}-{}-{}",
         std::process::id(),

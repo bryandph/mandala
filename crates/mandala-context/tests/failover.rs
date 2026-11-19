@@ -8,6 +8,8 @@
 //! no discovery release — connections die, the stale file stays, exactly
 //! like a killed process).
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +27,7 @@ use mandala_context::{
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)
 /// and `state/` (the isolated mandala state dir).
 fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+    common::refusal_preflight();
     let base = std::env::temp_dir().join(format!(
         "mandala-context-failover-{tag}-{}-{}",
         std::process::id(),
