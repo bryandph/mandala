@@ -4,6 +4,10 @@
 //! are not inherited by fork children, and are released by ANY close of the
 //! inode in that process. Therefore the keyed async mutex is taken BEFORE
 //! opening the inode and the sole descriptor stays private to the lease.
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use crate::{AcquireOptions, ContextIdentity};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io;
@@ -164,3 +168,68 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
     Ok(root)
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct Key { device: u64, inode: u64, identity: String }
+fn mutex_for(key: Key) -> Arc<AsyncMutex<()>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<Key, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let mut registry = REGISTRY.get_or_init(Mutex::default).lock().expect("election registry poisoned");
+    // Retain entries for process lifetime; removing a live weak entry is not
+    // necessary and must never split one coordination identity.
+    Arc::clone(registry.entry(key).or_insert_with(|| Arc::new(AsyncMutex::new(()))))
+}
+
+/// Sole owner of the lock descriptor, then the keyed mutex. Field order is
+/// deliberate: close the process-lock fd before releasing same-process access.
+/// Never clone, expose, diagnostically open, unlink or replace this inode.
+pub struct ElectionLease {
+    _file: File,
+    _mutex: OwnedMutexGuard<()>,
+}
+
+/// Nonblocking attempt. `Ok(None)` is contention, never permission to lead.
+/// Roots are validated on every attempt, but the lock inode is never opened
+/// until the keyed mutex is owned.
+///
+/// # Errors
+/// Unsafe paths, missing injected roots, creation/access failures and unsupported locks.
+pub fn try_acquire(identity: &ContextIdentity, options: &AcquireOptions) -> Result<Option<ElectionLease>, CoordinationError> {
+    let (path, home) = match &options.coordination_root {
+        Some(path) => (path.clone(), None),
+        None => { let home = account_home()?; (home.join(".local/state/mandala/context-election"), Some(home)) }
+    };
+    try_at(identity.key(), &path, home.as_deref())
+}
+
+fn try_at(identity: &str, path: &Path, home: Option<&Path>) -> Result<Option<ElectionLease>, CoordinationError> {
+    let root = root_at(path, home)?;
+    let meta = root.dir.metadata()?;
+    let mutex = mutex_for(Key { device: meta.dev(), inode: meta.ino(), identity: identity.to_owned() });
+    let Ok(guard) = mutex.try_lock_owned() else { return Ok(None); };
+    root.verify()?;
+    let name = c_name(OsStr::new(&format!("{identity}.lock")))?;
+    // O_NONBLOCK prevents a malicious FIFO from blocking before validation.
+    let file = open_at(root.dir.as_raw_fd(), &name, libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK, 0o600)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o600 || meta.nlink() != 1 {
+        return Err(unsafe_path(format!("lock ownership/mode/type/link count at {}", root.path.display())));
+    }
+    same_entry(&root.dir, &name, &file)?;
+    root.verify()?;
+    // SAFETY: zeroed flock's fields are fully set for a whole-file write lock.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::EACCES | libc::EAGAIN) => Ok(None),
+            Some(libc::ENOSYS | libc::ENOTSUP | libc::ENOLCK | libc::EINVAL) => Err(CoordinationError::Unsupported(e)),
+            _ => Err(e.into()),
+        };
+    }
+    same_entry(&root.dir, &name, &file)?;
+    root.verify()?;
+    Ok(Some(ElectionLease { _file: file, _mutex: guard }))
+}
