@@ -8,7 +8,7 @@ The lifetime-lock guarantee requires stopping **every** context frontend for the
 
 All acquisition tests inject a private, pre-created coordination root, retained across reacquisition. An injected root is never created by acquisition. Test fixture setup owns its creation. Production coordination uses the stable account home, not HOME/client state/runtime overrides; do not point tests at production state.
 
-Acquisition owns secure creation of a missing default `~/.local/state/mandala/context-election` and missing parents below the account home, at mode 0700. It verifies existing and created directories without following symlinks and rejects unsafe paths rather than repairing them. Lock files are persistent mode-0600 regular inodes, never stale-lock markers. Only host-local filesystems with POSIX process record locking are qualified; network homes are not qualified.
+Acquisition owns secure creation of a missing default `~/.local/state/mandala/context-election` and missing parents below the account home, at mode 0700. It verifies existing and created directories without following symlinks and rejects unsafe paths rather than repairing them. Lock files are persistent mode-0600 regular inodes, never stale-lock markers. Only local filesystems with POSIX process record locking are supported; network homes are not qualified. Admission checks the opened root descriptor: macOS requires MNT_LOCAL; Linux refuses known network/FUSE filesystem magics (NFS, SMB/CIFS/SMB2, 9p including WSL drvfs, FUSE, Ceph, AFS, Coda and NCP), and assumes other filesystems are local. Unsupported kernel record-lock errors still fail explicitly.
 
 Context suites run a bounded native-loopback refusal preflight. On WSL, unused loopback ports may time out instead of refusing (LAB-206). This is an environment error, not permission to weaken the production busy-leader rule.
 
@@ -28,6 +28,12 @@ unshare --user --map-root-user --net sh -c '
 ```
 
 Native macOS runs use the same refusal preflight, without a Linux namespace. Run Linux suites repeatedly under owned CPU load; record load process ownership and terminate only those owned load processes. Namespace evidence does not replace sandboxed Nix builds on either platform.
+
+## Acquisition failures
+
+For canonical checkouts, MCP completes protocol initialization even when acquisition fails, but logs the error and returns a structured acquisition error from every tool. It never falls back to an effectful standalone handler. A host started before discovery publication fails is fully torn down before this error-only server begins. Non-path flake references retain existing standalone behavior. TUI read-only fallback is unchanged except that coordination errors fail closed.
+
+A fork child deliberately paused before exec can retain inherited TCP listeners even though POSIX process locks are not inherited. Current behavior is safe unavailability (LeaderBusy, no second endpoint), with recovery after the child execs or exits. A separate operator decision is required before changing the merged stronger fork guarantee or adding socket atfork handling; see the change's fork audit and qualification notes. This limitation is not hidden by helper-only lock tests.
 
 ## Preserved pre-fix witness
 
