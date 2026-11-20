@@ -464,3 +464,60 @@ impl ContextSession {
         }
     }
 }
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retained_local_snapshot_cannot_invoke_config_after_shutdown() {
+        let root = std::env::temp_dir().join(format!("context-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flake")).unwrap();
+        let coordination = root.join("coordination");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&coordination)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let session = ContextSession::acquire_with_options(
+            ContextIdentity::with_port_range(root.join("flake"), 29924, 4).unwrap(),
+            root.join("state"),
+            "snapshot",
+            Arc::new(move || {
+                let count = count.clone();
+                let (events, _) = broadcast::channel(8);
+                HostConfig::new(
+                    Arc::new(move |_, _, _| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(Value::Null) })
+                    }),
+                    events,
+                )
+            }),
+            AcquireOptions {
+                coordination_root: Some(coordination.canonicalize().unwrap()),
+                ..AcquireOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let Exec::Local(snapshot) = session.snapshot().await.unwrap() else {
+            panic!("local");
+        };
+        session.shutdown(Duration::ZERO).await;
+        assert!(
+            snapshot(None, "late".into(), serde_json::Map::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "not even synchronous factory dispatch invocation escapes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

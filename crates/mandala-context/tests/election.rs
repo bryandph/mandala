@@ -45,6 +45,46 @@ fn lock_path(id: &ContextIdentity, options: &AcquireOptions) -> PathBuf {
 }
 
 #[test]
+fn report_default_layout() {
+    if std::env::var_os("MANDALA_REPORT_LAYOUT").is_some() {
+        println!("LAYOUT {:?}", election::default_root());
+    }
+}
+
+#[test]
+fn account_home_layout_ignores_client_environment_overrides() {
+    let (path, _, _) = fixture("layout");
+    let mut observations = Vec::new();
+    for i in 0..3 {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "report_default_layout", "--nocapture"])
+            .env("MANDALA_REPORT_LAYOUT", "1")
+            .env("HOME", path.join(format!("home-{i}")))
+            .env("MANDALA_FLEET_STATE", path.join(format!("state-{i}")))
+            .env("XDG_STATE_HOME", path.join(format!("xdg-{i}")));
+        if i == 2 {
+            command.env_remove("XDG_RUNTIME_DIR");
+        } else {
+            command.env("XDG_RUNTIME_DIR", path.join(format!("runtime-{i}")));
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        observations.push(
+            stdout
+                .lines()
+                .find(|line| line.starts_with("LAYOUT "))
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert!(observations.iter().all(|path| path == &observations[0]));
+    // Resolution is read-only: never opens or creates the actual default root.
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn same_process_sessions_aliases_and_independent_flakes() {
     let (path, id, options) = fixture("sessions");
     let lease = election::try_acquire(&id, &options).unwrap().unwrap();

@@ -327,6 +327,10 @@ pub fn try_acquire(
     try_at(identity.key(), &path, home.as_deref())
 }
 
+fn lock_metadata_safe(regular: bool, owner: u32, current: u32, mode: u32, links: u64) -> bool {
+    regular && owner == current && mode & 0o7777 == 0o600 && links == 1
+}
+
 fn try_at(
     identity: &str,
     path: &Path,
@@ -352,11 +356,13 @@ fn try_at(
         0o600,
     )?;
     let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o7777 != 0o600
-        || meta.nlink() != 1
-    {
+    if !lock_metadata_safe(
+        meta.is_file(),
+        meta.uid(),
+        unsafe { libc::geteuid() },
+        meta.mode(),
+        meta.nlink(),
+    ) {
         return Err(unsafe_path(format!(
             "lock ownership/mode/type/link count at {}",
             root.path.display()
@@ -371,14 +377,7 @@ fn try_at(
     lock.l_start = 0;
     lock.l_len = 0;
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
-        let e = io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::EACCES | libc::EAGAIN) => Ok(None),
-            Some(libc::ENOSYS | libc::ENOTSUP | libc::ENOLCK | libc::EINVAL) => {
-                Err(CoordinationError::Unsupported(e))
-            }
-            _ => Err(e.into()),
-        };
+        return classify_lock_error(io::Error::last_os_error());
     }
     same_entry(&root.dir, &name, &file)?;
     root.verify()?;
@@ -386,6 +385,16 @@ fn try_at(
         _file: file,
         _mutex: guard,
     }))
+}
+
+fn classify_lock_error(e: io::Error) -> Result<Option<ElectionLease>, CoordinationError> {
+    match e.raw_os_error() {
+        Some(libc::EACCES | libc::EAGAIN) => Ok(None),
+        Some(libc::ENOSYS | libc::ENOTSUP | libc::ENOLCK | libc::EINVAL) => {
+            Err(CoordinationError::Unsupported(e))
+        }
+        _ => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +469,31 @@ mod tests {
         std::fs::write(&local, []).unwrap();
         assert!(try_at("fixture", &root, Some(&home)).is_err());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn foreign_metadata_and_unsupported_lock_errors_fail_closed() {
+        // Synthetic ownership validation: no privilege or live chown fixture.
+        // Native foreign-owner inode coverage requires a privileged fixture.
+        assert!(!lock_metadata_safe(true, 1001, 1000, 0o600, 1));
+        assert!(!lock_metadata_safe(true, 1000, 1000, 0o600, 2));
+        assert!(lock_metadata_safe(true, 1000, 1000, 0o600, 1));
+        for errno in [libc::ENOSYS, libc::ENOTSUP, libc::ENOLCK, libc::EINVAL] {
+            assert!(matches!(
+                classify_lock_error(io::Error::from_raw_os_error(errno)),
+                Err(CoordinationError::Unsupported(_))
+            ));
+        }
+        for errno in [libc::EACCES, libc::EAGAIN] {
+            assert!(matches!(
+                classify_lock_error(io::Error::from_raw_os_error(errno)),
+                Ok(None)
+            ));
+        }
+        assert!(matches!(
+            classify_lock_error(io::Error::from_raw_os_error(libc::EIO)),
+            Err(CoordinationError::Unavailable(_))
+        ));
     }
 
     #[test]

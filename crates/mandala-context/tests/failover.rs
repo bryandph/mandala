@@ -436,7 +436,7 @@ async fn missing_discovery_never_hides_a_walked_leader() {
     let cfg = factory("joiner", calls, events);
     let result = acquire(&identity, &state, "joiner", move || (cfg)()).await;
     assert!(
-        matches!(result, Err(AcquireError::TokenUnavailable)),
+        matches!(result, Err(AcquireError::CoordinationBusy)),
         "the live walked leader must block a second claim"
     );
 

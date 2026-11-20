@@ -152,6 +152,7 @@ impl Drop for ActiveCall {
 }
 
 struct LocalCall {
+    active: ActiveCall,
     origin: Option<String>,
     tool: String,
     args: serde_json::Map<String, Value>,
@@ -215,10 +216,8 @@ impl HostOwner {
                 () = shut_down(&mut shutdown) => break,
                 Some(call) = self.calls.recv() => {
                     let shared = Arc::clone(&self.shared);
-                    shared.active.fetch_add(1, Ordering::AcqRel);
-                    let active = ActiveCall(Arc::clone(&shared));
                     self.tasks.spawn(async move {
-                        let _active = active;
+                        let _active = call.active;
                         let result = (shared.config.dispatch)(call.origin, call.tool, call.args).await;
                         let _ = call.result.send(result);
                     });
@@ -256,6 +255,30 @@ impl HostOwner {
 }
 
 impl HostShared {
+    fn queue(
+        self: &Arc<Self>,
+        origin: Option<String>,
+        tool: String,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<oneshot::Receiver<Result<Value, String>>, String> {
+        if *self.shutdown.borrow() {
+            return Err("context closed".into());
+        }
+        let (result, rx) = oneshot::channel();
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let active = ActiveCall(Arc::clone(self));
+        self.calls
+            .send(LocalCall {
+                active,
+                origin,
+                tool,
+                args,
+                result,
+            })
+            .map_err(|_| "context closed".to_string())?;
+        Ok(rx)
+    }
+
     fn token_matches(&self, presented: &str) -> bool {
         *self.token.read().expect("token lock poisoned") == presented
     }
@@ -334,16 +357,7 @@ impl RunningHost {
                 if *shared.shutdown.borrow() || shared.refusing.load(Ordering::Acquire) {
                     return Err("context closed".into());
                 }
-                let (result, rx) = oneshot::channel();
-                shared
-                    .calls
-                    .send(LocalCall {
-                        origin,
-                        tool,
-                        args,
-                        result,
-                    })
-                    .map_err(|_| "context closed".to_string())?;
+                let rx = shared.queue(origin, tool, args)?;
                 drop(shared);
                 rx.await.map_err(|_| "context closed".to_string())?
             })
@@ -594,22 +608,18 @@ async fn serve_conn(stream: TcpStream, shared: Arc<HostShared>) {
                 let in_flight = Arc::clone(&in_flight);
                 let origin = client.clone();
                 tokio::spawn(async move {
-                    let (result, rx) = oneshot::channel();
-                    let outcome = if shared
-                        .calls
-                        .send(LocalCall {
-                            origin: Some(origin),
-                            tool,
-                            args,
-                            result,
-                        })
-                        .is_ok()
-                    {
-                        rx.await.unwrap_or_else(|_| Err("context closed".into()))
-                    } else {
-                        Err("context closed".into())
+                    let outcome = match shared.queue(Some(origin), tool, args) {
+                        Ok(rx) => rx.await.ok(),
+                        Err(_) => None,
                     };
                     in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let Some(outcome) = outcome.filter(|_| !*shared.shutdown.borrow()) else {
+                        // Lease teardown is endpoint loss, not a tool error.
+                        // Never race socket closure with a fabricated result:
+                        // reads retry once and mutations surface failover.
+                        shared.unsettled.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    };
                     let frame = match outcome {
                         Ok(result) => Frame::CallResult {
                             id,
