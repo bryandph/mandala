@@ -14,6 +14,8 @@ A blanket side-effect-free carve-out is **not clean**:
 
 Option A (retain the lease until registered owned blocking jobs finish) therefore needs to cover at least mutation/process-bearing jobs and the leader watcher's probe/reload chain. It can delay takeover by a full evaluation or survey; there is no general finite worst-case bound. Option B cannot cover the campaign bridge or all evaluator/Git work as side-effect-free. This is a decision input, not an implemented policy. Independent detached deploy supervisors must remain independent; global `shutdown_workers` is terminal/process-wide and is not a session-restart mechanism.
 
+Worker reaping below describes normal reload/timeout/final Evaluator Drop in a live parent. Cancelling an async parent does not run that Drop while the blocking closure still owns the evaluator Arc. An abruptly terminated parent cannot run Rust destructors at all: no parent-death signal/monitor is installed in Worker::spawn, and the worker notices stdin EOF between requests, so an already-running external eval may finish later. That is not claimed as automatic cancellation or rollback of already-launched external effects.
+
 ## Common result-publication boundary
 
 `MandalaHandler::call_tool_from` (`server.rs:236-276`) emits start before awaiting dispatch, then emits settle/audit and returns a result only after dispatch finishes. Inventory installation (`server.rs:404-420`) and expected-cache saving (`server.rs:606-617`) are async-parent continuations, not inside the evaluator closures. If the parent future has actually been aborted/joined before lease release, those continuations do not resume: an orphaned closure's returned value is discarded. A continuation that ran before cancellation still runs under the outer task's lease until termination.
@@ -91,7 +93,7 @@ These must not be conflated with the above merely because the same process can c
 
 ## Evidence and limits
 
-- Native opt-in blocking-work witness: 0 passed/1 failed in 0.01s, replacement factory observed one live old blocking job after outer wire termination; the test releases/finishes its owned thread before asserting. Default remains ignored and explicitly marked pending scope review.
+- Opt-in blocking-work witness: 0 passed/1 failed in 0.01s on native macOS AND on Linux using an immutable copied binary in a private user/net namespace at 32 test threads. The replacement factory observed one live old blocking job after outer wire termination; the test releases/finishes its owned thread before asserting. The fresh /tmp/lab218-impl-4 clone and its witness/root fixture were then removed. Default remains ignored and explicitly marked pending scope review.
 - Controlled Git fixture: no commit, system/global config and fsmonitor disabled; ordinary `git status --porcelain` changed `.git/index` checksum after a timestamp-only touch. Fixture removed.
 - Controlled Nix fixture, isolated HOME and canonical private NIX_REMOTE store: exact subprocess aggregate flags (`nix eval --no-warn-dirty --json <fixture>#mandala`) created `flake.lock`; no network input or fleet effect, fixture removed. Native worker Virtual lock mode was verified in source, not inferred from CLI behavior.
 - Typical duration labels above are qualitative, not benchmarks. The 600s worker setting is a response timeout, not a universal cancellation or takeover bound. No code, process or store behavior is assumed rollback-safe merely because its caller's Future was dropped.
