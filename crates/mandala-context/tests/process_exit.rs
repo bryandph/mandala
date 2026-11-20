@@ -13,13 +13,26 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+struct ParkedChild(i32);
+impl Drop for ParkedChild {
+    fn drop(&mut self) {
+        unsafe {
+            nix::libc::kill(self.0, nix::libc::SIGKILL);
+        }
+    }
+}
+
 #[test]
 fn endpoint_process() {
     let Some(root) = std::env::var_os("MANDALA_ENDPOINT_FIXTURE") else {
         return;
     };
     let root = std::path::PathBuf::from(root);
-    let identity = ContextIdentity::with_port_range(root.join("flake"), 29920, 4).unwrap();
+    let port = std::env::var("MANDALA_ENDPOINT_PORT")
+        .ok()
+        .map(|port| port.parse().unwrap())
+        .unwrap_or(29920);
+    let identity = ContextIdentity::with_port_range(root.join("flake"), port, 4).unwrap();
     let state = root.join("state");
     let options = common::options(&state);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -48,10 +61,128 @@ fn endpoint_process() {
         else {
             panic!("leader");
         };
+        if let Ok(mode) = std::env::var("MANDALA_ENDPOINT_FORK") {
+            use nix::libc;
+            let failed = mode == "failed-exec";
+            let mut ready = [0; 2];
+            assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                    if failed {
+                        libc::execl(
+                            c"/does-not-exist/context-test".as_ptr(),
+                            c"context-test".as_ptr(),
+                            std::ptr::null::<libc::c_char>(),
+                        );
+                    }
+                    libc::write(ready[1], b"!".as_ptr().cast(), 1);
+                    libc::close(ready[1]);
+                    loop {
+                        libc::pause();
+                    }
+                }
+            }
+            unsafe {
+                libc::close(ready[1]);
+            }
+            let mut ack = [0_u8];
+            assert_eq!(
+                unsafe { libc::read(ready[0], ack.as_mut_ptr().cast(), 1) },
+                1
+            );
+            unsafe {
+                libc::close(ready[0]);
+            }
+            println!("FORK {pid}");
+        }
         println!("READY");
         std::io::stdout().flush().unwrap();
         std::future::pending::<()>().await;
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serving_parent_exit_allows_replacement_while_preexec_child_remains_alive() {
+    use nix::libc;
+    common::refusal_preflight();
+    for mode in ["fork", "failed-exec"] {
+        let root =
+            std::env::temp_dir().join(format!("context-parent-{mode}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flake")).unwrap();
+        let state = root.join("state");
+        let identity = ContextIdentity::with_port_range(root.join("flake"), 29944, 4).unwrap();
+        let mut parent = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "endpoint_process", "--nocapture"])
+            .env("MANDALA_ENDPOINT_FIXTURE", &root)
+            .env("MANDALA_ENDPOINT_PORT", "29944")
+            .env("MANDALA_ENDPOINT_FORK", mode)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(parent.stdout.take().unwrap());
+        let mut fork = None;
+        loop {
+            let mut line = String::new();
+            assert!(output.read_line(&mut line).unwrap() > 0);
+            if let Some(pid) = line.strip_prefix("FORK ") {
+                fork = Some(pid.trim().parse::<i32>().unwrap());
+            }
+            if line.trim() == "READY" {
+                break;
+            }
+        }
+        let fork = fork.unwrap();
+        let _cleanup_child = ParkedChild(fork);
+        let Acquired::Follower(client) = common::acquire(&identity, &state, "before-exit", || {
+            panic!("parent excludes factory")
+        })
+        .await
+        .unwrap() else {
+            panic!("live parent must serve");
+        };
+        assert!(client.ping().await);
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(fork, 0) },
+            0,
+            "child held before successful exec"
+        );
+        let (events, _) = broadcast::channel(8);
+        let Acquired::Leader(host) = common::acquire(&identity, &state, "replacement", || {
+            HostConfig::new(
+                Arc::new(|_, _, _| Box::pin(async { Ok(json!("replacement")) })),
+                events,
+            )
+        })
+        .await
+        .unwrap() else {
+            panic!("replacement leads");
+        };
+        let d = discovery::read(&state, identity.key()).unwrap();
+        let client =
+            ContextClient::connect(d.addr().unwrap(), &d.token, "observer", identity.flake())
+                .await
+                .unwrap();
+        assert_eq!(
+            client.call("read", serde_json::Map::new()).await.unwrap(),
+            json!("replacement")
+        );
+        assert_eq!(
+            unsafe { libc::kill(fork, 0) },
+            0,
+            "child still alive while replacement serves"
+        );
+        unsafe {
+            libc::kill(fork, libc::SIGKILL);
+        }
+        host.shutdown(Duration::ZERO).await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
