@@ -29,6 +29,8 @@ Independent deploy supervisors are distinct run owners: `mandala-core/src/runner
 
 Coordinator approved task 2 onward after reviewing this trace. The checkout watcher is narrowly included as leader-owned work: retain its JoinHandle in the lease, abort and await actual termination before guard release, without changing watch semantics or cancelling independent deploy supervisors. This implements the existing factory/config/local-dispatch lifetime requirement; it is not a deviation.
 
+The coordinator also approved narrow inode-ownership bookkeeping under the same process-wide registry mutex as the keyed async-mutex map. Same-user tampering inside the mode-0700 root can otherwise redirect an open to another live lease's inode: merely rejecting and closing that descriptor silently releases its process record lock. Pre-open inode aliases now fail explicitly; a replacement found after open transfers the unexpected descriptor to the existing lease, which closes it only after releasing its original lock. No acquisition shares an existing lease. Hard-link, rename and injected open-race tests use an independent process's F_GETLK observation before and after teardown; deferred descriptors do not outlive their owner.
+
 ## Required implementation evidence
 
 Prove blocked wire calls and local calls are actually dropped/terminated before a contender obtains the released lease, including graceful-drain expiry, abrupt Drop, cancelled shutdown/acquisition and retained local snapshots. Keep listener and guards in a proven teardown ownership order. Test real process death separately with SIGKILL and fork-before-exec children; a Drop-based diagnostic is live-process connection loss, not process-death evidence.

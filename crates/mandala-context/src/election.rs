@@ -262,16 +262,25 @@ struct Key {
     inode: u64,
     identity: String,
 }
+type Inode = (u64, u64);
+#[derive(Default)]
+struct Registry {
+    mutexes: HashMap<Key, Arc<AsyncMutex<()>>>,
+    // Each entry belongs to one ElectionLease. Unexpected alias descriptors
+    // are transferred to that lease, never closed while its lock is held.
+    owned: HashMap<Inode, Vec<File>>,
+}
+fn registry() -> &'static Mutex<Registry> {
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    REGISTRY.get_or_init(Mutex::default)
+}
 fn mutex_for(key: Key) -> Arc<AsyncMutex<()>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<Key, Arc<AsyncMutex<()>>>>> = OnceLock::new();
-    let mut registry = REGISTRY
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("election registry poisoned");
+    let mut registry = registry().lock().expect("election registry poisoned");
     // Retain entries for process lifetime; removing a live weak entry is not
     // necessary and must never split one coordination identity.
     Arc::clone(
         registry
+            .mutexes
             .entry(key)
             .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
     )
@@ -281,8 +290,22 @@ fn mutex_for(key: Key) -> Arc<AsyncMutex<()>> {
 /// deliberate: close the process-lock fd before releasing same-process access.
 /// Never clone, expose, diagnostically open, unlink or replace this inode.
 pub struct ElectionLease {
-    _file: File,
+    _file: Option<File>,
     _mutex: OwnedMutexGuard<()>,
+    inode: Inode,
+}
+impl Drop for ElectionLease {
+    fn drop(&mut self) {
+        let mut registry = registry().lock().expect("election registry poisoned");
+        let deferred = registry
+            .owned
+            .remove(&self.inode)
+            .expect("registered lease inode");
+        // Serialize release with every helper open. First release this owner's
+        // record lock, then close quarantined alias fds, then the keyed mutex.
+        drop(self._file.take());
+        drop(deferred);
+    }
 }
 
 /// Nonblocking attempt. `Ok(None)` is contention, never permission to lead.
@@ -336,6 +359,15 @@ fn try_at(
     path: &Path,
     home: Option<&Path>,
 ) -> Result<Option<ElectionLease>, CoordinationError> {
+    try_at_observed(identity, path, home, || {})
+}
+
+fn try_at_observed(
+    identity: &str,
+    path: &Path,
+    home: Option<&Path>,
+    before_open: impl FnOnce(),
+) -> Result<Option<ElectionLease>, CoordinationError> {
     let root = root_at(path, home)?;
     let meta = root.dir.metadata()?;
     let mutex = mutex_for(Key {
@@ -348,6 +380,22 @@ fn try_at(
     };
     root.verify()?;
     let name = c_name(OsStr::new(&format!("{identity}.lock")))?;
+    let mut registry = registry().lock().expect("election registry poisoned");
+    match stat_at(&root.dir, &name) {
+        Ok(meta)
+            if registry
+                .owned
+                .contains_key(&(meta.st_dev as u64, meta.st_ino as u64)) =>
+        {
+            return Err(unsafe_path(
+                "lock path aliases an inode already owned by this process",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    before_open();
     // O_NONBLOCK prevents a malicious FIFO from blocking before validation.
     let file = open_at(
         root.dir.as_raw_fd(),
@@ -356,6 +404,15 @@ fn try_at(
         0o600,
     )?;
     let meta = file.metadata()?;
+    let inode = (meta.dev(), meta.ino());
+    if let Some(deferred) = registry.owned.get_mut(&inode) {
+        // Same-user replacement raced the pre-open check. Closing this fd
+        // here would silently release another live lease's F_SETLK lock.
+        deferred.push(file);
+        return Err(unsafe_path(
+            "opened lock aliases an owned inode after replacement; descriptor retained by existing lease",
+        ));
+    }
     if !lock_metadata_safe(
         meta.is_file(),
         meta.uid(),
@@ -381,9 +438,11 @@ fn try_at(
     }
     same_entry(&root.dir, &name, &file)?;
     root.verify()?;
+    registry.owned.insert(inode, Vec::new());
     Ok(Some(ElectionLease {
-        _file: file,
+        _file: Some(file),
         _mutex: guard,
+        inode,
     }))
 }
 
@@ -436,7 +495,8 @@ mod tests {
         }
         let before = std::fs::metadata(root.join("fixture.lock")).unwrap().ino();
         assert_ne!(
-            unsafe { libc::fcntl(lease._file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            unsafe { libc::fcntl(lease._file.as_ref().unwrap().as_raw_fd(), libc::F_GETFD) }
+                & libc::FD_CLOEXEC,
             0
         );
         drop(lease);
@@ -468,6 +528,115 @@ mod tests {
         std::fs::remove_file(&local).unwrap();
         std::fs::write(&local, []).unwrap();
         assert!(try_at("fixture", &root, Some(&home)).is_err());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn process_lock_probe() {
+        let Some(path) = std::env::var_os("MANDALA_PROBE_LOCK_PATH") else {
+            return;
+        };
+        let file = File::open(path).unwrap();
+        let mut record: libc::flock = unsafe { std::mem::zeroed() };
+        record.l_type = libc::F_WRLCK as _;
+        record.l_whence = libc::SEEK_SET as _;
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut record) },
+            -1
+        );
+        let held = std::env::var("MANDALA_PROBE_LOCK_HELD").unwrap() == "true";
+        assert_eq!(record.l_type != libc::F_UNLCK as libc::c_short, held);
+        if held {
+            assert!(record.l_pid > 0);
+        }
+    }
+
+    fn probe_lock(path: &Path, held: bool) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "election::tests::process_lock_probe",
+                "--nocapture",
+            ])
+            .env("MANDALA_PROBE_LOCK_PATH", path)
+            .env("MANDALA_PROBE_LOCK_HELD", held.to_string())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "independent process observes record lock held={held}"
+        );
+    }
+
+    #[test]
+    fn owned_inode_hardlink_and_rename_aliases_never_release_original_lock() {
+        for rename in [false, true] {
+            let home = home(if rename {
+                "rename-alias"
+            } else {
+                "hardlink-alias"
+            });
+            let root = home.join("coordination");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            let lease = try_at("first", &root, None).unwrap().unwrap();
+            let first = root.join("first.lock");
+            let second = root.join("second.lock");
+            if rename {
+                std::fs::rename(&first, &second).unwrap();
+            } else {
+                std::fs::hard_link(&first, &second).unwrap();
+            }
+            assert!(matches!(
+                try_at("second", &root, None),
+                Err(CoordinationError::Unsafe(_))
+            ));
+            probe_lock(&second, true);
+            drop(lease);
+            probe_lock(&second, false);
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn post_open_alias_race_defers_close_until_original_owner_releases() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let home = home("deferred-alias");
+        let root = home.join("coordination");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let lease = try_at("first", &root, None).unwrap().unwrap();
+        let first = root.join("first.lock");
+        let second = root.join("second.lock");
+        File::options()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&second)
+            .unwrap();
+        let result = try_at_observed("second", &root, None, || {
+            std::fs::rename(&second, root.join("old-second")).unwrap();
+            std::fs::rename(&first, &second).unwrap();
+        });
+        assert!(matches!(result, Err(CoordinationError::Unsafe(_))));
+        let deferred = {
+            let registry = registry().lock().unwrap();
+            let files = registry.owned.get(&lease.inode).unwrap();
+            assert_eq!(files.len(), 1);
+            files[0].as_raw_fd()
+        };
+        probe_lock(&second, true);
+        drop(lease);
+        assert_eq!(
+            unsafe { libc::fcntl(deferred, libc::F_GETFD) },
+            -1,
+            "deferred fd cannot outlive its owner"
+        );
+        probe_lock(&second, false);
         std::fs::remove_dir_all(home).unwrap();
     }
 
