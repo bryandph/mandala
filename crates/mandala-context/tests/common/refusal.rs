@@ -1,12 +1,12 @@
 //! Test-only loopback environment check; production busy rules are untouched.
 use std::io;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::Once;
 use std::time::Duration;
 
 /// Require three actual refused connections within a fixed sample budget.
-/// A successful connect is not a refusal: that released port became occupied
-/// (or a pre-exec child retained its temporary listener), so choose another.
+/// A successful connect is not a refusal: that candidate port is occupied,
+/// so choose another. The preflight never creates a listening socket itself.
 /// A timeout or any other error fails immediately; it is never skipped.
 pub(crate) fn collect_refusals(mut probe: impl FnMut() -> io::Result<()>) -> Result<(), String> {
     let mut refused = 0;
@@ -26,16 +26,20 @@ pub(crate) fn collect_refusals(mut probe: impl FnMut() -> io::Result<()>) -> Res
             }
         }
     }
-    Err("could not obtain three refusal samples in 12 attempts: released test ports became occupied; no successful connection counts as a passing sample".into())
+    Err("could not obtain three refusal samples in 12 attempts: test-probe ports were occupied; no successful connection counts as a passing sample".into())
 }
 
 pub fn refusal_preflight() {
     static CHECK: Once = Once::new();
     CHECK.call_once(|| {
+        // Dedicated probe range: outside production/context fixture ports and
+        // below Linux/macOS ephemeral allocations. Do not briefly LISTEN to
+        // select a port: children can inherit that listener, and WSL can treat
+        // recently-listening/ephemeral ports differently from unused test ports.
+        let mut offset = u16::try_from(std::process::id() % 1024).expect("probe offset fits");
         let result = collect_refusals(|| {
-            let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-            let addr = reserved.local_addr()?;
-            drop(reserved);
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 30000 + offset));
+            offset = (offset + 1) % 1024;
             TcpStream::connect_timeout(&addr, Duration::from_millis(500))
                 .map(drop)
                 .map_err(|e| io::Error::new(e.kind(), format!("{addr}: {e}")))
