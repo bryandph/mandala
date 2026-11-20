@@ -27,6 +27,10 @@ pub mod host;
 pub mod identity;
 pub mod protocol;
 
+#[cfg(test)]
+#[path = "../tests/common/refusal.rs"]
+mod test_refusal;
+
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};

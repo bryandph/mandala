@@ -83,16 +83,12 @@ fn scratch_tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path
     (flake, state, aggregate)
 }
 
+#[path = "../../mandala-context/tests/common/refusal.rs"]
+mod test_refusal;
+
 fn coordination_root(state: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::DirBuilderExt;
-    static CHECK: std::sync::Once = std::sync::Once::new();
-    CHECK.call_once(|| {
-        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
-        reserved.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
-        let addr = reserved.local_addr().unwrap();
-        let result = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500));
-        assert!(matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused), "LAB-206 loopback-refusal preflight: {result:?}; use a private loopback netns with lo up on WSL");
-    });
+    test_refusal::refusal_preflight();
     let root = state.join("context-election-test");
     std::fs::create_dir_all(state).unwrap();
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {

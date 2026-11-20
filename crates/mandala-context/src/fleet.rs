@@ -471,18 +471,47 @@ mod lease_tests {
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn refusal_preflight_requires_three_refusals_and_never_skips_timeouts() {
+        let mut calls = 0;
+        let result = crate::test_refusal::collect_refusals(|| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::ConnectionRefused.into())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 4, "occupied sample did not count as refused");
+        let mut calls = 0;
+        let result = crate::test_refusal::collect_refusals(|| {
+            calls += 1;
+            Err(std::io::ErrorKind::TimedOut.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "timeout fails immediately");
+        let mut calls = 0;
+        let result = crate::test_refusal::collect_refusals(|| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls, 12,
+            "occupied samples cannot produce success or unbounded retries"
+        );
+        assert!(
+            crate::test_refusal::collect_refusals(|| Err(
+                std::io::ErrorKind::PermissionDenied.into()
+            ))
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn retained_local_snapshot_cannot_invoke_config_after_shutdown() {
-        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
-        reserved
-            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
-            .unwrap();
-        let addr = reserved.local_addr().unwrap();
-        let refused = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500));
-        assert!(
-            matches!(refused, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
-            "LAB-206: loopback must refuse; use private netns with lo up on WSL: {refused:?}"
-        );
+        crate::test_refusal::refusal_preflight();
         let root = std::env::temp_dir().join(format!("context-snapshot-{}", std::process::id()));
         std::fs::create_dir_all(root.join("flake")).unwrap();
         let coordination = root.join("coordination");

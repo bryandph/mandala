@@ -4,11 +4,10 @@ use mandala_context::{
     AcquireError, AcquireOptions, Acquired, ContextIdentity, ContextSession, HostConfig,
     HostConfigFactory,
 };
-use std::net::{Ipv4Addr, TcpStream};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
-use std::time::Duration;
+mod refusal;
+pub use refusal::refusal_preflight;
 
 /// Test fixture provisioning only: injected roots are made by tests, never acquisition.
 pub fn options(state: &Path) -> AcquireOptions {
@@ -44,25 +43,4 @@ pub async fn session_acquire(
     let state = state.into();
     let options = options(&state);
     ContextSession::acquire_with_options(identity, state, name, config, options).await
-}
-
-/// LAB-206: a dead endpoint must refuse, not silently blackhole connects.
-/// Run once per integration-test process, before any election assertion.
-pub fn refusal_preflight() {
-    static CHECK: Once = Once::new();
-    CHECK.call_once(|| {
-        for _ in 0..3 {
-            // Bind without LISTEN and retain the reservation during probing.
-            // Dropping a temporary listener permits port reuse, and a forked
-            // pre-exec child can briefly retain its inherited LISTEN socket.
-            let reserved = tokio::net::TcpSocket::new_v4().expect("reserve test socket");
-            reserved.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("reserve non-listening test port");
-            let addr = reserved.local_addr().unwrap();
-            let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
-            assert!(
-                matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
-                "LAB-206 loopback-refusal preflight: unused {addr} must refuse, not timeout: {result:?}. On WSL run an immutable prebuilt test binary in `unshare --user --map-root-user --net` with `ip link set lo up`; use isolated HOME/state/runtime and injected coordination roots. Production busy-leader handling is unchanged."
-            );
-        }
-    });
 }
