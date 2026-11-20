@@ -37,6 +37,8 @@ For canonical path flakes, the coordinator also confirmed that every MCP acquisi
 
 Inherited socket handling is on hold for an operator decision: see [fork-audit.md](fork-audit.md). No atfork code is implemented. The original stronger serving-child witness is preserved as ignored evidence; a separate active characterization proves bounded LeaderBusy with zero factories while the child is parked, followed by one authenticated replacement after exec or exit.
 
+The coordinator lifted the flake exclusion for exactly one build-policy attribute, `__darwinAllowLocalNetworking = true` in mandala-rs. Native Darwin sandbox denied loopback bind with EPERM, which the previous effectful standalone fallback could mask during MCP initialization. This attribute permits isolated loopback tests within an otherwise enabled sandbox; no flake.lock or CI change is authorized. Both explicitly sandboxed and normal Mac builds are required, and Linux sandbox build remains the CI authority.
+
 ## Required implementation evidence
 
 Prove blocked wire calls and local calls are actually dropped/terminated before a contender obtains the released lease, including graceful-drain expiry, abrupt Drop, cancelled shutdown/acquisition and retained local snapshots. Keep listener and guards in a proven teardown ownership order. Test real process death separately with SIGKILL and fork-before-exec children; a Drop-based diagnostic is live-process connection loss, not process-death evidence.

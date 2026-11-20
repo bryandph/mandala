@@ -43,7 +43,7 @@ These are checkpoint results, not final qualification after future socket-owners
 - All-target workspace clippy with `-D warnings` passed at the latest checkpoint.
 - `nix fmt -- --check .` passed (64 files).
 - Full workspace testing exposed the unresolved actual-serving-child listener inheritance test; it is not a passing workspace gate.
-- The first explicitly sandboxed macOS Nix build failed three stdio discovery assertions while handshakes succeeded. Improved fixture stderr diagnostics are committed; a diagnostic rerun is in progress. This is not claimed as a passing sandbox build.
+- The first explicitly sandboxed macOS Nix build failed three stdio discovery assertions while handshakes succeeded. The diagnostic rerun's refusal preflight identified `bind(127.0.0.1:0)` returning EPERM under Darwin sandbox, before any root resolution: not a HOME/injection failure. The old generic standalone fallback masked the bind error for protocol handshakes, so those apparent successes did not prove a context existed; no full baseline sandbox pass is claimed. The coordinator authorized exactly `__darwinAllowLocalNetworking = true` on mandala-rs (no other flake/CI/input change), allowing honest sandboxed loopback tests. Sandboxed and normal Mac builds must now both be rerun, with the Linux sandbox build remaining CI authority.
 
 ## Explicit coverage limits and remaining gates
 
