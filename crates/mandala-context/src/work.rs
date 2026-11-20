@@ -2,11 +2,13 @@
 //! registered jobs retain the lease until their function/captures are destroyed.
 //! Only the two audited read-only registry snapshots may use the carve-out.
 use crate::election::ElectionLease;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 
@@ -29,6 +31,65 @@ impl std::error::Error for BlockingError {}
 
 struct LeaseLifetime {
     _lease: Option<ElectionLease>,
+    identity: Option<String>,
+    retirement_started: Mutex<Option<Instant>>,
+}
+impl LeaseLifetime {
+    fn observe_retirement(
+        &self,
+        running: usize,
+        queued: usize,
+        kinds: BTreeMap<&'static str, (usize, usize)>,
+    ) {
+        let Some(identity) = &self.identity else {
+            return;
+        };
+        let first = {
+            let mut started = self
+                .retirement_started
+                .lock()
+                .expect("retirement log state poisoned");
+            if started.is_some() {
+                false
+            } else {
+                *started = Some(Instant::now());
+                true
+            }
+        };
+        if first {
+            let kinds = kinds
+                .into_iter()
+                .map(|(kind, (running, queued))| {
+                    format!("{kind}(running={running}, queued={queued})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Diagnostics must not turn a closed stderr into a teardown panic.
+            let _ = writeln!(
+                std::io::stderr(),
+                "mandala context: retirement pending identity={identity} registered_running={running} registered_queued={queued} kinds=[{kinds}]; both guards retained"
+            );
+        }
+    }
+}
+impl Drop for LeaseLifetime {
+    fn drop(&mut self) {
+        let started = self
+            .retirement_started
+            .get_mut()
+            .expect("retirement log state poisoned")
+            .take();
+        // Drop the entire ElectionLease, including its keyed mutex guard,
+        // before reporting release rather than merely reporting an empty map.
+        drop(self._lease.take());
+        if let (Some(identity), Some(started)) = (&self.identity, started) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "mandala context: retirement guards released identity={identity} waited_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
+    }
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -36,6 +97,7 @@ enum Phase {
     Running,
 }
 struct Entry {
+    kind: &'static str,
     phase: Phase,
     abort: Option<AbortHandle>,
 }
@@ -65,7 +127,12 @@ pub(crate) struct WorkOwner {
 }
 impl WorkOwner {
     pub(crate) fn new(lease: Option<ElectionLease>) -> Self {
-        let lifetime = Arc::new(LeaseLifetime { _lease: lease });
+        let identity = lease.as_ref().map(|lease| lease.identity_key().to_owned());
+        let lifetime = Arc::new(LeaseLifetime {
+            _lease: lease,
+            identity,
+            retirement_started: Mutex::new(None),
+        });
         let scope = BlockingScope {
             inner: Arc::new(Inner {
                 state: Mutex::default(),
@@ -88,6 +155,7 @@ impl WorkOwner {
 impl Drop for WorkOwner {
     fn drop(&mut self) {
         self.scope.close();
+        self.scope.observe_retirement();
     }
 }
 
@@ -172,7 +240,36 @@ impl BlockingScope {
             .expect("blocking registry poisoned")
             .closing
     }
+    fn observe_retirement(&self) {
+        let (running, queued, kinds) = {
+            let state = self.inner.state.lock().expect("blocking registry poisoned");
+            if !state.closing || state.jobs.is_empty() {
+                return;
+            }
+            let mut running = 0;
+            let mut queued = 0;
+            let mut kinds = BTreeMap::<&'static str, (usize, usize)>::new();
+            for entry in state.jobs.values() {
+                let counts = kinds.entry(entry.kind).or_default();
+                match entry.phase {
+                    Phase::Running => {
+                        running += 1;
+                        counts.0 += 1;
+                    }
+                    Phase::Queued => {
+                        queued += 1;
+                        counts.1 += 1;
+                    }
+                }
+            }
+            (running, queued, kinds)
+        };
+        if let Some(lease) = self.inner.lease.upgrade() {
+            lease.observe_retirement(running, queued, kinds);
+        }
+    }
     pub(crate) async fn wait(&self) {
+        self.observe_retirement();
         loop {
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
@@ -213,6 +310,12 @@ impl BlockingScope {
             state.jobs.insert(
                 id,
                 Entry {
+                    // A static closure/function path identifies the operation
+                    // without logging arguments, credentials or mutable state.
+                    kind: std::any::type_name::<F>()
+                        .split("::{{closure}}")
+                        .next()
+                        .expect("function type name"),
                     phase: Phase::Queued,
                     abort: None,
                 },

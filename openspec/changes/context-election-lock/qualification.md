@@ -1,6 +1,6 @@
 # Final implementation qualification and operator handoff
 
-Qualified code: `9d12e6584874d623080381fafc294f4f4f03ef58`. Later handoff commits change documentation/checklist only. Tasks through 6.2 are complete under the explicit operator amendments and baseline exception below; 6.3 remains the operator's separate rollout decision. No PR, merge, rollout, live coordination/state mutation or restart was performed.
+Full qualification snapshot: `9d12e6584874d623080381fafc294f4f4f03ef58`. A final review follow-up adds observability only: identity/count/kind when retirement waits, and elapsed wait after both guards are actually released. Its native mandala-context suites (70 passes), workspace clippy `-D warnings` and fmt were rechecked; targeted stderr validation confirms both diagnostics (`/tmp/lab218-retirement-observability*.log`). The coordinator performs the final Mac build/PR CI after that small follow-up; package results below identify the full qualification snapshot. Tasks through 6.2 are complete under the explicit operator amendments and baseline exception below; 6.3 remains the operator's separate rollout decision. No PR, merge, rollout, live coordination/state mutation or restart was performed.
 
 ## Approved decisions, not hidden deviations
 

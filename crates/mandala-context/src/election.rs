@@ -390,6 +390,12 @@ pub struct ElectionLease {
     _file: Option<File>,
     _mutex: OwnedMutexGuard<()>,
     inode: Inode,
+    identity: String,
+}
+impl ElectionLease {
+    pub(crate) fn identity_key(&self) -> &str {
+        &self.identity
+    }
 }
 impl Drop for ElectionLease {
     fn drop(&mut self) {
@@ -536,6 +542,7 @@ fn try_at_observed(
         _file: Some(file),
         _mutex: guard,
         inode,
+        identity: identity.to_owned(),
     }))
 }
 
