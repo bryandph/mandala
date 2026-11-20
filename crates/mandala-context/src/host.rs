@@ -42,7 +42,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::discovery::{self, Discovery};
 use crate::protocol::{Frame, PROTOCOL_VERSION, UNAUTHORIZED};
@@ -142,6 +142,13 @@ struct HostShared {
     // Every task that can invoke config retains this shared owner; its final
     // drop cannot precede task termination or the owner's listener closure.
     _lease: Option<crate::election::ElectionLease>,
+}
+
+struct AbortOnDrop(AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct ActiveCall(Arc<HostShared>);
@@ -526,6 +533,11 @@ async fn serve_conn(stream: TcpStream, shared: Arc<HostShared>) {
             }
         })
     };
+
+    // If owner teardown cancels this connection while a peer has stopped
+    // reading, cancel its writer too. The writer retains the shared lease
+    // until its write future/stream have actually been destroyed.
+    let _writer_abort = AbortOnDrop(writer.abort_handle());
 
     // Bearer auth before anything else is served (fleet-context spec). The
     // rejection carries our flake so a colliding context's probe can move on.
