@@ -39,6 +39,14 @@ Inherited socket handling is on hold for an operator decision: see [fork-audit.m
 
 The coordinator lifted the flake exclusion for exactly one build-policy attribute, `__darwinAllowLocalNetworking = true` in mandala-rs. Native Darwin sandbox denied loopback bind with EPERM, which the previous effectful standalone fallback could mask during MCP initialization. This attribute permits isolated loopback tests within an otherwise enabled sandbox; no flake.lock or CI change is authorized. Both explicitly sandboxed and normal Mac builds are required, and Linux sandbox build remains the CI authority.
 
+## Additional blocking-work scope gate
+
+Production MCP effects start blocking-pool work in `effects.rs:234,255,279` (evaluator reload/evaluation and repository revision); `server.rs:741,1123` likewise starts blocking registry/snapshot work. Tokio cannot abort an already-started spawn_blocking closure merely by aborting and joining its async parent. Those closures capture their evaluator/work state, not the current election lease. The tracked async future and sockets can therefore stop while inner work remains active.
+
+The isolated opt-in witness `blocking_work::blocking_job_must_finish_before_a_replacement_factory_runs` confirms this: the old wire call terminates, a replacement factory observes one old blocking job still live (required zero), then the fixture releases and finishes its blocking thread before failing the assertion. Native result: 0 passed, 1 failed, 0.01s. It is ignored by default as explicit pending-review evidence, not claimed as passing.
+
+This is escalated under the spec's broader-cancellation-review rule. A narrow lease-retention/owned-blocking-work registration mechanism is the recommended next review direction: the guard must stay retained until owned work actually ends, with safe unavailability if it cannot stop. The exact bounded frontend/evaluator teardown policy needs review before implementation. The existing global shutdown_workers latch is terminal/process-wide and cannot simply be used for an in-process session restart or independent flake. Independent detached deploy supervisors remain excluded. Whether any already-launched work falls outside the guard contract requires an explicit decision, not an assumed carve-out. Tasks 3.6 and 4.4 are reopened as partial; no new cancellation/evaluator internals were changed.
+
 ## Required implementation evidence
 
 Prove blocked wire calls and local calls are actually dropped/terminated before a contender obtains the released lease, including graceful-drain expiry, abrupt Drop, cancelled shutdown/acquisition and retained local snapshots. Keep listener and guards in a proven teardown ownership order. Test real process death separately with SIGKILL and fork-before-exec children; a Drop-based diagnostic is live-process connection loss, not process-death evidence.
