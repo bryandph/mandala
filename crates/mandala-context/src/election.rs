@@ -237,7 +237,7 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
         let meta = child.metadata()?;
         let is_root = walked == path;
         let private = create_below.is_some_and(|home| walked.starts_with(home));
-        let owner_ok = meta.uid() == uid || (!private && !is_root && meta.uid() == system_uid);
+        let owner_ok = directory_owner_safe(meta.uid(), uid, system_uid, private, is_root);
         let sticky_system =
             !private && !is_root && meta.uid() == system_uid && meta.mode() & 0o1000 != 0;
         if !meta.is_dir()
@@ -263,6 +263,10 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
     root.verify()?;
     verify_filesystem(&root.dir)?;
     Ok(root)
+}
+
+fn directory_owner_safe(owner: u32, current: u32, system: u32, private: bool, root: bool) -> bool {
+    owner == current || (!private && !root && owner == system)
 }
 
 // Values from Linux include/uapi/linux/magic.h. Prefer libc's exported
@@ -758,6 +762,11 @@ mod tests {
     fn foreign_metadata_and_unsupported_lock_errors_fail_closed() {
         // Synthetic ownership validation: no privilege or live chown fixture.
         // Native foreign-owner inode coverage requires a privileged fixture.
+        assert!(!directory_owner_safe(1001, 1000, 0, false, false));
+        assert!(!directory_owner_safe(0, 1000, 0, true, false));
+        assert!(!directory_owner_safe(0, 1000, 0, false, true));
+        assert!(directory_owner_safe(0, 1000, 0, false, false));
+        assert!(directory_owner_safe(1000, 1000, 0, true, true));
         assert!(!lock_metadata_safe(true, 1001, 1000, 0o600, 1));
         assert!(!lock_metadata_safe(true, 1000, 1000, 0o600, 2));
         assert!(lock_metadata_safe(true, 1000, 1000, 0o600, 1));

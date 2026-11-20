@@ -128,6 +128,29 @@ fn inode_is_persistent_and_lock_file_private() {
 }
 
 #[test]
+fn lock_contents_are_unchanged_and_never_ownership_metadata() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (path, id, options) = fixture("contents");
+    let file = lock_path(&id, &options);
+    let bytes = br#"{"pid":1,"token":"not-authority","leader":true}"#;
+    {
+        let mut setup = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&file)
+            .unwrap();
+        setup.write_all(bytes).unwrap();
+    }
+    let lease = election::try_acquire(&id, &options).unwrap().unwrap();
+    assert!(election::try_acquire(&id, &options).unwrap().is_none());
+    drop(lease);
+    // Never diagnostically open/read/close this inode while its lease is held.
+    assert_eq!(std::fs::read(file).unwrap(), bytes);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn unsafe_roots_and_lock_files_fail_closed() {
     let (path, id, options) = fixture("security");
     let missing = path.join("missing");

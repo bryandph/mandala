@@ -152,6 +152,12 @@ async fn token_rotation_cuts_old_connects_not_live_connections() {
     };
     let before = discovery::read(&state, identity.key()).unwrap();
     let addr = before.addr().unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let lock_path = common::options(&state)
+        .coordination_root
+        .unwrap()
+        .join(format!("{}.lock", identity.key()));
+    let inode_before = std::fs::symlink_metadata(&lock_path).unwrap();
 
     // Authenticated BEFORE the rotation — must survive it.
     let veteran = ContextClient::connect(addr, &before.token, "veteran", identity.flake())
@@ -167,6 +173,12 @@ async fn token_rotation_cuts_old_connects_not_live_connections() {
     assert_eq!(after.url, before.url);
     assert_eq!(after.pid, before.pid);
     assert_eq!(after.flake, before.flake);
+    let inode_after = std::fs::symlink_metadata(&lock_path).unwrap();
+    assert_eq!(
+        (inode_before.dev(), inode_before.ino()),
+        (inode_after.dev(), inode_after.ino()),
+        "rotation never replaces the rendezvous inode"
+    );
 
     // Old token: cut off at the next connect, with the structured rejection.
     match ContextClient::connect(addr, &before.token, "stale", identity.flake()).await {
@@ -195,6 +207,12 @@ async fn token_rotation_cuts_old_connects_not_live_connections() {
         .await
         .unwrap();
     assert!(matches!(acquired, Acquired::Follower(_)));
+    host.shutdown(Duration::ZERO).await;
+    assert_eq!(
+        inode_before.ino(),
+        std::fs::symlink_metadata(lock_path).unwrap().ino(),
+        "shutdown retains rendezvous inode"
+    );
 }
 
 // ---- 2.1: connect-probe is the only liveness judgement ----------------------

@@ -44,6 +44,19 @@ impl Drop for ParkedChild {
 }
 
 #[test]
+fn parked_after_exec() {
+    if std::env::var_os("MANDALA_ENDPOINT_WAIT_EXEC").is_some() {
+        // Self-exec keeps this fixture hermetic in Nix sandboxes, where
+        // /bin/sleep need not exist. It has no context config or socket.
+        loop {
+            unsafe {
+                nix::libc::pause();
+            }
+        }
+    }
+}
+
+#[test]
 fn endpoint_process() {
     let Some(root) = std::env::var_os("MANDALA_ENDPOINT_FIXTURE") else {
         return;
@@ -86,6 +99,17 @@ fn endpoint_process() {
             use nix::libc;
             let failed = mode == "failed-exec";
             let wait_for_exec = std::env::var_os("MANDALA_ENDPOINT_WAIT_EXEC").is_some();
+            use std::os::unix::ffi::OsStrExt;
+            let executable =
+                std::ffi::CString::new(std::env::current_exe().unwrap().as_os_str().as_bytes())
+                    .unwrap();
+            let exec_argv = [
+                executable.as_ptr(),
+                c"--exact".as_ptr(),
+                c"parked_after_exec".as_ptr(),
+                c"--nocapture".as_ptr(),
+                std::ptr::null(),
+            ];
             let mut ready = [0; 2];
             assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
             let pid = unsafe { libc::fork() };
@@ -107,12 +131,7 @@ fn endpoint_process() {
                         let mut action = [0_u8];
                         libc::read(libc::STDIN_FILENO, action.as_mut_ptr().cast(), 1);
                         if action[0] == b'e' {
-                            libc::execl(
-                                c"/bin/sleep".as_ptr(),
-                                c"sleep".as_ptr(),
-                                c"60".as_ptr(),
-                                std::ptr::null::<libc::c_char>(),
-                            );
+                            libc::execv(executable.as_ptr(), exec_argv.as_ptr());
                         }
                         libc::_exit(0);
                     }

@@ -99,10 +99,10 @@ fn io_and_busy_failures_initialize_then_refuse_every_tool_without_effects() {
         let (tx, output) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    if tx.send(value).is_err() {
-                        break;
-                    }
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && tx.send(value).is_err()
+                {
+                    break;
                 }
             }
         });
