@@ -1,4 +1,5 @@
-//! LAB-218 diagnosis-only, deliberately failing, opt-in regression.
+//! LAB-218 serialized disappearing-occupant regression and abrupt stress.
+//! The deliberately failing original is retained in diagnostic commit 130c29b.
 //!
 //! A disappearing foreign port occupant invalidates a contender's completed
 //! scan. The contenders then hold TWO listening endpoints for the SAME flake.
@@ -35,11 +36,11 @@ fn config(label: &'static str) -> HostConfig {
         dispatch: Arc::new(move |_, _, _| Box::pin(async move { Ok(json!({"served_by": label})) })),
         events,
         heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+        background_tasks: Arc::default(),
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "LAB-218: deliberately failing diagnosis-only split-brain regression"]
 async fn disappearing_foreign_occupant_invalidates_completed_scan() {
     tokio::time::timeout(Duration::from_secs(10), reproduce())
         .await
@@ -71,9 +72,8 @@ async fn stress_abrupt_promotion() {
     for trial in 0..trials {
         let entered = Arc::new(AtomicUsize::new(0));
         let dispatch_entered = entered.clone();
-        // RunningHost::drop does not cancel dispatched futures. Keep them
-        // blocked through failover, then release them to avoid accumulating
-        // a pending task per old call across stress trials.
+        // Calls are blocked through abrupt host loss; tracked teardown must
+        // actually terminate them before the replacement can lead.
         let finish_old = Arc::new(Notify::new());
         let dispatch_finish = finish_old.clone();
         let mut original = config("original");
@@ -163,6 +163,33 @@ async fn stress_abrupt_promotion() {
             }
         }
         assert_eq!(count, 1, "trial={trial}: exactly one abrupt promotion");
+        assert!(
+            results.iter().all(|result| result == &results[0]),
+            "trial={trial}: common dispatch results"
+        );
+        let d = discovery::read(&state, identity.key()).unwrap();
+        let mut endpoints = 0;
+        for port in identity.ports() {
+            if let Ok(client) = ContextClient::connect(
+                (Ipv4Addr::LOCALHOST, port).into(),
+                &d.token,
+                "stress-observer",
+                identity.flake(),
+            )
+            .await
+            {
+                endpoints += 1;
+                assert_eq!(
+                    client.call("read", serde_json::Map::new()).await.unwrap(),
+                    results[0],
+                    "trial={trial}: wire/local dispatch agree"
+                );
+            }
+        }
+        assert_eq!(
+            endpoints, 1,
+            "trial={trial}: exactly one authenticated serving endpoint"
+        );
         for session in sessions {
             session.shutdown(Duration::ZERO).await;
         }
@@ -186,16 +213,13 @@ async fn reproduce() {
     let flake = root.join("flake");
     let state = root.join("state");
     std::fs::create_dir_all(&flake).unwrap();
+    let options = common::options(&state);
     let identity = ContextIdentity::with_port_range(&flake, 29800, 3).unwrap();
     let ports: Vec<_> = identity.ports().collect();
-
-    // p0 is a genuinely foreign context; p1 is free; p2 is a foreign
-    // protocol sentinel that pauses only the slow contender's scan.
-    let first = TcpListener::bind((Ipv4Addr::LOCALHOST, ports[0]))
-        .await
-        .unwrap();
     let foreign = RunningHost::start(
-        first,
+        TcpListener::bind((Ipv4Addr::LOCALHOST, ports[0]))
+            .await
+            .unwrap(),
         discovery::mint_token(),
         "/foreign/checkout".into(),
         config("foreign"),
@@ -221,12 +245,10 @@ async fn reproduce() {
                     scanned.notify_one();
                     release.notified().await;
                 }
-                w.write_all(b"{\"type\":\"error\",\"error\":\"unauthorized\",\"flake\":\"/foreign/sentinel\"}\n").await.unwrap();
+                let _ = w.write_all(b"{\"type\":\"error\",\"error\":\"unauthorized\",\"flake\":\"/foreign/sentinel\"}\n").await;
             });
         }
     });
-
-    // Reuse one token, as in real promotion. Never access the user's state.
     let token = discovery::mint_token();
     discovery::write(
         &state,
@@ -241,62 +263,81 @@ async fn reproduce() {
     .unwrap();
     let slow_id = identity.clone();
     let slow_state = state.clone();
+    let slow_options = options.clone();
     let slow = tokio::spawn(async move {
-        acquire(&slow_id, &slow_state, "slow-contender", || config("slow"))
-            .await
-            .unwrap()
+        mandala_context::acquire_with_options(
+            &slow_id,
+            &slow_state,
+            "slow-contender",
+            slow_options,
+            || config("slow"),
+        )
+        .await
+        .unwrap()
     });
     scanned.notified().await;
-
-    // Slow has already observed p1 free. Fast completes its scan and wins p1.
-    let fast = acquire(&identity, &state, "fast-contender", || config("fast"))
+    assert!(
+        mandala_context::election::try_acquire(&identity, &options)
+            .unwrap()
+            .is_none(),
+        "slow owns both guards while gated"
+    );
+    let attempted = Arc::new(Notify::new());
+    let mut fast_options = options.clone();
+    fast_options.election_attempt = Some(attempted.clone());
+    let fast_id = identity.clone();
+    let fast_state = state.clone();
+    let fast = tokio::spawn(async move {
+        mandala_context::acquire_with_options(
+            &fast_id,
+            &fast_state,
+            "fast-contender",
+            fast_options,
+            || panic!("loser factory must not run"),
+        )
         .await
-        .unwrap();
-    let Acquired::Leader(fast) = fast else {
-        panic!("fast must lead")
-    };
-    assert_eq!(fast.port(), ports[1]);
-
-    // The unrelated context exits. Wait until its accept task really drops
-    // the listener, then allow slow to finish its now-stale full scan.
-    drop(foreign);
-    loop {
-        if let Ok(check) = TcpListener::bind((Ipv4Addr::LOCALHOST, ports[0])).await {
-            drop(check);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+        .unwrap()
+    });
+    attempted.notified().await;
+    assert!(
+        !fast.is_finished(),
+        "fast actually attempted acquisition and remains a candidate"
+    );
+    foreign.shutdown(Duration::ZERO).await;
     release.notify_one();
-    let slow = slow.await.unwrap();
-    let mut leaders = vec![fast];
-    if let Acquired::Leader(host) = slow {
-        leaders.push(host);
-    }
-
-    // Not merely stale is_leader(): both retained handles own distinct live
-    // listeners, authenticate the SAME flake/token, and execute wire calls.
-    for host in &leaders {
-        let client = ContextClient::connect(
-            (Ipv4Addr::LOCALHOST, host.port()).into(),
+    let Acquired::Leader(slow) = slow.await.unwrap() else {
+        panic!("slow must lead");
+    };
+    let Acquired::Follower(fast) = fast.await.unwrap() else {
+        panic!("fast must join slow");
+    };
+    assert_eq!(
+        fast.call("read", serde_json::Map::new()).await.unwrap()["served_by"],
+        "slow"
+    );
+    let mut endpoints = 0;
+    for port in identity.ports() {
+        if let Ok(client) = ContextClient::connect(
+            (Ipv4Addr::LOCALHOST, port).into(),
             &token,
-            "diagnostic-observer",
+            "observer",
             identity.flake(),
         )
         .await
-        .unwrap();
-        let value = client.call("read", serde_json::Map::new()).await.unwrap();
-        eprintln!(
-            "LAB-218 live leader: port={}, flake={}, result={value}",
-            host.port(),
-            client.server_flake
-        );
+        {
+            endpoints += 1;
+            assert_eq!(
+                client.call("read", serde_json::Map::new()).await.unwrap()["served_by"],
+                "slow"
+            );
+        }
     }
-    let live_ports: Vec<_> = leaders.iter().map(RunningHost::port).collect();
-    sentinel_task.abort();
     assert_eq!(
-        leaders.len(),
-        1,
-        "LAB-218: two genuinely live leaders on ports {live_ports:?}"
+        endpoints, 1,
+        "exactly one authenticated wire-serving endpoint"
     );
+    slow.shutdown(Duration::ZERO).await;
+    sentinel_task.abort();
+    let _ = sentinel_task.await;
+    std::fs::remove_dir_all(root).unwrap();
 }

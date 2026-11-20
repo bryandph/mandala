@@ -22,6 +22,7 @@ pub fn options(state: &Path) -> AcquireOptions {
     }
     AcquireOptions {
         coordination_root: Some(std::fs::canonicalize(root).unwrap()),
+        ..AcquireOptions::default()
     }
 }
 

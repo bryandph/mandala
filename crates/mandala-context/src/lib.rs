@@ -21,8 +21,8 @@
 
 pub mod client;
 pub mod discovery;
-pub mod fleet;
 pub mod election;
+pub mod fleet;
 pub mod host;
 pub mod identity;
 pub mod protocol;
@@ -47,6 +47,10 @@ pub struct AcquireOptions {
     /// private; acquisition never creates an injected root. `None` uses the
     /// stable account-home default, independently of client state overrides.
     pub coordination_root: Option<PathBuf>,
+    /// Test observer fired immediately after a genuine guard attempt. It does
+    /// not gate production acquisition or change election decisions.
+    #[doc(hidden)]
+    pub election_attempt: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// How the process joined the context.
@@ -73,6 +77,10 @@ pub enum AcquireError {
     /// window: the leader is alive but wedged. The caller degrades to
     /// standalone — it must NOT claim a second leadership for the checkout.
     LeaderBusy,
+    /// The shared acquisition budget expired while another owner held coordination.
+    CoordinationBusy,
+    /// Unsafe/unavailable root or unsupported record locking: fail closed.
+    CoordinationUnavailable(election::CoordinationError),
 }
 
 impl From<io::Error> for AcquireError {
@@ -92,6 +100,11 @@ impl std::fmt::Display for AcquireError {
                     "live leader rejected our token and discovery never refreshed"
                 )
             }
+            Self::CoordinationBusy => write!(
+                f,
+                "context coordination busy/unavailable within acquisition deadline"
+            ),
+            Self::CoordinationUnavailable(e) => write!(f, "{e}"),
             Self::LeaderBusy => {
                 write!(
                     f,
@@ -151,7 +164,88 @@ pub async fn acquire_with_options(
     identity: &ContextIdentity,
     state_dir: &Path,
     client_name: &str,
-    _options: AcquireOptions,
+    options: AcquireOptions,
+    config: impl FnOnce() -> HostConfig,
+) -> Result<Acquired, AcquireError> {
+    election::validate_root(&options).map_err(AcquireError::CoordinationUnavailable)?;
+    let mut config = Some(config);
+    // One budget includes mutex/process-lock waits, busy probes and token
+    // refresh. It stays within frontend initialization's ~30-second budget.
+    tokio::time::timeout(Duration::from_secs(24), async {
+        loop {
+            if let Some(joined) = join_existing(identity, state_dir, client_name, false).await? {
+                return Ok(joined);
+            }
+            let attempted = election::try_acquire(identity, &options)
+                .map_err(AcquireError::CoordinationUnavailable)?;
+            if let Some(observer) = &options.election_attempt {
+                observer.notify_one();
+            }
+            if let Some(lease) = attempted {
+                return acquire_guarded(
+                    identity,
+                    state_dir,
+                    client_name,
+                    lease,
+                    config.take().expect("factory once"),
+                )
+                .await;
+            }
+            // Another owner can be in its factory or use another discovery
+            // root. Try authenticated joining, never bind or run our factory.
+            if let Some(joined) = join_existing(identity, state_dir, client_name, true).await? {
+                return Ok(joined);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Err(AcquireError::CoordinationBusy))
+}
+
+async fn join_existing(
+    identity: &ContextIdentity,
+    state_dir: &Path,
+    client_name: &str,
+    scan: bool,
+) -> Result<Option<Acquired>, AcquireError> {
+    let existing = discovery::read(state_dir, identity.key())
+        .filter(|d| d.flake == identity.flake() && !d.token.is_empty());
+    let token = existing.as_ref().map_or("", |d| d.token.as_str());
+    let mut addrs = Vec::new();
+    if let Some(addr) = existing.as_ref().and_then(Discovery::addr) {
+        addrs.push(addr);
+    }
+    if scan {
+        addrs.extend(
+            identity
+                .ports()
+                .map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        );
+    }
+    for addr in addrs {
+        match probe_with_busy_retry(addr, token, client_name, identity.flake()).await {
+            Probe::OurLeader(client) => return Ok(Some(Acquired::Follower(client))),
+            Probe::Busy => return Err(AcquireError::LeaderBusy),
+            Probe::TokenMismatch => {
+                match join_with_refreshed_token(addr, state_dir, identity, client_name, token).await
+                {
+                    Ok(joined) => return Ok(Some(joined)),
+                    Err(AcquireError::TokenUnavailable) => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+            Probe::Foreign | Probe::Dead => {}
+        }
+    }
+    Ok(None)
+}
+
+async fn acquire_guarded(
+    identity: &ContextIdentity,
+    state_dir: &Path,
+    client_name: &str,
+    lease: election::ElectionLease,
     config: impl FnOnce() -> HostConfig,
 ) -> Result<Acquired, AcquireError> {
     let mut config = Some(config);
@@ -207,11 +301,12 @@ pub async fn acquire_with_options(
         match TcpListener::bind(addr).await {
             Ok(listener) => {
                 let config = config.take().expect("the leader path runs at most once")();
-                let host = RunningHost::start(
+                let host = RunningHost::start_guarded(
                     listener,
                     token.clone(),
                     identity.flake().to_string(),
                     config,
+                    Some(lease),
                 )
                 .published_at(state_dir, identity.key());
                 discovery::write(

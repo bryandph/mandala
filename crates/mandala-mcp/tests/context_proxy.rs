@@ -35,8 +35,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, ContextClient, ContextIdentity, ContextSession, FleetContext, HostConfig,
-    LocalContext, discovery,
+    Acquired, ContextClient, ContextIdentity, FleetContext, HostConfig, LocalContext, discovery,
 };
 use mandala_mcp::MandalaHandler;
 

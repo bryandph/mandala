@@ -83,6 +83,18 @@ fn scratch_tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path
     (flake, state, aggregate)
 }
 
+fn coordination_root(state: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = state.join("context-election-test");
+    std::fs::create_dir_all(state).unwrap();
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("test root: {e}"),
+    }
+    root.canonicalize().unwrap()
+}
+
 /// Spawn one `mandala mcp` instance scoped to the scratch tree.
 fn spawn_mcp(
     flake: &std::path::Path,
@@ -91,6 +103,8 @@ fn spawn_mcp(
 ) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_mandala"))
         .arg("mcp")
+        .arg("--context-coordination-root")
+        .arg(coordination_root(state))
         .current_dir(flake)
         .env("MANDALA_AGGREGATE_FILE", aggregate)
         .env("MANDALA_FLEET_STATE", state)
@@ -455,6 +469,8 @@ sleep 1
             .arg("--flake")
             .arg(&flake)
             .arg("mcp")
+            .arg("--context-coordination-root")
+            .arg(coordination_root(&state))
             .current_dir(&flake)
             .env("PATH", &path)
             .env("MANDALA_AGGREGATE_FILE", &aggregate)
@@ -811,6 +827,8 @@ fn follower_ping_uses_canonical_flake_inventory() {
     let spawn = || {
         Command::new(env!("CARGO_BIN_EXE_mandala"))
             .args(["--flake", flake.to_str().unwrap(), "mcp"])
+            .arg("--context-coordination-root")
+            .arg(coordination_root(&state))
             .current_dir(&elsewhere)
             .env(
                 "PATH",

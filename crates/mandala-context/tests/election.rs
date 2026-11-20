@@ -1,7 +1,7 @@
 //! Native process-lock, inode and fork-before-exec gates. All roots are injected.
 use mandala_context::{AcquireOptions, ContextIdentity, election};
 use nix::libc;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -32,6 +32,7 @@ fn fixture(tag: &str) -> (PathBuf, ContextIdentity, AcquireOptions) {
         ContextIdentity::for_flake(flake).unwrap(),
         AcquireOptions {
             coordination_root: Some(root),
+            ..AcquireOptions::default()
         },
     )
 }
@@ -94,7 +95,8 @@ fn unsafe_roots_and_lock_files_fail_closed() {
         election::try_acquire(
             &id,
             &AcquireOptions {
-                coordination_root: Some(missing.clone())
+                coordination_root: Some(missing.clone()),
+                ..AcquireOptions::default()
             }
         )
         .is_err()
@@ -110,7 +112,8 @@ fn unsafe_roots_and_lock_files_fail_closed() {
         election::try_acquire(
             &id,
             &AcquireOptions {
-                coordination_root: Some(link)
+                coordination_root: Some(link),
+                ..AcquireOptions::default()
             }
         )
         .is_err()
@@ -193,13 +196,15 @@ fn fork_child_blocked_before_exec_cannot_retain_dead_parent_lock() {
         assert_eq!(
             unsafe { libc::kill(fork, 0) },
             0,
-            "child still alive before replacement"
+            "child pid={fork} mode={mode} still alive before replacement: {}",
+            std::io::Error::last_os_error()
         );
         let lease = election::try_acquire(&id, &options).unwrap().unwrap();
         assert_eq!(
             unsafe { libc::kill(fork, 0) },
             0,
-            "replacement owns while child remains alive"
+            "replacement owns while child pid={fork} mode={mode} remains alive: {}",
+            std::io::Error::last_os_error()
         );
         unsafe {
             libc::kill(fork, libc::SIGKILL);
@@ -221,6 +226,7 @@ fn subprocess_holder() {
     let id = ContextIdentity::for_flake(flake).unwrap();
     let options = AcquireOptions {
         coordination_root: Some(root.into()),
+        ..AcquireOptions::default()
     };
     let _lease = election::try_acquire(&id, &options).unwrap().unwrap();
     let mut pid = 0;
@@ -228,10 +234,17 @@ fn subprocess_holder() {
         // Both variants hold the child alive, deliberately before successful exec.
         // A failed exec must not accidentally retain the parent's process lock.
         let failed = mode == "failed-exec";
+        let mut ready = [0; 2];
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
         pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
             unsafe {
+                libc::close(ready[0]);
+                // Keep the deliberately orphaned fixture alive despite a
+                // parent's terminal/session hangup on native macOS.
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
                 if failed {
                     libc::execl(
                         c"/does-not-exist/mandala-test".as_ptr(),
@@ -239,19 +252,34 @@ fn subprocess_holder() {
                         std::ptr::null::<libc::c_char>(),
                     );
                 }
+                libc::write(ready[1], b"!".as_ptr().cast(), 1);
+                libc::close(ready[1]);
                 loop {
                     libc::pause();
                 }
             }
         }
+        unsafe {
+            libc::close(ready[1]);
+        }
+        let mut ack = [0_u8];
+        assert_eq!(
+            unsafe { libc::read(ready[0], ack.as_mut_ptr().cast(), 1) },
+            1,
+            "child reached pre-exec/failed-exec barrier"
+        );
+        unsafe {
+            libc::close(ready[0]);
+        }
     }
     println!("READY {pid}");
     std::io::stdout().flush().unwrap();
-    let _ = std::io::stdin().read(&mut [0]);
-    if pid > 0 {
+    // Remain alive independently of stdin pipe closure. Child::wait closes
+    // stdin; treating that as graceful cleanup can kill the fork fixture
+    // before the parent's asynchronous SIGKILL is delivered on macOS.
+    loop {
         unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::pause();
         }
     }
 }

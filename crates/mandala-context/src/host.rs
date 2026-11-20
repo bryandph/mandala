@@ -35,14 +35,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::discovery::{self, Discovery};
 use crate::protocol::{Frame, PROTOCOL_VERSION, UNAUTHORIZED};
@@ -90,6 +90,9 @@ pub struct HostConfig {
     /// Heartbeat cadence for connections with calls in flight. Production
     /// default [`HostConfig::DEFAULT_HEARTBEAT`]; tests shrink it.
     pub heartbeat_interval: Duration,
+    /// Leader-owned background work (not independent deploy supervisors).
+    /// Teardown aborts and joins these before releasing leadership.
+    pub background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl HostConfig {
@@ -104,6 +107,7 @@ impl HostConfig {
             dispatch,
             events,
             heartbeat_interval: Self::DEFAULT_HEARTBEAT,
+            background_tasks: Arc::default(),
         }
     }
 }
@@ -128,11 +132,127 @@ struct HostShared {
     /// the writer AFTER the write, so "zero" means every settled result
     /// actually reached the wire.
     unsettled: AtomicUsize,
+    active: AtomicUsize,
     /// Shutdown phase 1: accepted connections are dropped before the hello.
     refusing: AtomicBool,
     /// Shutdown phase 2 (or abrupt drop): every host task exits, closing its
     /// streams. `true` is terminal; a dropped sender reads the same way.
     shutdown: watch::Receiver<bool>,
+    calls: mpsc::UnboundedSender<LocalCall>,
+    // Every task that can invoke config retains this shared owner; its final
+    // drop cannot precede task termination or the owner's listener closure.
+    _lease: Option<crate::election::ElectionLease>,
+}
+
+struct ActiveCall(Arc<HostShared>);
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct LocalCall {
+    origin: Option<String>,
+    tool: String,
+    args: serde_json::Map<String, Value>,
+    result: oneshot::Sender<Result<Value, String>>,
+}
+
+/// Single teardown owner. Field order protects runtime cancellation too:
+/// listener closes before tracked tasks and the final shared lease owner.
+struct HostOwner {
+    listener: TcpListener,
+    tasks: JoinSet<()>,
+    shared: Arc<HostShared>,
+    calls: mpsc::UnboundedReceiver<LocalCall>,
+}
+
+impl Drop for HostOwner {
+    fn drop(&mut self) {
+        // Normal shutdown awaits these; runtime cancellation must at least
+        // cancel them, never detach leader-owned background work.
+        let background = std::mem::take(
+            &mut *self
+                .shared
+                .config
+                .background_tasks
+                .lock()
+                .expect("background tasks poisoned"),
+        );
+        if !background.is_empty() {
+            for task in &background {
+                task.abort();
+            }
+            // This path is runtime cancellation, not ordinary host Drop (the
+            // owner is never explicitly aborted). A runtime-independent reaper
+            // retains the lease until background futures are actually gone.
+            // Fail closed by leaking the retained owner if thread creation fails.
+            let retained = Arc::clone(&self.shared);
+            let retained = Arc::into_raw(retained) as usize;
+            let result = std::thread::Builder::new()
+                .name("context-teardown".into())
+                .spawn(move || {
+                    // SAFETY: exactly one Arc raw reference was transferred here;
+                    // on spawn failure it is intentionally retained, never released.
+                    let _retained = unsafe { Arc::from_raw(retained as *const HostShared) };
+                    while background.iter().any(|task| !task.is_finished()) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            if let Ok(thread) = result {
+                drop(thread);
+            }
+        }
+    }
+}
+
+impl HostOwner {
+    async fn run(mut self) {
+        let mut shutdown = self.shared.shutdown.clone();
+        loop {
+            tokio::select! {
+                biased;
+                () = shut_down(&mut shutdown) => break,
+                Some(call) = self.calls.recv() => {
+                    let shared = Arc::clone(&self.shared);
+                    shared.active.fetch_add(1, Ordering::AcqRel);
+                    let active = ActiveCall(Arc::clone(&shared));
+                    self.tasks.spawn(async move {
+                        let _active = active;
+                        let result = (shared.config.dispatch)(call.origin, call.tool, call.args).await;
+                        let _ = call.result.send(result);
+                    });
+                }
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        if self.shared.refusing.load(Ordering::Acquire) { drop(stream); continue; }
+                        self.tasks.spawn(serve_conn(stream, Arc::clone(&self.shared)));
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                },
+                Some(_) = self.tasks.join_next(), if !self.tasks.is_empty() => {},
+            }
+        }
+        self.calls.close();
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        let background = std::mem::take(
+            &mut *self
+                .shared
+                .config
+                .background_tasks
+                .lock()
+                .expect("background tasks poisoned"),
+        );
+        for task in &background {
+            task.abort();
+        }
+        for task in background {
+            let _ = task.await;
+        }
+        // Dropping self closes listener before shared/lease; no tracked work
+        // remains. No abort request is used as a substitute for termination.
+    }
 }
 
 impl HostShared {
@@ -160,50 +280,40 @@ impl RunningHost {
     /// listener).
     #[must_use]
     pub fn start(listener: TcpListener, token: String, flake: String, config: HostConfig) -> Self {
+        Self::start_guarded(listener, token, flake, config, None)
+    }
+
+    pub(crate) fn start_guarded(
+        listener: TcpListener,
+        token: String,
+        flake: String,
+        config: HostConfig,
+        lease: Option<crate::election::ElectionLease>,
+    ) -> Self {
         let port = listener
             .local_addr()
             .expect("bound listener has an addr")
             .port();
         let (shutdown_tx, shutdown) = watch::channel(false);
+        let (calls, call_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(HostShared {
             token: RwLock::new(token),
             flake,
             config,
             unsettled: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
             shutdown,
+            calls,
+            _lease: lease,
         });
-        let accept = {
-            let shared = Arc::clone(&shared);
-            tokio::spawn(async move {
-                let mut shutdown = shared.shutdown.clone();
-                loop {
-                    tokio::select! {
-                        accepted = listener.accept() => match accepted {
-                            Ok((stream, _)) => {
-                                if shared.refusing.load(Ordering::Acquire) {
-                                    // Shutdown phase 1: refuse before the
-                                    // hello (the peer sees close-before-
-                                    // welcome, a probe reads "not a context").
-                                    drop(stream);
-                                    continue;
-                                }
-                                tokio::spawn(serve_conn(stream, Arc::clone(&shared)));
-                            }
-                            Err(_) => {
-                                // Transient accept failures (EMFILE, …): back
-                                // off, keep the bind — releasing it would
-                                // drop leadership.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
-                        },
-                        // Terminal: dropping out drops the listener — the
-                        // port refuses connects, the lock is released.
-                        () = shut_down(&mut shutdown) => break,
-                    }
-                }
-            })
+        let owner = HostOwner {
+            listener,
+            tasks: JoinSet::new(),
+            shared: Arc::clone(&shared),
+            calls: call_rx,
         };
+        let accept = tokio::spawn(owner.run());
         Self {
             port,
             accept,
@@ -211,6 +321,33 @@ impl RunningHost {
             shutdown_tx,
             claim: None,
         }
+    }
+
+    /// A non-owning local snapshot. Execution is registered with the lease's
+    /// task owner, never by retaining callable unguarded configuration.
+    pub(crate) fn local_dispatch(&self) -> Dispatch {
+        let shared = Arc::downgrade(&self.shared);
+        Arc::new(move |origin, tool, args| {
+            let shared = shared.clone();
+            Box::pin(async move {
+                let shared = shared.upgrade().ok_or("context closed")?;
+                if *shared.shutdown.borrow() || shared.refusing.load(Ordering::Acquire) {
+                    return Err("context closed".into());
+                }
+                let (result, rx) = oneshot::channel();
+                shared
+                    .calls
+                    .send(LocalCall {
+                        origin,
+                        tool,
+                        args,
+                        result,
+                    })
+                    .map_err(|_| "context closed".to_string())?;
+                drop(shared);
+                rx.await.map_err(|_| "context closed".to_string())?
+            })
+        })
     }
 
     /// Record where this leader's discovery file lives, enabling
@@ -292,7 +429,8 @@ impl RunningHost {
     pub async fn shutdown(self, grace: Duration) {
         self.shared.refusing.store(true, Ordering::Release);
         let deadline = tokio::time::Instant::now() + grace;
-        while self.shared.unsettled.load(Ordering::Acquire) > 0
+        while (self.shared.unsettled.load(Ordering::Acquire) > 0
+            || self.shared.active.load(Ordering::Acquire) > 0)
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(DRAIN_POLL).await;
@@ -300,7 +438,6 @@ impl RunningHost {
         let _ = self.shutdown_tx.send(true);
         // The accept task drops the listener when it exits; wait for that so
         // "shutdown returned" means "the port is closed".
-        self.accept.abort();
         while !self.accept.is_finished() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -321,7 +458,8 @@ impl Drop for RunningHost {
         // release (the next claimant reuses the stale file's token, exactly
         // like a crashed process).
         let _ = self.shutdown_tx.send(true);
-        self.accept.abort();
+        // Owner observes shutdown, aborts AND joins all dispatched work, then
+        // drops the listener and lease. Never detach teardown by aborting it.
     }
 }
 
@@ -456,7 +594,21 @@ async fn serve_conn(stream: TcpStream, shared: Arc<HostShared>) {
                 let in_flight = Arc::clone(&in_flight);
                 let origin = client.clone();
                 tokio::spawn(async move {
-                    let outcome = (shared.config.dispatch)(Some(origin), tool, args).await;
+                    let (result, rx) = oneshot::channel();
+                    let outcome = if shared
+                        .calls
+                        .send(LocalCall {
+                            origin: Some(origin),
+                            tool,
+                            args,
+                            result,
+                        })
+                        .is_ok()
+                    {
+                        rx.await.unwrap_or_else(|_| Err("context closed".into()))
+                    } else {
+                        Err("context closed".into())
+                    };
                     in_flight.fetch_sub(1, Ordering::Relaxed);
                     let frame = match outcome {
                         Ok(result) => Frame::CallResult {

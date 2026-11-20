@@ -21,13 +21,18 @@ fn main() -> ExitCode {
     // environment readers. This also clears the handoff before spawning children.
     unsafe { mandala_core::supervisor::capture_at_entry() };
     Cli::new()
-        .mcp_launcher(|flake| match mandala_mcp::serve_stdio_blocking(flake) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("mandala mcp: {err}");
-                ExitCode::FAILURE
-            }
-        })
+        .mcp_launcher_with_options(
+            |flake, root| match mandala_mcp::serve_stdio_blocking_with_root(
+                flake,
+                root.map(std::path::Path::to_path_buf),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("mandala mcp: {err}");
+                    ExitCode::FAILURE
+                }
+            },
+        )
         .tui_launcher(mandala_tui::launch_blocking)
         .register(deploy::engine())
         .register(ansible::engine())

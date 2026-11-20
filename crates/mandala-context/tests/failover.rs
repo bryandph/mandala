@@ -79,6 +79,7 @@ fn factory(
         dispatch: labeled_dispatch(&label, Arc::clone(&calls), events.clone()),
         events: events.clone(),
         heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+        background_tasks: Arc::default(),
     })
 }
 
@@ -116,6 +117,7 @@ async fn occupy_first_as_foreign(identity: &ContextIdentity) -> RunningHost {
             dispatch: labeled_dispatch("foreign", calls, events.clone()),
             events,
             heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+            background_tasks: Arc::default(),
         },
     )
 }

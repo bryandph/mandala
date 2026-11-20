@@ -35,9 +35,7 @@ use mandala_mcp::{MandalaHandler, handler_dispatch, tool_is_idempotent};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use mandala_context::{
-    Acquired, ContextIdentity, ContextSession, FleetContext, HostConfig, HostConfigFactory,
-};
+use mandala_context::{Acquired, ContextIdentity, FleetContext, HostConfig, HostConfigFactory};
 
 mod common;
 use common::{FakeEffects, base_inventory};

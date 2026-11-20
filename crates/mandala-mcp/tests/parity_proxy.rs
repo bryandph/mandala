@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mandala_context::{
-    Acquired, CallError, ContextIdentity, ContextSession, FleetContext, HostConfig, LocalContext,
+    Acquired, CallError, ContextIdentity, FleetContext, HostConfig, LocalContext,
 };
 use mandala_core::registry::{self, Meta};
 use mandala_core::runner::COMMAND_LOG;

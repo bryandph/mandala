@@ -58,6 +58,7 @@ fn config_with(events: broadcast::Sender<Value>) -> HostConfig {
         dispatch: echo_dispatch(),
         events,
         heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+        background_tasks: Arc::default(),
     }
 }
 

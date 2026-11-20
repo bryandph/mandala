@@ -125,8 +125,16 @@ fn factory_with_effects(
                 },
             )),
         );
-        spawn_handler_head_watch(&flake, &handler);
-        HostConfig::new(handler_dispatch(handler), events)
+        let watcher = spawn_handler_head_watch(&flake, &handler);
+        let config = HostConfig::new(handler_dispatch(handler), events);
+        if let Some(watcher) = watcher {
+            config
+                .background_tasks
+                .lock()
+                .expect("background tasks poisoned")
+                .push(watcher);
+        }
+        config
     })
 }
 

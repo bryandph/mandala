@@ -291,6 +291,25 @@ pub struct ElectionLease {
 ///
 /// # Errors
 /// Unsafe paths, missing injected roots, creation/access failures and unsupported locks.
+/// Validate or securely create the configured root without opening any lock
+/// inode. Followers need no lease, but unsafe explicit options still fail.
+///
+/// # Errors
+/// See [`try_acquire`].
+pub fn validate_root(options: &AcquireOptions) -> Result<(), CoordinationError> {
+    match &options.coordination_root {
+        Some(path) => root_at(path, None).map(|_| ()),
+        None => {
+            let home = account_home()?;
+            root_at(
+                &home.join(".local/state/mandala/context-election"),
+                Some(&home),
+            )
+            .map(|_| ())
+        }
+    }
+}
+
 pub fn try_acquire(
     identity: &ContextIdentity,
     options: &AcquireOptions,

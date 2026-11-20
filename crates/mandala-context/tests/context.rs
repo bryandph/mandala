@@ -71,6 +71,7 @@ fn config_with(events: broadcast::Sender<Value>, heartbeat: Duration) -> HostCon
         dispatch: echo_dispatch(Some(events.clone())),
         events,
         heartbeat_interval: heartbeat,
+        background_tasks: Arc::default(),
     }
 }
 

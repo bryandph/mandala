@@ -154,9 +154,8 @@ enum Role {
     /// This process IS the leader: it holds the bind and executes locally.
     Leader {
         host: RunningHost,
-        /// The promoted config, kept so local calls and subscriptions use
-        /// exactly what remote callers are served with.
-        config: HostConfig,
+        /// Events do not retain callable leader configuration.
+        events: broadcast::Sender<Value>,
     },
     /// A live leader answers: calls forward over this connection.
     Follower { client: Arc<ContextClient> },
@@ -261,7 +260,7 @@ impl ContextSession {
     /// The current executable snapshot.
     async fn snapshot(&self) -> Result<Exec, CallError> {
         match &*self.inner.role.lock().await {
-            Role::Leader { config, .. } => Ok(Exec::Local(Arc::clone(&config.dispatch))),
+            Role::Leader { host, .. } => Ok(Exec::Local(host.local_dispatch())),
             Role::Follower { client } => Ok(Exec::Remote(Arc::clone(client))),
             Role::Closed => Err(CallError::Closed),
         }
@@ -330,17 +329,17 @@ async fn acquire_role(
     make_host: &HostConfigFactory,
     options: &AcquireOptions,
 ) -> Result<Role, AcquireError> {
-    let mut kept: Option<HostConfig> = None;
+    let mut kept = None;
     let acquired = acquire_with_options(identity, state_dir, client_name, options.clone(), || {
         let config = (make_host)();
-        kept = Some(config.clone());
+        kept = Some(config.events.clone());
         config
     })
     .await?;
     Ok(match acquired {
         Acquired::Leader(host) => Role::Leader {
             host,
-            config: kept.expect("the factory ran on the leader path"),
+            events: kept.expect("the factory ran on the leader path"),
         },
         Acquired::Follower(client) => Role::Follower {
             client: Arc::new(client),
@@ -447,8 +446,8 @@ impl ContextSession {
     async fn attach(&self) -> Result<Attached, CallError> {
         loop {
             let client = match &*self.inner.role.lock().await {
-                Role::Leader { config, .. } => {
-                    return Ok(Attached::Local(config.events.subscribe()));
+                Role::Leader { events, .. } => {
+                    return Ok(Attached::Local(events.subscribe()));
                 }
                 Role::Follower { client } => Arc::clone(client),
                 Role::Closed => return Err(CallError::Closed),

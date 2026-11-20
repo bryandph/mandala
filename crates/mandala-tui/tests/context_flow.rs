@@ -17,7 +17,6 @@
 #[path = "../../mandala-context/tests/common/mod.rs"]
 mod common;
 
-use common::acquire;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;

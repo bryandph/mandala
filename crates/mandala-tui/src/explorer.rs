@@ -130,7 +130,7 @@ pub async fn run_explorer(cfg: ExplorerConfig) -> io::Result<()> {
     // during that eval, the watcher observes the transition and queues a load
     // for the new commit instead of letting the old generation stay final.
     let initial_head = drift::repo_head(&cfg.flake);
-    let context = crate::context::join_context(&cfg.flake).await;
+    let context = crate::context::join_context(&cfg.flake).await?;
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut state = AppState::new();
