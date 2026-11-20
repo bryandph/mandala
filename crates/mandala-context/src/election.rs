@@ -28,12 +28,17 @@ pub enum CoordinationError {
     Unavailable(io::Error),
     /// The filesystem/kernel does not implement process record locks.
     Unsupported(io::Error),
+    /// Known remote/FUSE filesystem or a non-local Darwin mount.
+    UnqualifiedFilesystem(String),
 }
 
 impl std::fmt::Display for CoordinationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsafe(s) => write!(f, "unsafe context coordination path: {s}"),
+            Self::UnqualifiedFilesystem(name) => {
+                write!(f, "unqualified filesystem for context coordination: {name}")
+            }
             Self::Home(e) => write!(f, "cannot resolve stable account home: {e}"),
             Self::Unavailable(e) => write!(f, "context coordination unavailable: {e}"),
             Self::Unsupported(e) => write!(f, "host-local POSIX record locking unsupported: {e}"),
@@ -256,7 +261,87 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
         chain,
     };
     root.verify()?;
+    verify_filesystem(&root.dir)?;
     Ok(root)
+}
+
+// Values from Linux include/uapi/linux/magic.h. Prefer libc's exported
+// constants on Linux; fallback values let both native test suites exercise
+// the complete classifier, without making Linux's local-FS set an allowlist.
+macro_rules! filesystem_magic {
+    ($name:ident, $libc_name:ident, $value:expr) => {
+        #[cfg(target_os = "linux")]
+        const $name: u64 = libc::$libc_name as u64;
+        #[cfg(not(target_os = "linux"))]
+        const $name: u64 = $value;
+    };
+}
+filesystem_magic!(NFS_MAGIC, NFS_SUPER_MAGIC, 0x6969);
+filesystem_magic!(SMB_MAGIC, SMB_SUPER_MAGIC, 0x517b);
+filesystem_magic!(FUSE_MAGIC, FUSE_SUPER_MAGIC, 0x65735546);
+filesystem_magic!(AFS_MAGIC, AFS_SUPER_MAGIC, 0x5346414f);
+filesystem_magic!(CODA_MAGIC, CODA_SUPER_MAGIC, 0x73757245);
+filesystem_magic!(NCP_MAGIC, NCP_SUPER_MAGIC, 0x564c);
+// These magic.h constants are not exported by our libc version.
+const CIFS_MAGIC: u64 = 0xff534d42; // CIFS_MAGIC_NUMBER
+const SMB2_MAGIC: u64 = 0xfe534d42; // SMB2_MAGIC_NUMBER
+const V9FS_MAGIC: u64 = 0x01021997; // V9FS_MAGIC (9p / WSL drvfs)
+const CEPH_MAGIC: u64 = 0x00c36400; // CEPH_SUPER_MAGIC
+const KERNEL_AFS_MAGIC: u64 = 0x6b414653; // AFS_FS_MAGIC (in-kernel AFS)
+const REMOTE_FILESYSTEMS: [u64; 11] = [
+    NFS_MAGIC,
+    SMB_MAGIC,
+    CIFS_MAGIC,
+    SMB2_MAGIC,
+    V9FS_MAGIC,
+    FUSE_MAGIC,
+    CEPH_MAGIC,
+    AFS_MAGIC,
+    KERNEL_AFS_MAGIC,
+    CODA_MAGIC,
+    NCP_MAGIC,
+];
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn linux_filesystem_is_local(kind: u64) -> bool {
+    !REMOTE_FILESYSTEMS.contains(&kind)
+}
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn mac_filesystem_is_local(flags: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    let local = libc::MNT_LOCAL as u64;
+    #[cfg(not(target_os = "macos"))]
+    let local = 0x1000; // Darwin MNT_LOCAL
+    flags & local != 0
+}
+
+fn verify_filesystem(root: &File) -> Result<(), CoordinationError> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: live opened directory descriptor and valid output storage.
+    if unsafe { libc::fstatfs(root.as_raw_fd(), stat.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_os = "macos")]
+    let (qualified, description) = (
+        mac_filesystem_is_local(u64::from(stat.f_flags)),
+        format!("Darwin mount flags {:#x} lack MNT_LOCAL", stat.f_flags),
+    );
+    #[cfg(target_os = "linux")]
+    let (qualified, description) = (
+        linux_filesystem_is_local(stat.f_type as u64),
+        format!("known network/FUSE filesystem type {:#x}", stat.f_type),
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (qualified, description) = (
+        false,
+        "platform has no qualified filesystem policy".to_string(),
+    );
+    if qualified {
+        Ok(())
+    } else {
+        Err(CoordinationError::UnqualifiedFilesystem(description))
+    }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -532,6 +617,31 @@ mod tests {
         std::fs::remove_file(&local).unwrap();
         std::fs::write(&local, []).unwrap();
         assert!(try_at("fixture", &root, Some(&home)).is_err());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn filesystem_policy_refuses_known_remote_types_and_nonlocal_darwin_mounts() {
+        for kind in REMOTE_FILESYSTEMS {
+            assert!(!linux_filesystem_is_local(kind), "remote magic {kind:#x}");
+        }
+        // A denylist, not a local-filesystem allowlist: unknown/local types pass.
+        for kind in [
+            0xef53, 0x9123683e, 0x01021994, 0x794c7630, 0x2fc12fc1, 0x12345678,
+        ] {
+            assert!(linux_filesystem_is_local(kind));
+        }
+        assert!(!mac_filesystem_is_local(0));
+        assert!(!mac_filesystem_is_local(0x1));
+        assert!(mac_filesystem_is_local(0x1000));
+        assert!(mac_filesystem_is_local(0x1001));
+    }
+
+    #[test]
+    fn native_opened_temp_filesystem_passes_admission() {
+        let home = home("native-fs");
+        let root = root_at(&home, None).unwrap();
+        verify_filesystem(&root.dir).unwrap();
         std::fs::remove_dir_all(home).unwrap();
     }
 
