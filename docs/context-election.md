@@ -35,6 +35,14 @@ For canonical checkouts, MCP completes protocol initialization even when acquisi
 
 The operator-approved fork amendment guarantees that a child does not retain the leadership LOCK. A child paused before exec can retain context listeners or accepted connections: takeover and existing followers' EOF/in-flight completion can be delayed until exec or exit, with no socket-level latency bound during that window. Acquisition fails closed (LeaderBusy, no factory/discovery rewrite/second endpoint), then converges on one authenticated replacement. Production launch paths must immediately exec through Command/tokio Command; application pre_exec hooks are limited to non-blocking descriptor-flag changes. No atfork or heartbeat-deadline redesign is included. See the change's fork audit and qualification notes; the stronger ignored witness remains documented limitation evidence.
 
+## Blocking-work ownership
+
+Process-starting/state-writing leader jobs (evaluation/reload, Git status, campaign operations and checkout probes) register with the lease before entering the blocking pool. Teardown closes admission, cancels queued functions, actually closes listener/connections, terminates async calls, stops the watcher and retains exclusion until running registered functions/captures finish. A hung job remains fail closed; the evaluator's usual 600-second response timeout is configurable and is not a whole-job deadline.
+
+Resource shutdown can return while a lease-owning retirement task still waits for blocking work, so a new frontend may see coordination busy even though the old listener is closed. This preserves bounded frontend quit without introducing global evaluator cancellation. Acquisition's failed-publication path instead waits for full retirement before initializing its error-only server.
+
+Only the two audited read-only registry snapshot computations may finish without retaining the lease: they start no process, deliver no signal, write no shared/durable state and discard late results. Their queued functions still cancel. No blanket read-only exception applies to Git, evaluators or campaigns; independent client/UI work and detached deploy supervisors keep their existing ownership.
+
 ## Preserved pre-fix witness
 
 Signed commit `130c29b31dd8b44a60151146918d183b1153ed5d` contains the unmodified diagnostic patch (SHA256 `25881535aa1ade310c45968e2250c4a0e2cccbc1ca2458f011da1b786d46ffea`). On Linux/WSL in a fresh scratch clone and private loopback namespace, the immutable diagnostic executable failed `disappearing_foreign --ignored --nocapture`: 0 passed, 1 failed; authenticated same-flake endpoints on ports 29800 (`fast`) and 29802 (`slow`) both executed calls. This reproduces the pre-fix bug independently of retained role flags. Original supplied stress evidence also found two authenticated endpoints after 697 successful 32-contender trials (failure at trial 698); stochastic success does not disprove that observation.
