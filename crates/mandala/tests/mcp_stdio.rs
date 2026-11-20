@@ -87,8 +87,9 @@ fn coordination_root(state: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::DirBuilderExt;
     static CHECK: std::sync::Once = std::sync::Once::new();
     CHECK.call_once(|| {
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap(); drop(listener);
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let addr = reserved.local_addr().unwrap();
         let result = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500));
         assert!(matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused), "LAB-206 loopback-refusal preflight: {result:?}; use a private loopback netns with lo up on WSL");
     });

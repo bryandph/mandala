@@ -473,9 +473,11 @@ mod lease_tests {
 
     #[tokio::test]
     async fn retained_local_snapshot_cannot_invoke_config_after_shutdown() {
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let addr = reserved.local_addr().unwrap();
         let refused = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500));
         assert!(
             matches!(refused, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused),

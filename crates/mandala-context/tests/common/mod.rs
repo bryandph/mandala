@@ -4,7 +4,7 @@ use mandala_context::{
     AcquireError, AcquireOptions, Acquired, ContextIdentity, ContextSession, HostConfig,
     HostConfigFactory,
 };
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpStream};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -52,9 +52,12 @@ pub fn refusal_preflight() {
     static CHECK: Once = Once::new();
     CHECK.call_once(|| {
         for _ in 0..3 {
-            let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve test port");
+            // Bind without LISTEN and retain the reservation during probing.
+            // Dropping a temporary listener permits port reuse, and a forked
+            // pre-exec child can briefly retain its inherited LISTEN socket.
+            let reserved = tokio::net::TcpSocket::new_v4().expect("reserve test socket");
+            reserved.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("reserve non-listening test port");
             let addr = reserved.local_addr().unwrap();
-            drop(reserved);
             let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
             assert!(
                 matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
