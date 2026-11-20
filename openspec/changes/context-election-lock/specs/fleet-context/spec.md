@@ -103,7 +103,11 @@ Production code SHALL NOT fork without an immediate exec. Workspace-owned child 
 - **THEN** it uses Command or tokio Command with immediate exec, without a fork-only continuation or deliberately blocking pre_exec hook; application hooks are limited to non-blocking descriptor-flag changes
 
 ### Requirement: Listener closure precedes leadership release
-The leader lease SHALL keep the listener and lifetime guards in one proven ownership arrangement. On graceful shutdown, Drop, cancelled acquisition and every failure/unwind path, the listener SHALL actually close before either guard is released. An accept-task abort request alone SHALL NOT prove closure. No leader config, local dispatch snapshot or wire dispatch SHALL execute beyond its guard's lifetime. Graceful shutdown SHALL retain bounded draining and guarded discovery cleanup; stale discovery after abrupt loss SHALL remain recoverable without unlinking the lock inode.
+The leader lease SHALL keep the listener and lifetime guards in one proven ownership arrangement. On graceful shutdown, Drop, cancelled acquisition and every failure/unwind path, the owner's listener and connections SHALL actually close before either guard is released, subject to the documented inherited-socket-copy limitation. An accept-task abort request alone SHALL NOT prove closure. No leader config, local dispatch snapshot or wire dispatch SHALL execute beyond its guard's lifetime, except the precise read-only snapshot computation carve-out below. Graceful shutdown SHALL retain bounded async-call draining and guarded discovery cleanup; stale discovery after abrupt loss SHALL remain recoverable without unlinking the lock inode.
+
+Every process-starting or state-writing leader blocking job SHALL be registered with the lease before queueing: evaluator/reload work, repository status, campaign operations, and checkout-watch Git probes are included. Teardown SHALL prevent further registration and abort queued jobs before they start. Running registered functions and their captured resources SHALL retain the lifetime guards until actual completion/destruction, not merely until the awaiting async future is aborted. Teardown SHALL close listener/connections, stop tracked async calls, stop the watcher, complete registered blocking work, and only then release the guards. A retired lease owner MAY keep exclusion after resource shutdown returns; takeover SHALL fail safely while registered work remains, even if the work is hung. No evaluator-internals cancellation or process-wide shutdown_workers shortcut is required.
+
+Exactly two audited read-only registry snapshot computations MAY finish after their stopped async parent without retaining the lease: the run-list snapshot closure and blocking_snapshot in mandala-mcp/src/server.rs. They SHALL start no external process, deliver no process signal, write no durable/shared state and publish no result, event, inventory or cache after the parent is stopped. Signal-0 existence checks and private immutable derivation reads are observation only. Their queued jobs SHALL still be cancelled before starting after teardown. This carve-out SHALL NOT extend to evaluator, Git, campaign, watcher or other blocking work; independent client/UI work and already-launched detached deploy supervisors remain separate owners.
 
 Before implementation, lifecycle investigation SHALL establish whether a host can be dropped while its process lives, including demotion and in-process restart. If reachable, dispatched calls SHALL be tracked with a JoinSet or abort handles (and equivalent ownership for local calls), aborted on Drop and stopped before lock release. If unreachable in production, the lifecycle evidence SHALL be documented and Drop-based tests SHALL describe connection-loss semantics only, not claim process death or cancellation of continuing effects. Actual crash guarantees SHALL be tested with process termination. Independent detached supervisors SHALL NOT be treated as context dispatch to cancel.
 
@@ -118,6 +122,18 @@ Before implementation, lifecycle investigation SHALL establish whether a host ca
 #### Scenario: acquisition fails after binding
 - **WHEN** factory construction, host startup, discovery publication or acquisition cancellation fails after a listener was bound
 - **THEN** cleanup closes that listener before releasing the guards and leaves no detached serving leader
+
+#### Scenario: running registered blocking work delays lease release
+- **WHEN** an async leader call is stopped while its registered blocking function is still running
+- **THEN** resources close and the async call/watchers stop, but a replacement factory cannot enter until the blocking function and captures actually finish; hung work remains safely excluded
+
+#### Scenario: queued work is cancelled before start
+- **WHEN** teardown begins with a registered job queued behind unavailable blocking workers
+- **THEN** that queued function never executes, even after the pool becomes available, and it cannot start process or state effects after teardown
+
+#### Scenario: the precise read-only snapshot carve-out does not delay takeover
+- **WHEN** one of the two audited registry snapshot jobs is already running as its async parent is stopped
+- **THEN** takeover may proceed without waiting for that side-effect-free computation, whose late result is discarded and cannot be published; this is not permission for other unregistered leader work
 
 #### Scenario: a live-process drop is reachable
 - **WHEN** lifecycle investigation identifies a reachable host drop while dispatched calls can still run in the process
