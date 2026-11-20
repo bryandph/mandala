@@ -35,7 +35,7 @@ tokio = { version = "1", features = [
 getrandom = "0.4"
 # Existing workspace dependency; libc's descriptor-relative/no-follow and
 # process-associated F_SETLK operations are used directly, never flock/OFD.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }
