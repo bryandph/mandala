@@ -193,6 +193,7 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
         let name = c_name(name)?;
         let may_create =
             create_below.is_some_and(|home| walked.starts_with(home) && walked != home);
+        let mut created = false;
         let child = match open_at(
             current.as_raw_fd(),
             &name,
@@ -216,6 +217,8 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
                     if e.kind() != io::ErrorKind::AlreadyExists {
                         return Err(e.into());
                     }
+                } else {
+                    created = true;
                 }
                 open_at(
                     current.as_raw_fd(),
@@ -235,7 +238,7 @@ fn root_at(path: &Path, create_below: Option<&Path>) -> Result<Root, Coordinatio
         if !meta.is_dir()
             || !owner_ok
             || (meta.mode() & 0o022 != 0 && !sticky_system)
-            || (is_root && meta.mode() & 0o7777 != 0o700)
+            || ((is_root || created) && meta.mode() & 0o7777 != 0o700)
         {
             return Err(unsafe_path(format!(
                 "directory ownership/mode/type at {}",
