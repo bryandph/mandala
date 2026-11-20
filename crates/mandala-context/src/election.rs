@@ -144,7 +144,7 @@ fn stat_at(dir: &File, name: &CStr) -> io::Result<libc::stat> {
 fn same_entry(parent: &File, name: &CStr, file: &File) -> Result<(), CoordinationError> {
     let path = stat_at(parent, name)?;
     let opened = file.metadata()?;
-    if path.st_dev as u64 != opened.dev() || path.st_ino as u64 != opened.ino() {
+    if stat_inode(&path) != (opened.dev(), opened.ino()) {
         return Err(unsafe_path("path replaced during open/validation"));
     }
     Ok(())
@@ -266,6 +266,11 @@ struct Key {
     identity: String,
 }
 type Inode = (u64, u64);
+// libc's dev_t/ino_t widths and signedness differ between Linux and Darwin.
+#[allow(clippy::unnecessary_cast)]
+fn stat_inode(meta: &libc::stat) -> Inode {
+    (meta.st_dev as u64, meta.st_ino as u64)
+}
 #[derive(Default)]
 struct Registry {
     mutexes: HashMap<Key, Arc<AsyncMutex<()>>>,
@@ -385,11 +390,7 @@ fn try_at_observed(
     let name = c_name(OsStr::new(&format!("{identity}.lock")))?;
     let mut registry = registry().lock().expect("election registry poisoned");
     match stat_at(&root.dir, &name) {
-        Ok(meta)
-            if registry
-                .owned
-                .contains_key(&(meta.st_dev as u64, meta.st_ino as u64)) =>
-        {
+        Ok(meta) if registry.owned.contains_key(&stat_inode(&meta)) => {
             return Err(unsafe_path(
                 "lock path aliases an inode already owned by this process",
             ));
