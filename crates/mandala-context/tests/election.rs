@@ -174,6 +174,20 @@ fn unsafe_roots_and_lock_files_fail_closed() {
         0o644,
         "no repair"
     );
+    std::fs::remove_file(&lock).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let fifo = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(
+        election::try_acquire(&id, &options).is_err(),
+        "nonregular files cannot block or confer leadership"
+    );
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(
+        election::try_acquire(&id, &options).is_err(),
+        "unwritable root fails closed even with capabilities"
+    );
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
 

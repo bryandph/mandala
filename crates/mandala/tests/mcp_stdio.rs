@@ -85,6 +85,13 @@ fn scratch_tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path
 
 fn coordination_root(state: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::DirBuilderExt;
+    static CHECK: std::sync::Once = std::sync::Once::new();
+    CHECK.call_once(|| {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap(); drop(listener);
+        let result = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500));
+        assert!(matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused), "LAB-206 loopback-refusal preflight: {result:?}; use a private loopback netns with lo up on WSL");
+    });
     let root = state.join("context-election-test");
     std::fs::create_dir_all(state).unwrap();
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {
@@ -110,7 +117,13 @@ fn spawn_mcp(
         .env("MANDALA_FLEET_STATE", state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(state.join("context.stderr"))
+                .unwrap(),
+        ))
         .spawn()
         .expect("spawn mandala mcp")
 }
@@ -285,7 +298,12 @@ fn second_instance_proxies_and_promotes_when_the_leader_exits() {
     let mut a_in = a.stdin.take().unwrap();
     let mut a_out = BufReader::new(a.stdout.take().unwrap());
     handshake(&mut a_in, &mut a_out);
-    let d = read_discovery(&state).expect("the first instance published discovery");
+    let d = read_discovery(&state).unwrap_or_else(|| {
+        panic!(
+            "the first instance published discovery; stderr: {}",
+            std::fs::read_to_string(state.join("context.stderr")).unwrap_or_default()
+        )
+    });
     assert_eq!(
         d["pid"].as_u64(),
         Some(u64::from(a.id())),
@@ -491,7 +509,12 @@ sleep 1
     let mut leader_in = leader.stdin.take().unwrap();
     let mut leader_out = BufReader::new(leader.stdout.take().unwrap());
     handshake(&mut leader_in, &mut leader_out);
-    let elected = read_discovery(&state).expect("leader published discovery");
+    let elected = read_discovery(&state).unwrap_or_else(|| {
+        panic!(
+            "leader published discovery; stderr: {}",
+            std::fs::read_to_string(state.join("context.stderr")).unwrap_or_default()
+        )
+    });
     assert_eq!(elected["pid"].as_u64(), Some(u64::from(leader.id())));
 
     let mut follower = spawn();

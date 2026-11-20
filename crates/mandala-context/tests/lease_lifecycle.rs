@@ -69,23 +69,31 @@ async fn wire_drop_terminates_calls_and_background_before_new_factory() {
     let cfg = blocked(live.clone(), entered.clone());
     let background_count = background_live.clone();
     let background_ready = background_entered.clone();
-    cfg.background_tasks
-        .lock()
-        .unwrap()
-        .push(tokio::spawn(async move {
-            background_count.fetch_add(1, Ordering::SeqCst);
-            let _live = Live(background_count);
-            background_ready.notify_one();
-            std::future::pending::<()>().await;
-        }));
-    background_entered.notified().await;
     let Acquired::Leader(host) =
-        acquire_with_options(&identity, &state, "first", options.clone(), || cfg)
-            .await
-            .unwrap()
+        acquire_with_options(&identity, &state, "first", options.clone(), || {
+            assert!(
+                election::try_acquire(&identity, &options)
+                    .unwrap()
+                    .is_none(),
+                "factory owns both guards"
+            );
+            cfg.background_tasks
+                .lock()
+                .unwrap()
+                .push(tokio::spawn(async move {
+                    background_count.fetch_add(1, Ordering::SeqCst);
+                    let _live = Live(background_count);
+                    background_ready.notify_one();
+                    std::future::pending::<()>().await;
+                }));
+            cfg
+        })
+        .await
+        .unwrap()
     else {
         panic!("leader");
     };
+    background_entered.notified().await;
     let follower = common::acquire(&identity, &state, "wire", || panic!("follower factory"))
         .await
         .unwrap();
@@ -306,6 +314,40 @@ async fn different_discovery_roots_share_exclusion_and_fail_bounded() {
         json!("replacement")
     );
     host.shutdown(Duration::ZERO).await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exhausted_foreign_ports_never_invoke_factory_and_release_candidate_guard() {
+    let (root, identity, state, options) = fixture("exhausted", 29936);
+    let mut occupants = Vec::new();
+    for port in identity.ports() {
+        occupants.push(mandala_context::RunningHost::start(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap(),
+            mandala_context::discovery::mint_token(),
+            "/foreign-fixture".into(),
+            config(),
+        ));
+    }
+    let result = acquire_with_options(&identity, &state, "candidate", options.clone(), || {
+        panic!("exhausted candidate factory must not run")
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(mandala_context::AcquireError::PortsExhausted)
+    ));
+    assert!(
+        election::try_acquire(&identity, &options)
+            .unwrap()
+            .is_some()
+    );
+    assert!(mandala_context::discovery::read(&state, identity.key()).is_none());
+    for occupant in occupants {
+        occupant.shutdown(Duration::ZERO).await;
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 

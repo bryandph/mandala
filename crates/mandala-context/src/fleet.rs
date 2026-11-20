@@ -473,6 +473,14 @@ mod lease_tests {
 
     #[tokio::test]
     async fn retained_local_snapshot_cannot_invoke_config_after_shutdown() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let refused = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+        assert!(
+            matches!(refused, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "LAB-206: loopback must refuse; use private netns with lo up on WSL: {refused:?}"
+        );
         let root = std::env::temp_dir().join(format!("context-snapshot-{}", std::process::id()));
         std::fs::create_dir_all(root.join("flake")).unwrap();
         let coordination = root.join("coordination");
