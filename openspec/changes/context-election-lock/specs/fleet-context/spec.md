@@ -68,7 +68,11 @@ Token minting at first claim, reuse across restart and rotation SHALL remain unc
 ## ADDED Requirements
 
 ### Requirement: Process locks exclude contenders without fork inheritance
-The OS guard SHALL be a whole-file exclusive traditional POSIX `fcntl(F_SETLK)` record lock (`F_WRLCK`, start zero, length zero), associated with the process, paired with a process-wide keyed async mutex. It SHALL NOT use `F_OFD_SETLK`, `F_OFD_SETLKW`, `flock` or equivalent open-file-description semantics. Fork children SHALL NOT inherit ownership or delay replacement leadership after parent death, even before exec or after exec failure. Close-on-exec SHALL be set atomically but SHALL NOT be considered sufficient for this property. A dedicated descriptor-owning helper SHALL serialize same-process access before opening the inode and prevent other opens/closes of that inode from silently releasing the process's lock. The keyed mutex registry SHALL NOT create parallel guards for one live identity.
+The OS guard SHALL be a whole-file exclusive traditional POSIX `fcntl(F_SETLK)` record lock (`F_WRLCK`, start zero, length zero), associated with the process, paired with a process-wide keyed async mutex. It SHALL NOT use `F_OFD_SETLK`, `F_OFD_SETLKW`, `flock` or equivalent open-file-description semantics. Fork children SHALL NOT inherit ownership of the leadership lock or delay its release after parent death, even before exec or after exec failure. Close-on-exec SHALL be set atomically but SHALL NOT be considered sufficient for this lock-ownership property. A dedicated descriptor-owning helper SHALL serialize same-process access before opening the inode and prevent other opens/closes of that inode from silently releasing the process's lock. The keyed mutex registry SHALL NOT create parallel guards for one live identity.
+
+The fork guarantee covers the lock, not immediate closure of inherited context socket copies. A pre-exec child retaining the listener or accepted connections MAY delay socket takeover and existing followers' EOF/in-flight completion until the child execs or exits. Socket-level failover latency SHALL NOT be claimed as bounded during that window. Acquisition SHALL fail closed on an inherited busy listener: no leader factory, discovery rewrite, second authenticated endpoint or unlocked execution. After inherited sockets are released, participants SHALL converge on exactly one authenticated replacement endpoint. This documented inherited-copy limitation also applies when interpreting listener-closure and bounded-failover obligations; the owner still closes its own listener and work in the required lease order.
+
+Production code SHALL NOT fork without an immediate exec. Workspace-owned child creation while context resources may be live SHALL use `std::process::Command` or `tokio::process::Command`; application `pre_exec` hooks SHALL be limited to non-blocking descriptor-flag changes. This rule does not claim to audit internals of already-execed external tools. No atfork socket registry or heartbeat-deadline redesign is required by this change. The stronger parked-child serving witness SHALL remain ignored as documented evidence of the socket-retention limitation, not be reported as a passing guarantee.
 
 #### Scenario: separate processes cannot hold the same lease
 - **WHEN** distinct processes request the same coordination identity
@@ -76,11 +80,27 @@ The OS guard SHALL be a whole-file exclusive traditional POSIX `fcntl(F_SETLK)` 
 
 #### Scenario: parent dies with a child blocked before exec
 - **WHEN** a leader forks a child that remains blocked before exec and the leader is killed
-- **THEN** a replacement process can acquire and serve while the child is still alive, without child-side unlock of the parent's lock
+- **THEN** another process can acquire the leadership lock while the child is still alive, without child-side unlock of the parent's lock; inherited socket copies may still delay actual endpoint takeover until exec or exit
 
 #### Scenario: unrelated concurrent fork or failed exec
 - **WHEN** another runtime thread forks or a child fails exec while leadership is held
-- **THEN** the parent retains exclusion while alive and children cannot retain the lease after parent death
+- **THEN** the parent retains exclusion while alive and children cannot retain the lock after parent death, including when a failed-exec child remains alive
+
+#### Scenario: a paused child retains the listener
+- **WHEN** the parent dies while a child is held before exec with an inherited listener
+- **THEN** replacement acquisition returns LeaderBusy without invoking its factory, rewriting discovery, executing unlocked configuration or creating a second authenticated endpoint
+
+#### Scenario: a paused child retains an accepted connection
+- **WHEN** a pre-exec child retains an accepted context connection after parent death
+- **THEN** an existing follower's EOF and in-flight completion may be delayed until child exec or exit, and bounded socket-level failover is not promised during that window
+
+#### Scenario: the inherited socket window ends
+- **WHEN** the child execs or exits and releases its inherited context sockets
+- **THEN** replacement succeeds with exactly one authenticated serving endpoint and all successful participants converge; a successfully execed child may remain alive without retaining the sockets
+
+#### Scenario: production launch paths obey immediate exec
+- **WHEN** production context-capable code starts a child, including a detached deploy supervisor
+- **THEN** it uses Command or tokio Command with immediate exec, without a fork-only continuation or deliberately blocking pre_exec hook; application hooks are limited to non-blocking descriptor-flag changes
 
 ### Requirement: Listener closure precedes leadership release
 The leader lease SHALL keep the listener and lifetime guards in one proven ownership arrangement. On graceful shutdown, Drop, cancelled acquisition and every failure/unwind path, the listener SHALL actually close before either guard is released. An accept-task abort request alone SHALL NOT prove closure. No leader config, local dispatch snapshot or wire dispatch SHALL execute beyond its guard's lifetime. Graceful shutdown SHALL retain bounded draining and guarded discovery cleanup; stale discovery after abrupt loss SHALL remain recoverable without unlinking the lock inode.

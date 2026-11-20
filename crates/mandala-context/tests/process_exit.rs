@@ -163,10 +163,10 @@ fn endpoint_process() {
 
 // Stronger original requirement witness: the record lock releases, but the
 // deliberately unexeced child's inherited listener keeps replacement busy.
-// Retain this evidence pending the operator's fork-contract decision; do not
-// hide it by closing context descriptors only in the fixture child.
+// Retain this as documented limitation evidence under the operator-approved
+// option-A spec amendment; do not hide it by fixture-only descriptor closure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "operator fork-contract gate: inherited listener remains until child exec/exit"]
+#[ignore = "documented option-A limitation: inherited listener remains until child exec/exit"]
 async fn serving_parent_exit_allows_replacement_while_preexec_child_remains_alive() {
     use nix::libc;
     common::refusal_preflight();
