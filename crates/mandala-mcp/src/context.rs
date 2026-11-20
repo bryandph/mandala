@@ -149,22 +149,42 @@ pub fn spawn_handler_head_watch(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let initial_head = drift::repo_head(flake)?;
     let weak_handler = Arc::downgrade(handler);
-    Some(drift::spawn_repo_head_watch(
+    let scope = mandala_context::work::current_scope();
+    let probe_scope = scope.clone();
+    Some(drift::spawn_repo_head_watch_with_probe(
         flake.to_string(),
         initial_head,
+        move |checkout| {
+            let scope = probe_scope.clone();
+            async move {
+                mandala_context::work::in_scope(scope, async move {
+                    mandala_context::work::spawn_blocking(move || drift::repo_head(&checkout))
+                        .await
+                        .ok()
+                        .flatten()
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        },
         move |_head| {
             let weak_handler = weak_handler.clone();
+            let scope = scope.clone();
             async move {
-                let Some(handler) = weak_handler.upgrade() else {
-                    return false;
-                };
-                // Use the normal dispatch wrapper: the reload is audited,
-                // swaps the leader's inventory atomically, and publishes one
-                // settle event that every observer adopts.
-                let _ = handler
-                    .call_tool_from(Some("checkout-watch"), "reload", serde_json::Map::new())
-                    .await;
-                true
+                mandala_context::work::in_scope(scope, async move {
+                    let Some(handler) = weak_handler.upgrade() else {
+                        return false;
+                    };
+                    // Preserve normal reload/audit/event behavior, now with
+                    // ownership propagated into its evaluator blocking jobs.
+                    let _ = handler
+                        .call_tool_from(Some("checkout-watch"), "reload", serde_json::Map::new())
+                        .await;
+                    true
+                })
+                .await
+                .unwrap_or(false)
             }
         },
     ))

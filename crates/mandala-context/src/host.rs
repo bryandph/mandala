@@ -133,6 +133,7 @@ struct HostShared {
     /// actually reached the wire.
     unsettled: AtomicUsize,
     active: AtomicUsize,
+    writers: AtomicUsize,
     /// Shutdown phase 1: accepted connections are dropped before the hello.
     refusing: AtomicBool,
     /// Shutdown phase 2 (or abrupt drop): every host task exits, closing its
@@ -141,7 +142,7 @@ struct HostShared {
     calls: mpsc::UnboundedSender<LocalCall>,
     // Every task that can invoke config retains this shared owner; its final
     // drop cannot precede task termination or the owner's listener closure.
-    _lease: Option<crate::election::ElectionLease>,
+    work: crate::work::WorkOwner,
 }
 
 struct AbortOnDrop(AbortHandle);
@@ -163,20 +164,88 @@ struct LocalCall {
     origin: Option<String>,
     tool: String,
     args: serde_json::Map<String, Value>,
-    result: oneshot::Sender<Result<Value, String>>,
+    reply: Reply,
+}
+
+enum Reply {
+    Local(oneshot::Sender<Result<Value, String>>),
+    Wire(WireReply),
+}
+struct WireReply {
+    id: u64,
+    tx: mpsc::Sender<Frame>,
+    in_flight: Arc<AtomicUsize>,
+    shared: Arc<HostShared>,
+    counting_flight: bool,
+    counting_settlement: bool,
+}
+impl WireReply {
+    async fn send(mut self, outcome: Result<Value, String>) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.counting_flight = false;
+        if *self.shared.shutdown.borrow() {
+            return;
+        }
+        let frame = match outcome {
+            Ok(result) => Frame::CallResult {
+                id: self.id,
+                ok: true,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => Frame::CallResult {
+                id: self.id,
+                ok: false,
+                result: None,
+                error: Some(error),
+            },
+        };
+        if self.tx.send(frame).await.is_ok() {
+            self.counting_settlement = false;
+        }
+    }
+}
+impl Drop for WireReply {
+    fn drop(&mut self) {
+        if self.counting_flight {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
+        if self.counting_settlement {
+            self.shared.unsettled.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+struct LiveWriter(Arc<HostShared>);
+impl Drop for LiveWriter {
+    fn drop(&mut self) {
+        self.0.writers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+// Actual stream destruction precedes the counter used by ordered teardown.
+struct WriterSocket {
+    stream: tokio::net::tcp::OwnedWriteHalf,
+    _live: LiveWriter,
+}
+impl WriterSocket {
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.stream.write_all(bytes).await
+    }
 }
 
 /// Single teardown owner. Field order protects runtime cancellation too:
 /// listener closes before tracked tasks and the final shared lease owner.
 struct HostOwner {
-    listener: TcpListener,
-    tasks: JoinSet<()>,
+    listener: Option<TcpListener>,
+    connections: JoinSet<()>,
+    async_calls: JoinSet<()>,
     shared: Arc<HostShared>,
     calls: mpsc::UnboundedReceiver<LocalCall>,
+    resources_closed: watch::Sender<bool>,
 }
 
 impl Drop for HostOwner {
     fn drop(&mut self) {
+        self.shared.work.scope().close();
         // Normal shutdown awaits these; runtime cancellation must at least
         // cancel them, never detach leader-owned background work.
         let background = std::mem::take(
@@ -223,25 +292,45 @@ impl HostOwner {
                 () = shut_down(&mut shutdown) => break,
                 Some(call) = self.calls.recv() => {
                     let shared = Arc::clone(&self.shared);
-                    self.tasks.spawn(async move {
-                        let _active = call.active;
-                        let result = (shared.config.dispatch)(call.origin, call.tool, call.args).await;
-                        let _ = call.result.send(result);
+                    self.async_calls.spawn(async move {
+                        let LocalCall { active, origin, tool, args, reply } = call;
+                        let _active = active;
+                        let scope = shared.work.scope();
+                        let result = crate::work::in_scope(Some(scope), async move {
+                            (shared.config.dispatch)(origin, tool, args).await
+                        }).await.unwrap_or_else(|error| Err(error.to_string()));
+                        match reply {
+                            Reply::Local(reply) => { let _ = reply.send(result); },
+                            Reply::Wire(reply) => reply.send(result).await,
+                        }
                     });
                 }
-                accepted = self.listener.accept() => match accepted {
+                accepted = self.listener.as_ref().expect("live listener").accept() => match accepted {
                     Ok((stream, _)) => {
                         if self.shared.refusing.load(Ordering::Acquire) { drop(stream); continue; }
-                        self.tasks.spawn(serve_conn(stream, Arc::clone(&self.shared)));
+                        self.connections.spawn(serve_conn(stream, Arc::clone(&self.shared)));
                     }
                     Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
                 },
-                Some(_) = self.tasks.join_next(), if !self.tasks.is_empty() => {},
+                Some(_) = self.connections.join_next(), if !self.connections.is_empty() => {},
+                Some(_) = self.async_calls.join_next(), if !self.async_calls.is_empty() => {},
             }
         }
+        self.shared.work.scope().close();
+        // Ordered retirement: listener/connections, calls, watcher, blocking
+        // jobs, and only then the final guard. Queued jobs cannot start.
+        drop(self.listener.take());
+        self.connections.abort_all();
+        while self.connections.join_next().await.is_some() {}
+        while self.shared.writers.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         self.calls.close();
-        self.tasks.abort_all();
-        while self.tasks.join_next().await.is_some() {}
+        while let Ok(call) = self.calls.try_recv() {
+            drop(call);
+        }
+        self.async_calls.abort_all();
+        while self.async_calls.join_next().await.is_some() {}
         let background = std::mem::take(
             &mut *self
                 .shared
@@ -256,8 +345,11 @@ impl HostOwner {
         for task in background {
             let _ = task.await;
         }
-        // Dropping self closes listener before shared/lease; no tracked work
-        // remains. No abort request is used as a substitute for termination.
+        let _ = self.resources_closed.send(true);
+        // Public shutdown may return after resource closure, preserving bounded
+        // frontend quit. This owner and each running job retain the lease until
+        // actual job completion; a hung job fails closed rather than unlocking.
+        self.shared.work.scope().wait().await;
     }
 }
 
@@ -280,10 +372,31 @@ impl HostShared {
                 origin,
                 tool,
                 args,
-                result,
+                reply: Reply::Local(result),
             })
             .map_err(|_| "context closed".to_string())?;
         Ok(rx)
+    }
+
+    fn queue_wire(
+        self: &Arc<Self>,
+        origin: String,
+        tool: String,
+        args: serde_json::Map<String, Value>,
+        reply: WireReply,
+    ) {
+        if *self.shutdown.borrow() {
+            return;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let active = ActiveCall(Arc::clone(self));
+        let _ = self.calls.send(LocalCall {
+            active,
+            origin: Some(origin),
+            tool,
+            args,
+            reply: Reply::Wire(reply),
+        });
     }
 
     fn token_matches(&self, presented: &str) -> bool {
@@ -299,6 +412,7 @@ pub struct RunningHost {
     shared: Arc<HostShared>,
     shutdown_tx: watch::Sender<bool>,
     claim: Option<Claim>,
+    resources_closed: watch::Receiver<bool>,
 }
 
 impl RunningHost {
@@ -310,7 +424,13 @@ impl RunningHost {
     /// listener).
     #[must_use]
     pub fn start(listener: TcpListener, token: String, flake: String, config: HostConfig) -> Self {
-        Self::start_guarded(listener, token, flake, config, None)
+        Self::start_guarded(
+            listener,
+            token,
+            flake,
+            config,
+            crate::work::WorkOwner::new(None),
+        )
     }
 
     pub(crate) fn start_guarded(
@@ -318,7 +438,7 @@ impl RunningHost {
         token: String,
         flake: String,
         config: HostConfig,
-        lease: Option<crate::election::ElectionLease>,
+        work: crate::work::WorkOwner,
     ) -> Self {
         let port = listener
             .local_addr()
@@ -326,22 +446,26 @@ impl RunningHost {
             .port();
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (calls, call_rx) = mpsc::unbounded_channel();
+        let (resources_tx, resources_closed) = watch::channel(false);
         let shared = Arc::new(HostShared {
             token: RwLock::new(token),
             flake,
             config,
             unsettled: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
+            writers: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
             shutdown,
             calls,
-            _lease: lease,
+            work,
         });
         let owner = HostOwner {
-            listener,
-            tasks: JoinSet::new(),
+            listener: Some(listener),
+            connections: JoinSet::new(),
+            async_calls: JoinSet::new(),
             shared: Arc::clone(&shared),
             calls: call_rx,
+            resources_closed: resources_tx,
         };
         let accept = tokio::spawn(owner.run());
         Self {
@@ -350,6 +474,7 @@ impl RunningHost {
             shared,
             shutdown_tx,
             claim: None,
+            resources_closed,
         }
     }
 
@@ -446,8 +571,19 @@ impl RunningHost {
     ///    never clobbered).
     ///
     /// Calls still unsettled when `grace` expires are abandoned (their
-    /// clients see the connection close as a structured failover).
+    /// clients see the connection close as a structured failover). The
+    /// listener, connections, async calls and watcher are actually stopped
+    /// before return. A retired owner retains the guards until registered
+    /// blocking work completes; takeover may remain safely busy meanwhile.
     pub async fn shutdown(self, grace: Duration) {
+        self.shutdown_inner(grace, false).await;
+    }
+
+    pub(crate) async fn shutdown_complete(self, grace: Duration) {
+        self.shutdown_inner(grace, true).await;
+    }
+
+    async fn shutdown_inner(&self, grace: Duration, mut complete: bool) {
         self.shared.refusing.store(true, Ordering::Release);
         let deadline = tokio::time::Instant::now() + grace;
         while (self.shared.unsettled.load(Ordering::Acquire) > 0
@@ -457,15 +593,21 @@ impl RunningHost {
             tokio::time::sleep(DRAIN_POLL).await;
         }
         let _ = self.shutdown_tx.send(true);
-        // The accept task drops the listener when it exits; wait for that so
-        // "shutdown returned" means "the port is closed".
-        while !self.accept.is_finished() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut resources = self.resources_closed.clone();
+        while !*resources.borrow() {
+            if resources.changed().await.is_err() {
+                complete = true;
+                break;
+            }
         }
-        // Connection writer/result tasks retain shared until their stream and
-        // futures are actually destroyed. An abort notification is not enough.
-        while Arc::strong_count(&self.shared) > 1 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        if complete {
+            while !self.accept.is_finished() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            self.shared.work.scope().wait().await;
+            while Arc::strong_count(&self.shared) > 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
         if let Some(claim) = &self.claim {
             let ours = discovery::read(&claim.state_dir, &claim.key)
@@ -494,7 +636,12 @@ impl Drop for RunningHost {
 /// shutdown — the per-connection liveness watch drops and every subtask
 /// (writer, heartbeat, subscription forwarders) exits promptly.
 async fn serve_conn(stream: TcpStream, shared: Arc<HostShared>) {
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
+    shared.writers.fetch_add(1, Ordering::AcqRel);
+    let mut socket = WriterSocket {
+        stream: write_half,
+        _live: LiveWriter(Arc::clone(&shared)),
+    };
     let mut lines = BufReader::new(read_half).lines();
     let mut shutdown = shared.shutdown.clone();
 
@@ -522,7 +669,7 @@ async fn serve_conn(stream: TcpStream, shared: Arc<HostShared>) {
                 let settles = matches!(frame, Frame::CallResult { .. });
                 if !broken && let Ok(mut line) = frame.to_line() {
                     line.push('\n');
-                    broken = write_half.write_all(line.as_bytes()).await.is_err();
+                    broken = socket.write_all(line.as_bytes()).await.is_err();
                 }
                 if settles {
                     shared.unsettled.fetch_sub(1, Ordering::AcqRel);
@@ -620,43 +767,15 @@ async fn serve_conn(stream: TcpStream, shared: Arc<HostShared>) {
             Ok(Frame::Call { id, tool, args }) => {
                 shared.unsettled.fetch_add(1, Ordering::AcqRel);
                 in_flight.fetch_add(1, Ordering::Relaxed);
-                let tx = tx.clone();
-                let shared = Arc::clone(&shared);
-                let in_flight = Arc::clone(&in_flight);
-                let origin = client.clone();
-                tokio::spawn(async move {
-                    let outcome = match shared.queue(Some(origin), tool, args) {
-                        Ok(rx) => rx.await.ok(),
-                        Err(_) => None,
-                    };
-                    in_flight.fetch_sub(1, Ordering::Relaxed);
-                    let Some(outcome) = outcome.filter(|_| !*shared.shutdown.borrow()) else {
-                        // Lease teardown is endpoint loss, not a tool error.
-                        // Never race socket closure with a fabricated result:
-                        // reads retry once and mutations surface failover.
-                        shared.unsettled.fetch_sub(1, Ordering::AcqRel);
-                        return;
-                    };
-                    let frame = match outcome {
-                        Ok(result) => Frame::CallResult {
-                            id,
-                            ok: true,
-                            result: Some(result),
-                            error: None,
-                        },
-                        Err(error) => Frame::CallResult {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(error),
-                        },
-                    };
-                    if tx.send(frame).await.is_err() {
-                        // The writer is gone; the result can never be
-                        // written — settle the drain counter ourselves.
-                        shared.unsettled.fetch_sub(1, Ordering::AcqRel);
-                    }
-                });
+                let reply = WireReply {
+                    id,
+                    tx: tx.clone(),
+                    in_flight: Arc::clone(&in_flight),
+                    shared: Arc::clone(&shared),
+                    counting_flight: true,
+                    counting_settlement: true,
+                };
+                shared.queue_wire(client.clone(), tool, args, reply);
             }
             Ok(Frame::Subscribe) => {
                 let _ = tx.send(Frame::Subscribed).await;

@@ -181,14 +181,15 @@ impl RealEffects {
         let input = args.clone();
         let owned_flake = flake.to_string();
         let owned_operation = operation.to_string();
-        let mut result =
-            match tokio::task::spawn_blocking(move || call(&owned_flake, &owned_operation, &input))
-                .await
-                .map_err(io::Error::other)?
-            {
-                Ok(value) => value,
-                Err(error) => return Ok(refusal(error)),
-            };
+        let mut result = match mandala_context::work::spawn_blocking(move || {
+            call(&owned_flake, &owned_operation, &input)
+        })
+        .await
+        .map_err(io::Error::other)?
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(refusal(error)),
+        };
         let start = should_start(operation, &args, &result);
         if !start {
             return Ok(result);

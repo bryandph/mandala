@@ -26,6 +26,7 @@ pub mod fleet;
 pub mod host;
 pub mod identity;
 pub mod protocol;
+pub mod work;
 
 #[cfg(test)]
 #[path = "../tests/common/refusal.rs"]
@@ -211,7 +212,7 @@ pub async fn acquire_with_options(
     // abandoned by an election deadline: callers cannot start an MCP error
     // server until this listener/config/task teardown has actually finished.
     if let Some(host) = failed_host {
-        host.shutdown(Duration::ZERO).await;
+        host.shutdown_complete(Duration::ZERO).await;
     }
     result
 }
@@ -262,6 +263,7 @@ async fn acquire_guarded(
     failed_host: &mut Option<RunningHost>,
     config: impl FnOnce() -> HostConfig,
 ) -> Result<Acquired, AcquireError> {
+    let work = work::WorkOwner::new(Some(lease));
     let mut config = Some(config);
     // Reuse the context's token when a discovery file for OUR flake exists —
     // stable across leader restarts (spec: token mint/reuse). A stale or
@@ -314,13 +316,14 @@ async fn acquire_guarded(
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         match TcpListener::bind(addr).await {
             Ok(listener) => {
-                let config = config.take().expect("the leader path runs at most once")();
+                let config =
+                    work.factory(config.take().expect("the leader path runs at most once"));
                 let host = RunningHost::start_guarded(
                     listener,
                     token.clone(),
                     identity.flake().to_string(),
                     config,
-                    Some(lease),
+                    work,
                 )
                 .published_at(state_dir, identity.key());
                 if let Err(error) = discovery::write(

@@ -623,9 +623,11 @@ fn watching_stub_factory(flake: PathBuf, reload_count: Arc<AtomicUsize>) -> Host
                 let _ = sink_events.send(event.clone());
             })),
         );
-        spawn_handler_head_watch(&flake.to_string_lossy(), &handler)
+        let watcher = spawn_handler_head_watch(&flake.to_string_lossy(), &handler)
             .expect("test checkout has a Git HEAD");
-        HostConfig::new(handler_dispatch(handler), events)
+        let config = HostConfig::new(handler_dispatch(handler), events);
+        config.background_tasks.lock().unwrap().push(watcher);
+        config
     })
 }
 
