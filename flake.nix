@@ -134,6 +134,8 @@
         # repositories during `cargo test`; Git is check-only and does not
         # enter the shipped runtime closure.
         nativeCheckInputs = [pkgs.gitMinimal];
+        # Context and MCP tests bind 127.0.0.1; the Darwin sandbox denies that.
+        __darwinAllowLocalNetworking = true;
 
         # The eval-worker regression (tests/git_reload.rs) runs the REAL
         # libnixexpr worker, and `Store::open(None)` needs a writable store to
