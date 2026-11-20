@@ -37,8 +37,10 @@ impl Drop for ServerProcess {
 struct ParkedChild(i32);
 impl Drop for ParkedChild {
     fn drop(&mut self) {
-        unsafe {
-            nix::libc::kill(self.0, nix::libc::SIGKILL);
+        if self.0 > 0 {
+            unsafe {
+                nix::libc::kill(self.0, nix::libc::SIGKILL);
+            }
         }
     }
 }
@@ -286,7 +288,7 @@ async fn inherited_listener_fails_closed_until_child_exec_or_exit() {
             }
         }
         let fork = fork.unwrap();
-        let _cleanup_child = ParkedChild(fork);
+        let mut cleanup_child = ParkedChild(fork);
         let Acquired::Follower(client) = common::acquire(&identity, &state, "before", || {
             panic!("parent excludes factory")
         })
@@ -322,6 +324,11 @@ async fn inherited_listener_fails_closed_until_child_exec_or_exit() {
             discovery::read(&state, identity.key()).unwrap().url,
             old.url
         );
+        // Exit is controlled by the pipe, not a later PID-based signal. Do
+        // not retain a cleanup signal for a PID that may already be reaped.
+        if action == b'x' {
+            cleanup_child.0 = 0;
+        }
         control.write_all(&[action]).unwrap();
         control.flush().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
