@@ -165,7 +165,7 @@ impl BlockingScope {
             abort.abort();
         }
     }
-    fn closed(&self) -> bool {
+    pub(crate) fn closed(&self) -> bool {
         self.inner
             .state
             .lock()

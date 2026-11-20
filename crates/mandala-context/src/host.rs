@@ -183,7 +183,7 @@ impl WireReply {
     async fn send(mut self, outcome: Result<Value, String>) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
         self.counting_flight = false;
-        if *self.shared.shutdown.borrow() {
+        if *self.shared.shutdown.borrow() || self.shared.work.scope().closed() {
             return;
         }
         let frame = match outcome {
@@ -360,7 +360,7 @@ impl HostShared {
         tool: String,
         args: serde_json::Map<String, Value>,
     ) -> Result<oneshot::Receiver<Result<Value, String>>, String> {
-        if *self.shutdown.borrow() {
+        if *self.shutdown.borrow() || self.work.scope().closed() {
             return Err("context closed".into());
         }
         let (result, rx) = oneshot::channel();
@@ -385,7 +385,7 @@ impl HostShared {
         args: serde_json::Map<String, Value>,
         reply: WireReply,
     ) {
-        if *self.shutdown.borrow() {
+        if *self.shutdown.borrow() || self.work.scope().closed() {
             return;
         }
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -592,6 +592,7 @@ impl RunningHost {
         {
             tokio::time::sleep(DRAIN_POLL).await;
         }
+        self.shared.work.scope().close();
         let _ = self.shutdown_tx.send(true);
         let mut resources = self.resources_closed.clone();
         while !*resources.borrow() {
@@ -622,6 +623,7 @@ impl RunningHost {
 
 impl Drop for RunningHost {
     fn drop(&mut self) {
+        self.shared.work.scope().close();
         // Abrupt death: kill everything NOW — no drain, and no discovery
         // release (the next claimant reuses the stale file's token, exactly
         // like a crashed process).

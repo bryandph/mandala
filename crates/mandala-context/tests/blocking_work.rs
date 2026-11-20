@@ -319,7 +319,7 @@ fn runtime_cancellation_keeps_the_guard_until_running_work_ends() {
 }
 
 #[test]
-fn queued_registered_job_never_starts_after_teardown() {
+fn queued_registered_and_snapshot_jobs_never_start_after_teardown() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .max_blocking_threads(1)
@@ -327,76 +327,94 @@ fn queued_registered_job_never_starts_after_teardown() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let (root, identity, state, _) = fixture("queued", 29960);
-        let pool_gate = Gate::new();
-        let _release = Release(pool_gate.clone());
-        let entered = Arc::new(Notify::new());
-        let blocker_gate = pool_gate.clone();
-        let blocker_entered = entered.clone();
-        // Deliberately occupy the only blocking worker, outside any lease.
-        let blocker = tokio::task::spawn_blocking(move || {
-            blocker_entered.notify_one();
-            blocker_gate.wait();
-        });
-        entered.notified().await;
-        let started = Arc::new(AtomicUsize::new(0));
-        let queued = Arc::new(Notify::new());
-        let calls = started.clone();
-        let queued_notice = queued.clone();
-        let (events, _) = broadcast::channel(8);
-        let cfg = HostConfig::new(
-            Arc::new(move |_, _, _| {
-                let calls = calls.clone();
-                let queued = queued_notice.clone();
-                Box::pin(async move {
-                    let pending = work::spawn_blocking(move || {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Value::Null
-                    });
-                    // Registration/queueing is synchronous, not a timing guess.
-                    queued.notify_one();
-                    pending.await.map_err(|e| e.to_string())
-                })
-            }),
-            events,
-        );
-        let Acquired::Leader(host) = common::acquire(&identity, &state, "original", || cfg)
-            .await
-            .unwrap()
-        else {
-            panic!("leader");
-        };
-        let Acquired::Follower(client) =
-            common::acquire(&identity, &state, "caller", || panic!("follower factory"))
+        for registered in [true, false] {
+            let (root, identity, state, _) = fixture(
+                if registered {
+                    "queued"
+                } else {
+                    "queued-snapshot"
+                },
+                if registered { 29960 } else { 29976 },
+            );
+            let pool_gate = Gate::new();
+            let _release = Release(pool_gate.clone());
+            let entered = Arc::new(Notify::new());
+            let blocker_gate = pool_gate.clone();
+            let blocker_entered = entered.clone();
+            // Deliberately occupy the only blocking worker, outside any lease.
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_entered.notify_one();
+                blocker_gate.wait();
+            });
+            entered.notified().await;
+            let started = Arc::new(AtomicUsize::new(0));
+            let queued = Arc::new(Notify::new());
+            let calls = started.clone();
+            let queued_notice = queued.clone();
+            let (events, _) = broadcast::channel(8);
+            let cfg = HostConfig::new(
+                Arc::new(move |_, _, _| {
+                    let calls = calls.clone();
+                    let queued = queued_notice.clone();
+                    Box::pin(async move {
+                        let function = move || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Value::Null
+                        };
+                        // Registration/queueing is synchronous, not a timing guess.
+                        let result = if registered {
+                            let pending = work::spawn_blocking(function);
+                            queued.notify_one();
+                            pending.await
+                        } else {
+                            let pending = work::read_only_snapshot(function);
+                            queued.notify_one();
+                            pending.await
+                        };
+                        result.map_err(|e| e.to_string())
+                    })
+                }),
+                events,
+            );
+            let Acquired::Leader(host) = common::acquire(&identity, &state, "original", || cfg)
                 .await
                 .unwrap()
-        else {
-            panic!("follower");
-        };
-        let call = tokio::spawn(async move { client.call("queued", serde_json::Map::new()).await });
-        queued.notified().await;
-        host.shutdown(Duration::ZERO).await;
-        assert!(call.await.unwrap().is_err());
-        assert_eq!(started.load(Ordering::SeqCst), 0);
-        pool_gate.release();
-        blocker.await.unwrap();
-        let Acquired::Leader(replacement) =
-            common::acquire(&identity, &state, "replacement", || {
-                assert_eq!(
-                    started.load(Ordering::SeqCst),
-                    0,
-                    "cancelled queued job did not execute when the pool became available"
-                );
-                config()
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("replacement");
-        };
-        assert_eq!(started.load(Ordering::SeqCst), 0);
-        replacement.shutdown(Duration::ZERO).await;
-        std::fs::remove_dir_all(root).unwrap();
+            else {
+                panic!("leader");
+            };
+            let Acquired::Follower(client) =
+                common::acquire(&identity, &state, "caller", || panic!("follower factory"))
+                    .await
+                    .unwrap()
+            else {
+                panic!("follower");
+            };
+            let call =
+                tokio::spawn(async move { client.call("queued", serde_json::Map::new()).await });
+            queued.notified().await;
+            host.shutdown(Duration::ZERO).await;
+            assert!(call.await.unwrap().is_err());
+            assert_eq!(started.load(Ordering::SeqCst), 0);
+            pool_gate.release();
+            blocker.await.unwrap();
+            let Acquired::Leader(replacement) =
+                common::acquire(&identity, &state, "replacement", || {
+                    assert_eq!(
+                        started.load(Ordering::SeqCst),
+                        0,
+                        "cancelled queued job did not execute when the pool became available"
+                    );
+                    config()
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("replacement");
+            };
+            assert_eq!(started.load(Ordering::SeqCst), 0);
+            replacement.shutdown(Duration::ZERO).await;
+            std::fs::remove_dir_all(root).unwrap();
+        }
     });
 }
 
