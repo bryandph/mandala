@@ -106,9 +106,9 @@ async fn serve_over_stdio(handler: impl ToMcpServerHandler) -> SdkResult<()> {
 /// first read does). On stdin EOF a leader performs the orderly context
 /// shutdown (refuse-new → drain → close → guarded discovery release) BEFORE
 /// returning, so followers detect the death and re-race; a follower simply
-/// disconnects. When the checkout cannot host a context at all (non-path
-/// flake ref, exhausted port range) the server degrades loudly to the
-/// standalone context-free shape.
+/// disconnects. Non-path flake refs retain context-free standalone behavior.
+/// A canonical checkout's acquisition failure instead initializes an error-only
+/// MCP server: every tool reports the explicit error, with no effectful fallback.
 ///
 /// # Errors
 /// Propagates transport/runtime errors from the SDK.
@@ -119,13 +119,19 @@ pub async fn run_stdio(flake: &str) -> SdkResult<()> {
 /// Stdio frontend with explicit context options for isolated embedding/tests.
 ///
 /// # Errors
-/// Context coordination failures and SDK transport/runtime errors.
+/// SDK transport/runtime errors. Acquisition failures are explicit tool errors
+/// after successful MCP initialization, never an effectful fallback.
 pub async fn run_stdio_with_options(flake: &str, options: AcquireOptions) -> SdkResult<()> {
-    let Some(session) = join_context(flake, options)
-        .await
-        .map_err(std::io::Error::other)?
-    else {
-        return run_stdio_standalone(flake).await;
+    let session = match join_context(flake, options).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return run_stdio_standalone(flake).await,
+        Err(error) => {
+            // Acquisition already completed mandatory failed-host teardown.
+            // Keep protocol initialization responsive, but never degrade a
+            // canonical checkout into an unguarded effectful standalone core.
+            eprintln!("mandala mcp: context acquisition failed ({error}); all tools unavailable");
+            return serve_over_stdio(context::UnavailableContextHandler::new(&error)).await;
+        }
     };
     let result = serve_over_stdio(ContextHandler::new(session.clone())).await;
     // The stdio conversation is over: release leadership (or just hang up).
@@ -145,7 +151,7 @@ pub async fn run_stdio_standalone(flake: &str) -> SdkResult<()> {
 }
 
 /// Join (or claim) the fleet execution context for `flake`; `None` — with a
-/// stderr notice — when the checkout cannot host one.
+/// stderr notice — for a non-path flake; canonical acquisition errors remain errors.
 async fn join_context(
     flake: &str,
     options: AcquireOptions,
@@ -169,13 +175,7 @@ async fn join_context(
     .await
     {
         Ok(session) => Ok(Some(session)),
-        Err(e @ (AcquireError::CoordinationBusy | AcquireError::CoordinationUnavailable(_))) => {
-            Err(e)
-        }
-        Err(e) => {
-            eprintln!("mandala mcp: context unavailable ({e}); serving standalone");
-            Ok(None)
-        }
+        Err(error) => Err(error),
     }
 }
 

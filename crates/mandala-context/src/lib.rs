@@ -1,18 +1,18 @@
 //! mandala-context — the shared fleet execution context substrate (OpenSpec
 //! change `mandala-native-tui`, capability `fleet-context`; spike task 1.1).
 //!
-//! One execution context per canonical flake path. Leadership is acquired by
-//! **binding the loopback coordination endpoint — the bind IS the lock**:
-//! kernel-arbitrated, atomic, self-cleaning on process death, no lockfile
-//! protocol anywhere. The discovery file
+//! One execution context per canonical flake path. Leadership holds a keyed
+//! in-process mutex and a whole-file POSIX process record lock for its entire
+//! lifetime. Binding chooses the endpoint only after guarded revalidation.
+//! The discovery file
 //! (`<state_dir>/mcp/contexts/<key>.json`, 0600) is metadata only —
 //! `{url, token, pid, flake}` — and liveness is judged solely by connecting;
 //! pids are advisory (recycled-pid caveat carried over from phase 1).
 //!
 //! [`acquire`] is the one entry point: probe the discovery url first (it is
 //! authoritative for clients — the leader may sit on a walked port), scan the
-//! identity's full deterministic port sequence for an existing leader, then
-//! walk it again to race the bind. The full scan keeps a free earlier port
+//! identity's full deterministic port sequence for an existing leader under
+//! the lifetime guards, then walk it again to bind. Serialization and the full scan keep a free earlier port
 //! from hiding our leader on a later port when discovery is missing or stale.
 //! A live listener whose rejection reports a *different* flake is another
 //! context squatting our derived port — step to the next port; one reporting
@@ -131,7 +131,7 @@ const BUSY_PROBE_ATTEMPTS: u32 = 3;
 const BUSY_PROBE_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Acquire the context for `identity`: join the live leader if one answers,
-/// else bind-as-lock and become it.
+/// else acquire both lifetime guards, revalidate, bind and become it.
 ///
 /// `client_name` is this process's identity in hellos (labels its calls in
 /// the leader's activity stream). `config` is a factory invoked ONLY on the
@@ -169,9 +169,10 @@ pub async fn acquire_with_options(
 ) -> Result<Acquired, AcquireError> {
     election::validate_root(&options).map_err(AcquireError::CoordinationUnavailable)?;
     let mut config = Some(config);
+    let mut failed_host = None;
     // One budget includes mutex/process-lock waits, busy probes and token
     // refresh. It stays within frontend initialization's ~30-second budget.
-    tokio::time::timeout(Duration::from_secs(24), async {
+    let result = tokio::time::timeout(Duration::from_secs(24), async {
         loop {
             if let Some(joined) = join_existing(identity, state_dir, client_name, false).await? {
                 return Ok(joined);
@@ -187,6 +188,7 @@ pub async fn acquire_with_options(
                     state_dir,
                     client_name,
                     lease,
+                    &mut failed_host,
                     config.take().expect("factory once"),
                 )
                 .await;
@@ -200,7 +202,14 @@ pub async fn acquire_with_options(
         }
     })
     .await
-    .unwrap_or(Err(AcquireError::CoordinationBusy))
+    .unwrap_or(Err(AcquireError::CoordinationBusy));
+    // Publication failure owns a started host. Mandatory cleanup is not
+    // abandoned by an election deadline: callers cannot start an MCP error
+    // server until this listener/config/task teardown has actually finished.
+    if let Some(host) = failed_host {
+        host.shutdown(Duration::ZERO).await;
+    }
+    result
 }
 
 async fn join_existing(
@@ -246,6 +255,7 @@ async fn acquire_guarded(
     state_dir: &Path,
     client_name: &str,
     lease: election::ElectionLease,
+    failed_host: &mut Option<RunningHost>,
     config: impl FnOnce() -> HostConfig,
 ) -> Result<Acquired, AcquireError> {
     let mut config = Some(config);
@@ -309,7 +319,7 @@ async fn acquire_guarded(
                     Some(lease),
                 )
                 .published_at(state_dir, identity.key());
-                discovery::write(
+                if let Err(error) = discovery::write(
                     state_dir,
                     identity.key(),
                     &Discovery {
@@ -318,7 +328,10 @@ async fn acquire_guarded(
                         pid: std::process::id(),
                         flake: identity.flake().to_string(),
                     },
-                )?;
+                ) {
+                    *failed_host = Some(host);
+                    return Err(error.into());
+                }
                 return Ok(Acquired::Leader(host));
             }
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {

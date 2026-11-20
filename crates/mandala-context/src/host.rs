@@ -1,5 +1,5 @@
-//! The leader side of the context endpoint: a bound loopback listener (the
-//! bind IS the lock) serving protocol-v1 connections.
+//! The leader side: a loopback listener serving protocol-v1 connections,
+//! owned together with the lifetime coordination lease on acquisition.
 //!
 //! Per connection: bearer hello before anything else, then a read loop that
 //! spawns each `call` into its own task (calls run concurrently; a blocking
@@ -291,8 +291,8 @@ impl HostShared {
     }
 }
 
-/// A live, serving context endpoint — holding this IS holding leadership;
-/// dropping it (or process death) releases the bind and with it the lock.
+/// A live endpoint. Acquired hosts retain leadership until their listener
+/// and dispatched work have actually stopped; Drop requests owned teardown.
 pub struct RunningHost {
     port: u16,
     accept: JoinHandle<()>,
@@ -302,8 +302,8 @@ pub struct RunningHost {
 }
 
 impl RunningHost {
-    /// Serve an already-bound listener (the caller's successful bind is the
-    /// acquired lock).
+    /// Serve an already-bound listener without an election lease (the
+    /// isolated protocol-test seam). Production acquisition uses start_guarded.
     ///
     /// # Panics
     /// The listener has no local address (cannot happen for a bound TCP
@@ -460,6 +460,11 @@ impl RunningHost {
         // The accept task drops the listener when it exits; wait for that so
         // "shutdown returned" means "the port is closed".
         while !self.accept.is_finished() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Connection writer/result tasks retain shared until their stream and
+        // futures are actually destroyed. An abort notification is not enough.
+        while Arc::strong_count(&self.shared) > 1 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         if let Some(claim) = &self.claim {

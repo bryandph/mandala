@@ -1,6 +1,6 @@
 [package]
 name = "mandala-context"
-description = "Shared fleet execution context: bind-as-lock leadership, discovery, and the line-JSON coordination protocol"
+description = "Shared fleet execution context: lifetime-locked leadership, discovery, and the line-JSON coordination protocol"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
