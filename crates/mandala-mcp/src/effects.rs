@@ -231,7 +231,7 @@ impl Effects for RealEffects {
         }
         let evaluator = Arc::clone(&self.evaluator);
         let flake = flake.to_string();
-        tokio::task::spawn_blocking(move || {
+        mandala_context::work::spawn_blocking(move || {
             let mut guard = evaluator
                 .lock()
                 .map_err(|_| InventoryError::Eval("evaluator lock poisoned".to_string()))?;
@@ -252,7 +252,7 @@ impl Effects for RealEffects {
         let evaluator = Arc::clone(&self.evaluator);
         let flake = flake.to_string();
         let members = members.to_vec();
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = mandala_context::work::spawn_blocking(move || {
             let mut guard = evaluator
                 .lock()
                 .map_err(|_| drift::DriftError::Eval("evaluator lock poisoned".to_string()))?;
@@ -276,7 +276,7 @@ impl Effects for RealEffects {
 
     async fn repo_rev(&self, flake: &str) -> Option<String> {
         let flake = flake.to_string();
-        tokio::task::spawn_blocking(move || drift::repo_rev(&flake))
+        mandala_context::work::spawn_blocking(move || drift::repo_rev(&flake))
             .await
             .ok()
             .flatten()

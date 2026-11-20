@@ -8,6 +8,9 @@
 //! no discovery release — connections die, the stale file stays, exactly
 //! like a killed process).
 
+mod common;
+
+use common::acquire;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,13 +21,14 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    AcquireError, Acquired, CallError, ContextIdentity, ContextSession, FleetContext, HostConfig,
-    HostConfigFactory, RunningHost, acquire, discovery,
+    AcquireError, Acquired, CallError, ContextIdentity, FleetContext, HostConfig,
+    HostConfigFactory, RunningHost, discovery,
 };
 
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)
 /// and `state/` (the isolated mandala state dir).
 fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+    common::refusal_preflight();
     let base = std::env::temp_dir().join(format!(
         "mandala-context-failover-{tag}-{}-{}",
         std::process::id(),
@@ -75,6 +79,7 @@ fn factory(
         dispatch: labeled_dispatch(&label, Arc::clone(&calls), events.clone()),
         events: events.clone(),
         heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+        background_tasks: Arc::default(),
     })
 }
 
@@ -112,6 +117,7 @@ async fn occupy_first_as_foreign(identity: &ContextIdentity) -> RunningHost {
             dispatch: labeled_dispatch("foreign", calls, events.clone()),
             events,
             heartbeat_interval: HostConfig::DEFAULT_HEARTBEAT,
+            background_tasks: Arc::default(),
         },
     )
 }
@@ -129,7 +135,7 @@ async fn idempotent_read_retries_once_after_promotion() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
@@ -185,7 +191,7 @@ async fn mutation_surfaces_structured_failover_without_retry() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
@@ -236,7 +242,7 @@ async fn call_issued_after_leader_death_fails_over_without_hanging() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",
@@ -278,7 +284,7 @@ async fn simultaneous_promotion_race_has_exactly_one_winner() {
     for i in 0..3 {
         let (events, _) = broadcast::channel(64);
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = ContextSession::acquire(
+        let session = common::session_acquire(
             identity.clone(),
             &state,
             &format!("session-{i}"),
@@ -321,6 +327,36 @@ async fn simultaneous_promotion_race_has_exactly_one_winner() {
         if session.is_leader().await {
             leaders += 1;
             winner = Some(format!("s{i}"));
+        }
+    }
+    // LAB-218 diagnosis only: distinguish stale role flags from two live
+    // context endpoints, without changing acquisition or timing on success.
+    if leaders != 1 {
+        eprintln!(
+            "LAB-218 leaders={leaders}, served_by={served_by:?}, flake={}",
+            identity.flake()
+        );
+        let d = discovery::read(&state, identity.key()).unwrap();
+        for port in identity.ports() {
+            let addr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+            if let Ok(client) = mandala_context::ContextClient::connect(
+                addr,
+                &d.token,
+                "lab218-observer",
+                identity.flake(),
+            )
+            .await
+            {
+                let result = client.call("read", serde_json::Map::new()).await;
+                eprintln!("LAB-218 live endpoint port={port}, result={result:?}");
+            }
+        }
+        for (i, session) in sessions.iter().enumerate() {
+            let result = session.call("read", serde_json::Map::new(), true).await;
+            eprintln!(
+                "LAB-218 session={i}, leader={}, result={result:?}",
+                session.is_leader().await
+            );
         }
     }
     assert_eq!(leaders, 1, "the bind arbitrates exactly one promotion");
@@ -400,7 +436,7 @@ async fn missing_discovery_never_hides_a_walked_leader() {
     let cfg = factory("joiner", calls, events);
     let result = acquire(&identity, &state, "joiner", move || (cfg)()).await;
     assert!(
-        matches!(result, Err(AcquireError::TokenUnavailable)),
+        matches!(result, Err(AcquireError::CoordinationBusy)),
         "the live walked leader must block a second claim"
     );
 
@@ -434,7 +470,7 @@ async fn subscribe_stream_resumes_across_promotion() {
 
     let (events_s, _) = broadcast::channel(64);
     let calls_s = Arc::new(AtomicUsize::new(0));
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state,
         "session-s",

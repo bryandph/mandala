@@ -31,7 +31,7 @@ pub mod tools;
 
 use std::time::Duration;
 
-use mandala_context::{ContextIdentity, ContextSession};
+use mandala_context::{AcquireError, AcquireOptions, ContextIdentity, ContextSession};
 use rust_mcp_sdk::error::SdkResult;
 use rust_mcp_sdk::mcp_server::{McpServerOptions, ToMcpServerHandler, server_runtime};
 use rust_mcp_sdk::schema::{
@@ -106,15 +106,32 @@ async fn serve_over_stdio(handler: impl ToMcpServerHandler) -> SdkResult<()> {
 /// first read does). On stdin EOF a leader performs the orderly context
 /// shutdown (refuse-new → drain → close → guarded discovery release) BEFORE
 /// returning, so followers detect the death and re-race; a follower simply
-/// disconnects. When the checkout cannot host a context at all (non-path
-/// flake ref, exhausted port range) the server degrades loudly to the
-/// standalone context-free shape.
+/// disconnects. Non-path flake refs retain context-free standalone behavior.
+/// A canonical checkout's acquisition failure instead initializes an error-only
+/// MCP server: every tool reports the explicit error, with no effectful fallback.
 ///
 /// # Errors
 /// Propagates transport/runtime errors from the SDK.
 pub async fn run_stdio(flake: &str) -> SdkResult<()> {
-    let Some(session) = join_context(flake).await else {
-        return run_stdio_standalone(flake).await;
+    run_stdio_with_options(flake, AcquireOptions::default()).await
+}
+
+/// Stdio frontend with explicit context options for isolated embedding/tests.
+///
+/// # Errors
+/// SDK transport/runtime errors. Acquisition failures are explicit tool errors
+/// after successful MCP initialization, never an effectful fallback.
+pub async fn run_stdio_with_options(flake: &str, options: AcquireOptions) -> SdkResult<()> {
+    let session = match join_context(flake, options).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return run_stdio_standalone(flake).await,
+        Err(error) => {
+            // Acquisition already completed mandatory failed-host teardown.
+            // Keep protocol initialization responsive, but never degrade a
+            // canonical checkout into an unguarded effectful standalone core.
+            eprintln!("mandala mcp: context acquisition failed ({error}); all tools unavailable");
+            return serve_over_stdio(context::UnavailableContextHandler::new(&error)).await;
+        }
     };
     let result = serve_over_stdio(ContextHandler::new(session.clone())).await;
     // The stdio conversation is over: release leadership (or just hang up).
@@ -134,30 +151,31 @@ pub async fn run_stdio_standalone(flake: &str) -> SdkResult<()> {
 }
 
 /// Join (or claim) the fleet execution context for `flake`; `None` — with a
-/// stderr notice — when the checkout cannot host one.
-async fn join_context(flake: &str) -> Option<ContextSession> {
+/// stderr notice — for a non-path flake; canonical acquisition errors remain errors.
+async fn join_context(
+    flake: &str,
+    options: AcquireOptions,
+) -> Result<Option<ContextSession>, AcquireError> {
     let identity = match ContextIdentity::for_flake(flake) {
         Ok(identity) => identity,
         Err(e) => {
             eprintln!("mandala mcp: no context for flake '{flake}' ({e}); serving standalone");
-            return None;
+            return Ok(None);
         }
     };
     let state_dir = mandala_core::drift::state_dir();
     let client_name = format!("mcp-{}", std::process::id());
-    match ContextSession::acquire(
+    match ContextSession::acquire_with_options(
         identity,
         state_dir,
         client_name,
         context::host_config_factory(flake),
+        options,
     )
     .await
     {
-        Ok(session) => Some(session),
-        Err(e) => {
-            eprintln!("mandala mcp: context unavailable ({e}); serving standalone");
-            None
-        }
+        Ok(session) => Ok(Some(session)),
+        Err(error) => Err(error),
     }
 }
 
@@ -175,10 +193,30 @@ async fn join_context(flake: &str) -> Option<ContextSession> {
 /// # Errors
 /// Propagates any runtime-build or transport error.
 pub fn serve_stdio_blocking(flake: &str) -> Result<(), Box<dyn std::error::Error>> {
+    serve_stdio_blocking_with_root(flake, None)
+}
+
+/// Blocking frontend with an explicit, pre-created isolated coordination root.
+///
+/// # Errors
+/// See [`serve_stdio_blocking`].
+pub fn serve_stdio_blocking_with_root(
+    flake: &str,
+    coordination_root: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = rt.block_on(async { run_stdio(flake).await });
+    let result = rt.block_on(async {
+        run_stdio_with_options(
+            flake,
+            AcquireOptions {
+                coordination_root,
+                ..AcquireOptions::default()
+            },
+        )
+        .await
+    });
     mandala_core::eval::shutdown_workers();
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
     result?;

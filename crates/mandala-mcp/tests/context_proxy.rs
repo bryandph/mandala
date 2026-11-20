@@ -24,6 +24,10 @@
 //! isolated via `MANDALA_FLEET_STATE`. One test fn: the seam vars are
 //! process-global.
 
+#[path = "../../mandala-context/tests/common/mod.rs"]
+mod common;
+
+use common::acquire;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,8 +35,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, ContextClient, ContextIdentity, ContextSession, FleetContext, HostConfig,
-    LocalContext, acquire, discovery,
+    Acquired, ContextClient, ContextIdentity, FleetContext, HostConfig, LocalContext, discovery,
 };
 use mandala_mcp::MandalaHandler;
 
@@ -143,7 +146,7 @@ async fn fleet_context_seam_is_byte_identical_and_origin_labeled() {
     // Leader-local: the injected dispatch, directly.
     let local: Box<dyn FleetContext> = Box::new(LocalContext::new(dispatch, events));
     // Follower: a second instance detects the live leader and forwards.
-    let session = ContextSession::acquire(
+    let session = common::session_acquire(
         identity.clone(),
         &state_dir,
         "agent-claude",

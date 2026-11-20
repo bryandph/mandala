@@ -29,7 +29,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use mandala_context::{CallError, ContextIdentity, ContextSession, FleetContext};
+use mandala_context::{
+    AcquireError, AcquireOptions, CallError, ContextIdentity, ContextSession, FleetContext,
+};
 use mandala_core::drift;
 use mandala_core::inventory::{Inventory, SUPPORTED_SCHEMA_VERSION};
 use serde_json::{Value, json};
@@ -66,35 +68,48 @@ pub struct TuiContext {
 /// factory. `None` (with a stderr notice — the terminal is not yet in raw
 /// mode) when the checkout cannot host a context; the explorer then runs on
 /// its local evaluator exactly as before.
-pub async fn join_context(flake: &str) -> Option<TuiContext> {
+pub async fn join_context(flake: &str) -> std::io::Result<Option<TuiContext>> {
+    join_context_with_options(flake, AcquireOptions::default()).await
+}
+
+/// Join with explicitly injected coordination options; never fall back to
+/// leader-side local execution when coordination is unsafe or unavailable.
+pub async fn join_context_with_options(
+    flake: &str,
+    options: AcquireOptions,
+) -> std::io::Result<Option<TuiContext>> {
     let identity = match ContextIdentity::for_flake(flake) {
         Ok(identity) => identity,
         Err(e) => {
             eprintln!("mandala tui: no context for flake '{flake}' ({e}); evaluating locally");
-            return None;
+            return Ok(None);
         }
     };
     let state_dir = drift::state_dir();
     let client_name = format!("tui-{}", std::process::id());
-    match ContextSession::acquire(
+    match ContextSession::acquire_with_options(
         identity,
         state_dir,
         client_name.clone(),
         mandala_mcp::quiet_host_config_factory(flake),
+        options,
     )
     .await
     {
         Ok(session) => {
             let leader = session.is_leader().await;
-            Some(TuiContext {
+            Ok(Some(TuiContext {
                 session,
                 client_name,
                 leader,
-            })
+            }))
+        }
+        Err(e @ (AcquireError::CoordinationBusy | AcquireError::CoordinationUnavailable(_))) => {
+            Err(std::io::Error::other(e))
         }
         Err(e) => {
             eprintln!("mandala tui: context unavailable ({e}); evaluating locally");
-            None
+            Ok(None)
         }
     }
 }

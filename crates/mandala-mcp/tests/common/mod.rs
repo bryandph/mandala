@@ -7,6 +7,11 @@
 
 #![allow(dead_code)] // each test binary uses its own subset
 
+#[path = "../../../mandala-context/tests/common/mod.rs"]
+mod election_fixture;
+#[allow(unused_imports)]
+pub use election_fixture::{acquire, session_acquire};
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use crate::client::{CallFailure, ContextClient};
 use crate::host::{Dispatch, HostConfig, RunningHost};
 use crate::identity::ContextIdentity;
-use crate::{AcquireError, Acquired, acquire};
+use crate::{AcquireError, AcquireOptions, Acquired, acquire_with_options};
 
 /// Produces the leader-side [`HostConfig`] — the promotion hook. Invoked
 /// exactly when this process becomes (or re-becomes) the leader, so the
@@ -154,9 +154,8 @@ enum Role {
     /// This process IS the leader: it holds the bind and executes locally.
     Leader {
         host: RunningHost,
-        /// The promoted config, kept so local calls and subscriptions use
-        /// exactly what remote callers are served with.
-        config: HostConfig,
+        /// Events do not retain callable leader configuration.
+        events: broadcast::Sender<Value>,
     },
     /// A live leader answers: calls forward over this connection.
     Follower { client: Arc<ContextClient> },
@@ -176,6 +175,7 @@ struct SessionInner {
     state_dir: PathBuf,
     client_name: String,
     make_host: HostConfigFactory,
+    options: AcquireOptions,
     role: Mutex<Role>,
 }
 
@@ -203,15 +203,37 @@ impl ContextSession {
         client_name: impl Into<String>,
         make_host: HostConfigFactory,
     ) -> Result<Self, AcquireError> {
+        Self::acquire_with_options(
+            identity,
+            state_dir,
+            client_name,
+            make_host,
+            AcquireOptions::default(),
+        )
+        .await
+    }
+
+    /// Join with explicit options, retained for every reacquisition.
+    ///
+    /// # Errors
+    /// See [`Self::acquire`].
+    pub async fn acquire_with_options(
+        identity: ContextIdentity,
+        state_dir: impl Into<PathBuf>,
+        client_name: impl Into<String>,
+        make_host: HostConfigFactory,
+        options: AcquireOptions,
+    ) -> Result<Self, AcquireError> {
         let state_dir = state_dir.into();
         let client_name = client_name.into();
-        let role = acquire_role(&identity, &state_dir, &client_name, &make_host).await?;
+        let role = acquire_role(&identity, &state_dir, &client_name, &make_host, &options).await?;
         Ok(Self {
             inner: Arc::new(SessionInner {
                 identity,
                 state_dir,
                 client_name,
                 make_host,
+                options,
                 role: Mutex::new(role),
             }),
         })
@@ -238,7 +260,7 @@ impl ContextSession {
     /// The current executable snapshot.
     async fn snapshot(&self) -> Result<Exec, CallError> {
         match &*self.inner.role.lock().await {
-            Role::Leader { config, .. } => Ok(Exec::Local(Arc::clone(&config.dispatch))),
+            Role::Leader { host, .. } => Ok(Exec::Local(host.local_dispatch())),
             Role::Follower { client } => Ok(Exec::Remote(Arc::clone(client))),
             Role::Closed => Err(CallError::Closed),
         }
@@ -267,6 +289,7 @@ impl ContextSession {
             &self.inner.state_dir,
             &self.inner.client_name,
             &self.inner.make_host,
+            &self.inner.options,
         )
         .await
         .map_err(CallError::Acquire)?;
@@ -304,18 +327,19 @@ async fn acquire_role(
     state_dir: &std::path::Path,
     client_name: &str,
     make_host: &HostConfigFactory,
+    options: &AcquireOptions,
 ) -> Result<Role, AcquireError> {
-    let mut kept: Option<HostConfig> = None;
-    let acquired = acquire(identity, state_dir, client_name, || {
+    let mut kept = None;
+    let acquired = acquire_with_options(identity, state_dir, client_name, options.clone(), || {
         let config = (make_host)();
-        kept = Some(config.clone());
+        kept = Some(config.events.clone());
         config
     })
     .await?;
     Ok(match acquired {
         Acquired::Leader(host) => Role::Leader {
             host,
-            config: kept.expect("the factory ran on the leader path"),
+            events: kept.expect("the factory ran on the leader path"),
         },
         Acquired::Follower(client) => Role::Follower {
             client: Arc::new(client),
@@ -422,8 +446,8 @@ impl ContextSession {
     async fn attach(&self) -> Result<Attached, CallError> {
         loop {
             let client = match &*self.inner.role.lock().await {
-                Role::Leader { config, .. } => {
-                    return Ok(Attached::Local(config.events.subscribe()));
+                Role::Leader { events, .. } => {
+                    return Ok(Attached::Local(events.subscribe()));
                 }
                 Role::Follower { client } => Arc::clone(client),
                 Role::Closed => return Err(CallError::Closed),
@@ -438,5 +462,101 @@ impl ContextSession {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn refusal_preflight_requires_three_refusals_and_never_skips_timeouts() {
+        let mut calls = 0;
+        let result = crate::test_refusal::collect_refusals(|| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::ConnectionRefused.into())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 4, "occupied sample did not count as refused");
+        let mut calls = 0;
+        let result = crate::test_refusal::collect_refusals(|| {
+            calls += 1;
+            Err(std::io::ErrorKind::TimedOut.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "timeout fails immediately");
+        let mut calls = 0;
+        let result = crate::test_refusal::collect_refusals(|| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls, 12,
+            "occupied samples cannot produce success or unbounded retries"
+        );
+        assert!(
+            crate::test_refusal::collect_refusals(|| Err(
+                std::io::ErrorKind::PermissionDenied.into()
+            ))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_local_snapshot_cannot_invoke_config_after_shutdown() {
+        crate::test_refusal::refusal_preflight();
+        let root = std::env::temp_dir().join(format!("context-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flake")).unwrap();
+        let coordination = root.join("coordination");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&coordination)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let session = ContextSession::acquire_with_options(
+            ContextIdentity::with_port_range(root.join("flake"), 29924, 4).unwrap(),
+            root.join("state"),
+            "snapshot",
+            Arc::new(move || {
+                let count = count.clone();
+                let (events, _) = broadcast::channel(8);
+                HostConfig::new(
+                    Arc::new(move |_, _, _| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(Value::Null) })
+                    }),
+                    events,
+                )
+            }),
+            AcquireOptions {
+                coordination_root: Some(coordination.canonicalize().unwrap()),
+                ..AcquireOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let Exec::Local(snapshot) = session.snapshot().await.unwrap() else {
+            panic!("local");
+        };
+        session.shutdown(Duration::ZERO).await;
+        assert!(
+            snapshot(None, "late".into(), serde_json::Map::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "not even synchronous factory dispatch invocation escapes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

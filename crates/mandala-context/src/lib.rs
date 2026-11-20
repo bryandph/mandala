@@ -1,18 +1,18 @@
 //! mandala-context — the shared fleet execution context substrate (OpenSpec
 //! change `mandala-native-tui`, capability `fleet-context`; spike task 1.1).
 //!
-//! One execution context per canonical flake path. Leadership is acquired by
-//! **binding the loopback coordination endpoint — the bind IS the lock**:
-//! kernel-arbitrated, atomic, self-cleaning on process death, no lockfile
-//! protocol anywhere. The discovery file
+//! One execution context per canonical flake path. Leadership holds a keyed
+//! in-process mutex and a whole-file POSIX process record lock for its entire
+//! lifetime. Binding chooses the endpoint only after guarded revalidation.
+//! The discovery file
 //! (`<state_dir>/mcp/contexts/<key>.json`, 0600) is metadata only —
 //! `{url, token, pid, flake}` — and liveness is judged solely by connecting;
 //! pids are advisory (recycled-pid caveat carried over from phase 1).
 //!
 //! [`acquire`] is the one entry point: probe the discovery url first (it is
 //! authoritative for clients — the leader may sit on a walked port), scan the
-//! identity's full deterministic port sequence for an existing leader, then
-//! walk it again to race the bind. The full scan keeps a free earlier port
+//! identity's full deterministic port sequence for an existing leader under
+//! the lifetime guards, then walk it again to bind. Serialization and the full scan keep a free earlier port
 //! from hiding our leader on a later port when discovery is missing or stale.
 //! A live listener whose rejection reports a *different* flake is another
 //! context squatting our derived port — step to the next port; one reporting
@@ -21,14 +21,20 @@
 
 pub mod client;
 pub mod discovery;
+pub mod election;
 pub mod fleet;
 pub mod host;
 pub mod identity;
 pub mod protocol;
+pub mod work;
+
+#[cfg(test)]
+#[path = "../tests/common/refusal.rs"]
+mod test_refusal;
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -38,6 +44,19 @@ pub use discovery::{Discovery, mint_token};
 pub use fleet::{CallError, ContextSession, FleetContext, HostConfigFactory, LocalContext};
 pub use host::{Dispatch, DispatchFuture, HostConfig, RunningHost};
 pub use identity::ContextIdentity;
+
+/// Acquisition configuration, retained across session promotion.
+#[derive(Clone, Debug, Default)]
+pub struct AcquireOptions {
+    /// Explicit isolated coordination root. It must already exist and be
+    /// private; acquisition never creates an injected root. `None` uses the
+    /// stable account-home default, independently of client state overrides.
+    pub coordination_root: Option<PathBuf>,
+    /// Test observer fired immediately after a genuine guard attempt. It does
+    /// not gate production acquisition or change election decisions.
+    #[doc(hidden)]
+    pub election_attempt: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
 
 /// How the process joined the context.
 pub enum Acquired {
@@ -63,6 +82,10 @@ pub enum AcquireError {
     /// window: the leader is alive but wedged. The caller degrades to
     /// standalone — it must NOT claim a second leadership for the checkout.
     LeaderBusy,
+    /// The shared acquisition budget expired while another owner held coordination.
+    CoordinationBusy,
+    /// Unsafe/unavailable root or unsupported record locking: fail closed.
+    CoordinationUnavailable(election::CoordinationError),
 }
 
 impl From<io::Error> for AcquireError {
@@ -82,6 +105,11 @@ impl std::fmt::Display for AcquireError {
                     "live leader rejected our token and discovery never refreshed"
                 )
             }
+            Self::CoordinationBusy => write!(
+                f,
+                "context coordination busy/unavailable within acquisition deadline"
+            ),
+            Self::CoordinationUnavailable(e) => write!(f, "{e}"),
             Self::LeaderBusy => {
                 write!(
                     f,
@@ -108,7 +136,7 @@ const BUSY_PROBE_ATTEMPTS: u32 = 3;
 const BUSY_PROBE_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Acquire the context for `identity`: join the live leader if one answers,
-/// else bind-as-lock and become it.
+/// else acquire both lifetime guards, revalidate, bind and become it.
 ///
 /// `client_name` is this process's identity in hellos (labels its calls in
 /// the leader's activity stream). `config` is a factory invoked ONLY on the
@@ -123,6 +151,119 @@ pub async fn acquire(
     client_name: &str,
     config: impl FnOnce() -> HostConfig,
 ) -> Result<Acquired, AcquireError> {
+    acquire_with_options(
+        identity,
+        state_dir,
+        client_name,
+        AcquireOptions::default(),
+        config,
+    )
+    .await
+}
+
+/// Acquire with explicit options, including an isolated test coordination root.
+///
+/// # Errors
+/// See [`acquire`].
+pub async fn acquire_with_options(
+    identity: &ContextIdentity,
+    state_dir: &Path,
+    client_name: &str,
+    options: AcquireOptions,
+    config: impl FnOnce() -> HostConfig,
+) -> Result<Acquired, AcquireError> {
+    election::validate_root(&options).map_err(AcquireError::CoordinationUnavailable)?;
+    let mut config = Some(config);
+    let mut failed_host = None;
+    // One budget includes mutex/process-lock waits, busy probes and token
+    // refresh. It stays within frontend initialization's ~30-second budget.
+    let result = tokio::time::timeout(Duration::from_secs(24), async {
+        loop {
+            if let Some(joined) = join_existing(identity, state_dir, client_name, false).await? {
+                return Ok(joined);
+            }
+            let attempted = election::try_acquire(identity, &options)
+                .map_err(AcquireError::CoordinationUnavailable)?;
+            if let Some(observer) = &options.election_attempt {
+                observer.notify_one();
+            }
+            if let Some(lease) = attempted {
+                return acquire_guarded(
+                    identity,
+                    state_dir,
+                    client_name,
+                    lease,
+                    &mut failed_host,
+                    config.take().expect("factory once"),
+                )
+                .await;
+            }
+            // Another owner can be in its factory or use another discovery
+            // root. Try authenticated joining, never bind or run our factory.
+            if let Some(joined) = join_existing(identity, state_dir, client_name, true).await? {
+                return Ok(joined);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Err(AcquireError::CoordinationBusy));
+    // Publication failure owns a started host. Mandatory cleanup is not
+    // abandoned by an election deadline: callers cannot start an MCP error
+    // server until this listener/config/task teardown has actually finished.
+    if let Some(host) = failed_host {
+        host.shutdown_complete(Duration::ZERO).await;
+    }
+    result
+}
+
+async fn join_existing(
+    identity: &ContextIdentity,
+    state_dir: &Path,
+    client_name: &str,
+    scan: bool,
+) -> Result<Option<Acquired>, AcquireError> {
+    let existing = discovery::read(state_dir, identity.key())
+        .filter(|d| d.flake == identity.flake() && !d.token.is_empty());
+    let token = existing.as_ref().map_or("", |d| d.token.as_str());
+    let mut addrs = Vec::new();
+    if let Some(addr) = existing.as_ref().and_then(Discovery::addr) {
+        addrs.push(addr);
+    }
+    if scan {
+        addrs.extend(
+            identity
+                .ports()
+                .map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        );
+    }
+    for addr in addrs {
+        match probe_with_busy_retry(addr, token, client_name, identity.flake()).await {
+            Probe::OurLeader(client) => return Ok(Some(Acquired::Follower(client))),
+            Probe::Busy => return Err(AcquireError::LeaderBusy),
+            Probe::TokenMismatch => {
+                match join_with_refreshed_token(addr, state_dir, identity, client_name, token).await
+                {
+                    Ok(joined) => return Ok(Some(joined)),
+                    Err(AcquireError::TokenUnavailable) => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+            Probe::Foreign | Probe::Dead => {}
+        }
+    }
+    Ok(None)
+}
+
+async fn acquire_guarded(
+    identity: &ContextIdentity,
+    state_dir: &Path,
+    client_name: &str,
+    lease: election::ElectionLease,
+    failed_host: &mut Option<RunningHost>,
+    config: impl FnOnce() -> HostConfig,
+) -> Result<Acquired, AcquireError> {
+    let work = work::WorkOwner::new(Some(lease));
     let mut config = Some(config);
     // Reuse the context's token when a discovery file for OUR flake exists —
     // stable across leader restarts (spec: token mint/reuse). A stale or
@@ -175,15 +316,17 @@ pub async fn acquire(
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         match TcpListener::bind(addr).await {
             Ok(listener) => {
-                let config = config.take().expect("the leader path runs at most once")();
-                let host = RunningHost::start(
+                let config =
+                    work.factory(config.take().expect("the leader path runs at most once"));
+                let host = RunningHost::start_guarded(
                     listener,
                     token.clone(),
                     identity.flake().to_string(),
                     config,
+                    work,
                 )
                 .published_at(state_dir, identity.key());
-                discovery::write(
+                if let Err(error) = discovery::write(
                     state_dir,
                     identity.key(),
                     &Discovery {
@@ -192,7 +335,10 @@ pub async fn acquire(
                         pid: std::process::id(),
                         flake: identity.flake().to_string(),
                     },
-                )?;
+                ) {
+                    *failed_host = Some(host);
+                    return Err(error.into());
+                }
                 return Ok(Acquired::Leader(host));
             }
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {

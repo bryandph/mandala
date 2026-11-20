@@ -9,6 +9,9 @@
 //! so an unrelated local service squatting a test port cannot flake them —
 //! the walk is exactly what handles that.
 
+mod common;
+use common::acquire;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,13 +22,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use mandala_context::{
-    Acquired, ContextClient, ContextIdentity, Discovery, HostConfig, RunningHost, acquire,
-    discovery,
+    Acquired, ContextClient, ContextIdentity, Discovery, HostConfig, RunningHost, discovery,
 };
 
 /// A per-test scratch tree: `flake/` (the canonicalizable checkout stand-in)
 /// and `state/` (the isolated mandala state dir).
 fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+    common::refusal_preflight();
     let base = std::env::temp_dir().join(format!(
         "mandala-context-spike-{tag}-{}-{}",
         std::process::id(),
@@ -68,6 +71,7 @@ fn config_with(events: broadcast::Sender<Value>, heartbeat: Duration) -> HostCon
         dispatch: echo_dispatch(Some(events.clone())),
         events,
         heartbeat_interval: heartbeat,
+        background_tasks: Arc::default(),
     }
 }
 

@@ -83,6 +83,22 @@ fn scratch_tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path
     (flake, state, aggregate)
 }
 
+#[path = "../../mandala-context/tests/common/refusal.rs"]
+mod test_refusal;
+
+fn coordination_root(state: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    test_refusal::refusal_preflight();
+    let root = state.join("context-election-test");
+    std::fs::create_dir_all(state).unwrap();
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("test root: {e}"),
+    }
+    root.canonicalize().unwrap()
+}
+
 /// Spawn one `mandala mcp` instance scoped to the scratch tree.
 fn spawn_mcp(
     flake: &std::path::Path,
@@ -91,12 +107,20 @@ fn spawn_mcp(
 ) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_mandala"))
         .arg("mcp")
+        .arg("--context-coordination-root")
+        .arg(coordination_root(state))
         .current_dir(flake)
         .env("MANDALA_AGGREGATE_FILE", aggregate)
         .env("MANDALA_FLEET_STATE", state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(state.join("context.stderr"))
+                .unwrap(),
+        ))
         .spawn()
         .expect("spawn mandala mcp")
 }
@@ -271,7 +295,12 @@ fn second_instance_proxies_and_promotes_when_the_leader_exits() {
     let mut a_in = a.stdin.take().unwrap();
     let mut a_out = BufReader::new(a.stdout.take().unwrap());
     handshake(&mut a_in, &mut a_out);
-    let d = read_discovery(&state).expect("the first instance published discovery");
+    let d = read_discovery(&state).unwrap_or_else(|| {
+        panic!(
+            "the first instance published discovery; stderr: {}",
+            std::fs::read_to_string(state.join("context.stderr")).unwrap_or_default()
+        )
+    });
     assert_eq!(
         d["pid"].as_u64(),
         Some(u64::from(a.id())),
@@ -455,6 +484,8 @@ sleep 1
             .arg("--flake")
             .arg(&flake)
             .arg("mcp")
+            .arg("--context-coordination-root")
+            .arg(coordination_root(&state))
             .current_dir(&flake)
             .env("PATH", &path)
             .env("MANDALA_AGGREGATE_FILE", &aggregate)
@@ -475,7 +506,12 @@ sleep 1
     let mut leader_in = leader.stdin.take().unwrap();
     let mut leader_out = BufReader::new(leader.stdout.take().unwrap());
     handshake(&mut leader_in, &mut leader_out);
-    let elected = read_discovery(&state).expect("leader published discovery");
+    let elected = read_discovery(&state).unwrap_or_else(|| {
+        panic!(
+            "leader published discovery; stderr: {}",
+            std::fs::read_to_string(state.join("context.stderr")).unwrap_or_default()
+        )
+    });
     assert_eq!(elected["pid"].as_u64(), Some(u64::from(leader.id())));
 
     let mut follower = spawn();
@@ -811,6 +847,8 @@ fn follower_ping_uses_canonical_flake_inventory() {
     let spawn = || {
         Command::new(env!("CARGO_BIN_EXE_mandala"))
             .args(["--flake", flake.to_str().unwrap(), "mcp"])
+            .arg("--context-coordination-root")
+            .arg(coordination_root(&state))
             .current_dir(&elsewhere)
             .env(
                 "PATH",

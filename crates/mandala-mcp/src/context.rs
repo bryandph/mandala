@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mandala_context::{
-    CallError, ContextSession, Dispatch, FleetContext, HostConfig, HostConfigFactory,
+    AcquireError, CallError, ContextSession, Dispatch, FleetContext, HostConfig, HostConfigFactory,
 };
 use mandala_core::drift;
 use rust_mcp_sdk::McpServer;
@@ -40,6 +40,7 @@ use rust_mcp_sdk::mcp_server::ServerHandler;
 use rust_mcp_sdk::schema::schema_utils::CallToolError;
 use rust_mcp_sdk::schema::{
     CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, RpcError,
+    TextContent,
 };
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -125,8 +126,16 @@ fn factory_with_effects(
                 },
             )),
         );
-        spawn_handler_head_watch(&flake, &handler);
-        HostConfig::new(handler_dispatch(handler), events)
+        let watcher = spawn_handler_head_watch(&flake, &handler);
+        let config = HostConfig::new(handler_dispatch(handler), events);
+        if let Some(watcher) = watcher {
+            config
+                .background_tasks
+                .lock()
+                .expect("background tasks poisoned")
+                .push(watcher);
+        }
+        config
     })
 }
 
@@ -140,22 +149,42 @@ pub fn spawn_handler_head_watch(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let initial_head = drift::repo_head(flake)?;
     let weak_handler = Arc::downgrade(handler);
-    Some(drift::spawn_repo_head_watch(
+    let scope = mandala_context::work::current_scope();
+    let probe_scope = scope.clone();
+    Some(drift::spawn_repo_head_watch_with_probe(
         flake.to_string(),
         initial_head,
+        move |checkout| {
+            let scope = probe_scope.clone();
+            async move {
+                mandala_context::work::in_scope(scope, async move {
+                    mandala_context::work::spawn_blocking(move || drift::repo_head(&checkout))
+                        .await
+                        .ok()
+                        .flatten()
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        },
         move |_head| {
             let weak_handler = weak_handler.clone();
+            let scope = scope.clone();
             async move {
-                let Some(handler) = weak_handler.upgrade() else {
-                    return false;
-                };
-                // Use the normal dispatch wrapper: the reload is audited,
-                // swaps the leader's inventory atomically, and publishes one
-                // settle event that every observer adopts.
-                let _ = handler
-                    .call_tool_from(Some("checkout-watch"), "reload", serde_json::Map::new())
-                    .await;
-                true
+                mandala_context::work::in_scope(scope, async move {
+                    let Some(handler) = weak_handler.upgrade() else {
+                        return false;
+                    };
+                    // Preserve normal reload/audit/event behavior, now with
+                    // ownership propagated into its evaluator blocking jobs.
+                    let _ = handler
+                        .call_tool_from(Some("checkout-watch"), "reload", serde_json::Map::new())
+                        .await;
+                    true
+                })
+                .await
+                .unwrap_or(false)
             }
         },
     ))
@@ -219,6 +248,61 @@ impl ServerHandler for ContextHandler {
             // client instead of a hang — fleet-context requirement.
             Err(other) => Err(CallToolError::from_message(other.to_string())),
         }
+    }
+}
+
+/// Initializes and advertises the static tool surface, but never creates a
+/// handler/evaluator or dispatches effects after canonical-flake acquisition
+/// fails. Every tool returns the same explicit structured acquisition error.
+pub struct UnavailableContextHandler {
+    failure: Value,
+}
+impl UnavailableContextHandler {
+    #[must_use]
+    pub fn new(error: &AcquireError) -> Self {
+        let kind = match error {
+            AcquireError::Io(_) => "io",
+            AcquireError::PortsExhausted => "ports_exhausted",
+            AcquireError::TokenUnavailable => "token_unavailable",
+            AcquireError::LeaderBusy => "leader_busy",
+            AcquireError::CoordinationBusy => "coordination_busy",
+            AcquireError::CoordinationUnavailable(_) => "coordination_unavailable",
+        };
+        Self {
+            failure: serde_json::json!({"error": "context_acquisition_failed", "kind": kind, "message": error.to_string()}),
+        }
+    }
+
+    fn result(&self, tool: &str) -> CallToolResult {
+        let mut failure = self.failure.clone();
+        failure["tool"] = tool.into();
+        CallToolResult {
+            content: vec![TextContent::new(failure.to_string(), None, None).into()],
+            is_error: Some(true),
+            meta: None,
+            structured_content: failure.as_object().cloned(),
+        }
+    }
+}
+#[async_trait]
+impl ServerHandler for UnavailableContextHandler {
+    async fn handle_list_tools_request(
+        &self,
+        _params: Option<PaginatedRequestParams>,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ListToolsResult, RpcError> {
+        Ok(ListToolsResult {
+            tools: all_tools(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+    async fn handle_call_tool_request(
+        &self,
+        params: CallToolRequestParams,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<CallToolResult, CallToolError> {
+        Ok(self.result(&params.name))
     }
 }
 

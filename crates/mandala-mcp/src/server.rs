@@ -738,7 +738,9 @@ impl MandalaHandler {
         }
         #[allow(clippy::cast_sign_loss)]
         let limit = t.limit.unwrap_or(10).max(1) as usize;
-        let runs = tokio::task::spawn_blocking(move || {
+        // Operator-approved carve-out 1/2: read-only private registry views;
+        // no processes, durable writes or publication after parent cancellation.
+        let runs = mandala_context::work::read_only_snapshot(move || {
             let mut runs = Vec::new();
             for info in registry::list_runs().into_iter().take(limit) {
                 if let Some(mut obs) = registry::open_run(&info.run_id) {
@@ -1120,7 +1122,8 @@ async fn blocking_snapshot(
     mut obs: ObservedRun,
     detail: SnapshotDetail,
 ) -> Result<(ObservedRun, Value), CallToolError> {
-    tokio::task::spawn_blocking(move || {
+    // Operator-approved carve-out 2/2: immutable/private observation only.
+    mandala_context::work::read_only_snapshot(move || {
         let snap = run_snapshot(&mut obs, detail);
         (obs, snap)
     })

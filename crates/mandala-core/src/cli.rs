@@ -76,7 +76,7 @@ impl Engine {
 }
 
 /// The stdio-MCP launcher closure: takes the resolved `--flake` value.
-type McpLauncher = Box<dyn Fn(&str) -> ExitCode>;
+type McpLauncher = Box<dyn Fn(&str, Option<&std::path::Path>) -> ExitCode>;
 
 /// A parsed `mandala tui …` invocation, handed to the [`Cli::tui_launcher`]
 /// closure together with the resolved `--flake` value. The flag plumbing is
@@ -219,7 +219,16 @@ impl Cli {
     /// kept as a closure so `mandala-core` never depends on `mandala-mcp`,
     /// which would be a dependency cycle).
     #[must_use]
-    pub fn mcp_launcher(mut self, launch: impl Fn(&str) -> ExitCode + 'static) -> Self {
+    pub fn mcp_launcher(self, launch: impl Fn(&str) -> ExitCode + 'static) -> Self {
+        self.mcp_launcher_with_options(move |flake, _| launch(flake))
+    }
+
+    /// Launcher with an explicitly injected coordination root (isolated tests).
+    #[must_use]
+    pub fn mcp_launcher_with_options(
+        mut self,
+        launch: impl Fn(&str, Option<&std::path::Path>) -> ExitCode + 'static,
+    ) -> Self {
         self.mcp = Some(Box::new(launch));
         self
     }
@@ -289,7 +298,8 @@ impl Cli {
             )
             .subcommand(crate::campaign::cli::command())
             .subcommand(Command::new("version").about("Print the CLI version"))
-            .subcommand(Command::new("mcp").about("Run the fleet MCP server over stdio (headless)"))
+            .subcommand(Command::new("mcp").about("Run the fleet MCP server over stdio (headless)")
+                .arg(Arg::new("context-coordination-root").long("context-coordination-root").hide(true).value_parser(clap::value_parser!(std::path::PathBuf))))
             .subcommand(
                 // The native ratatui TUI (mandala-native-tui section 7 flip —
                 // the phase-1 Python exec-shim is gone). The retired Python
@@ -405,8 +415,12 @@ impl Cli {
                 println!("{VERSION}");
                 ExitCode::SUCCESS
             }
-            Some(("mcp", _)) => match &self.mcp {
-                Some(launch) => launch(&flake),
+            Some(("mcp", m)) => match &self.mcp {
+                Some(launch) => launch(
+                    &flake,
+                    m.get_one::<std::path::PathBuf>("context-coordination-root")
+                        .map(std::path::PathBuf::as_path),
+                ),
                 None => {
                     eprintln!("mandala: the MCP server is not available in this build");
                     ExitCode::FAILURE

@@ -395,11 +395,39 @@ pub fn repo_head(flake: &str) -> Option<String> {
 pub fn spawn_repo_head_watch<F, Fut>(
     flake: String,
     initial_head: String,
+    on_change: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut(String) -> Fut + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    spawn_repo_head_watch_with_probe(
+        flake,
+        initial_head,
+        |checkout| async move {
+            tokio::task::spawn_blocking(move || repo_head(&checkout))
+                .await
+                .ok()
+                .flatten()
+        },
+        on_change,
+    )
+}
+
+/// Same watch semantics with an injected probe executor. Shared context hosts
+/// use this seam to register Git probes with their lease without introducing
+/// a mandala-core -> mandala-context dependency.
+pub fn spawn_repo_head_watch_with_probe<F, Fut, P, Probe>(
+    flake: String,
+    initial_head: String,
+    mut probe: P,
     mut on_change: F,
 ) -> tokio::task::JoinHandle<()>
 where
     F: FnMut(String) -> Fut + Send + 'static,
     Fut: Future<Output = bool> + Send + 'static,
+    P: FnMut(String) -> Probe + Send + 'static,
+    Probe: Future<Output = Option<String>> + Send + 'static,
 {
     tokio::spawn(async move {
         let mut seen = initial_head;
@@ -409,9 +437,7 @@ where
         interval.tick().await;
         loop {
             interval.tick().await;
-            let checkout = flake.clone();
-            let Ok(Some(head)) = tokio::task::spawn_blocking(move || repo_head(&checkout)).await
-            else {
+            let Some(head) = probe(flake.clone()).await else {
                 continue;
             };
             if head == seen {
